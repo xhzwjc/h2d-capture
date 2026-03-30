@@ -58,8 +58,8 @@ To build and create zip archives:
 ```sh
 npm run build:zip
 # Output:
-#   dist/h2d-capture-chrome-v1.5.0.zip
-#   dist/h2d-capture-firefox-v1.5.0.zip
+#   dist/h2d-capture-chrome-v1.6.0.zip
+#   dist/h2d-capture-firefox-v1.6.0.zip
 ```
 
 ## Architecture

@@ -87,5 +87,9 @@ if (watch) {
       execSync(`cd dist/firefox && zip -r ../${name.replace("dist/", "")} .`);
       console.log(`Packed: ${name}`);
     }
+    // Source code archive for Firefox Add-on review
+    const srcName = `dist/h2d-capture-source-v${version}.zip`;
+    execSync(`zip -r ${srcName} src/ package.json package-lock.json tsconfig.json esbuild.config.mjs README.md LICENSE -x "*.DS_Store"`);
+    console.log(`Packed: ${srcName}`);
   }
 }

@@ -293,6 +293,7 @@ export interface DomCaptureAPI {
     captureIndex?: number,
   ) => Promise<SubmitResult>;
   writeToClipboard: (json: string) => Promise<void>;
+  wrapForClipboard: (json: string) => Promise<Blob>;
   isValidFigmaEndpoint: (url: string) => boolean;
   parseHashParams: () => HashParams;
   setVerbose: (enabled: boolean) => void;

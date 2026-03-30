@@ -1,6 +1,10 @@
 (() => {
   const HOST_ID = "__figma_capture_ext_toolbar__";
 
+  // Detect Firefox in MAIN world via CSS/navigator (browser.runtime.getBrowserInfo
+  // is not available in MAIN world, only in content scripts).
+  const isFirefox = navigator.userAgent.includes("Firefox");
+
   // Don't create toolbar twice
   if (document.getElementById(HOST_ID)) return;
 
@@ -365,11 +369,38 @@
       if (!captureAborted) stopBtn.classList.add("visible");
     }, 5000);
 
+    // Firefox: navigator.clipboard.write() requires user activation. Since the
+    // click event is still on the stack here (before any await), we create a
+    // ClipboardItem with a pending Promise<Blob> now. Firefox holds the write
+    // transaction open until the promise resolves.
+    let ffClipboard: {
+      resolve: (b: Blob) => void;
+      reject: (e: unknown) => void;
+      writePromise: Promise<void>;
+    } | null = null;
+    if (isFirefox) {
+      let resolve!: (b: Blob) => void;
+      let reject!: (e: unknown) => void;
+      const blobPromise = new Promise<Blob>((res, rej) => { resolve = res; reject = rej; });
+      const writePromise = navigator.clipboard.write([new ClipboardItem({ "text/html": blobPromise })]);
+      ffClipboard = { resolve, reject, writePromise };
+    }
+
     try {
       const json = await window.figma.capturePage(selector);
-      if (captureAborted) return;
+      if (captureAborted) {
+        ffClipboard?.reject(new Error("aborted"));
+        return;
+      }
+
       showStatus("Copying to clipboard...", false);
-      await window.figma.writeToClipboard!(json);
+      if (ffClipboard) {
+        ffClipboard.resolve(await window.figma.wrapForClipboard!(json));
+        await ffClipboard.writePromise;
+      } else {
+        await window.figma.writeToClipboard!(json);
+      }
+
       showStatus("Copied to clipboard", true);
       setTimeout(() => {
         if (captureAborted) return;
@@ -380,6 +411,7 @@
       if (!captureAborted) {
         showStatus("Error: " + ((err as Error).message || String(err)), false);
       }
+      ffClipboard?.reject(err);
       setLoading(false);
     } finally {
       clearStopTimer();

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "H2D Capture",
   "description": "Capture any webpage and paste it into Figma canvas",
-  "version": "1.5",
+  "version": "1.6",
   "permissions": ["activeTab", "scripting"],
   "action": {
     "default_icon": {
