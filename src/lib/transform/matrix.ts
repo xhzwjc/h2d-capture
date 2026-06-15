@@ -7,6 +7,16 @@
  */
 
 import type { Quad, ElementRect } from '../types.js';
+import {
+  getComputedStyleFor,
+  getNodeDocument,
+  isElementLike,
+  isHtmlElement,
+  isMathElement,
+  isSvgGraphicsElement,
+  isSvgSvgElement,
+  isTextNode,
+} from '../core/dom.js';
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -76,23 +86,23 @@ export function getElementDimensions(element: Element | Text): { width: number; 
   let width = 0;
   let height = 0;
 
-  if (element instanceof HTMLElement) {
+  if (isHtmlElement(element)) {
     width = element.offsetWidth;
     height = element.offsetHeight;
-  } else if (element instanceof SVGSVGElement) {
-    const computed = getComputedStyle(element);
+  } else if (isSvgSvgElement(element)) {
+    const computed = getComputedStyleFor(element);
     width = parseFloat(computed.width) || element.width.baseVal.value;
     height = parseFloat(computed.height) || element.height.baseVal.value;
-  } else if (element instanceof SVGGraphicsElement) {
+  } else if (isSvgGraphicsElement(element)) {
     const bbox = element.getBBox();
     width = bbox.width;
     height = bbox.height;
-  } else if (element instanceof MathMLElement) {
+  } else if (isMathElement(element)) {
     const clientRect = element.getBoundingClientRect();
     width = clientRect.width;
     height = clientRect.height;
-  } else if (element instanceof Text) {
-    const range = document.createRange();
+  } else if (isTextNode(element)) {
+    const range = getNodeDocument(element).createRange();
     range.selectNodeContents(element);
     const clientRect = range.getBoundingClientRect();
     width = clientRect.width;
@@ -229,9 +239,9 @@ export function multiplyMatrices(a: DOMMatrix | undefined | null, b: DOMMatrix |
  * coordinates.
  */
 export function getElementRect(element: Element | Text, computedStyle: CSSStyleDeclaration, combinedTransform: DOMMatrix | undefined | null): ElementRect {
-  const boundingRect = element instanceof Element
+  const boundingRect = isElementLike(element)
     ? element.getBoundingClientRect()
-    : (() => { const r = document.createRange(); r.selectNode(element); const rect = r.getBoundingClientRect(); r.detach(); return rect; })();
+    : (() => { const r = getNodeDocument(element).createRange(); r.selectNode(element); const rect = r.getBoundingClientRect(); r.detach(); return rect; })();
   let { x, y, width, height } = boundingRect;
   const dimensions = getElementDimensions(element);
   let cssWidth = dimensions.width;
@@ -241,7 +251,7 @@ export function getElementRect(element: Element | Text, computedStyle: CSSStyleD
   // viewport size. Use scrollWidth/scrollHeight to get full document dimensions.
   // However, if an explicit CSS width is set (e.g. for mobile capture at 360px),
   // respect that instead of expanding to viewport/scroll size.
-  if (element instanceof HTMLElement) {
+  if (isHtmlElement(element)) {
     const tag = element.tagName;
     if (tag === "HTML" || tag === "BODY") {
       const explicitWidth = element.style.getPropertyValue("max-width");
@@ -281,9 +291,9 @@ export function getElementRect(element: Element | Text, computedStyle: CSSStyleD
  * repositioning it to match the viewport bounding rect.
  */
 export function computeRotatedQuad(element: Element | Text, computedStyle: CSSStyleDeclaration, combinedTransform: DOMMatrix): Quad {
-  const boundingRect = element instanceof Element
+  const boundingRect = isElementLike(element)
     ? element.getBoundingClientRect()
-    : (() => { const r = document.createRange(); r.selectNode(element); const rect = r.getBoundingClientRect(); r.detach(); return rect; })();
+    : (() => { const r = getNodeDocument(element).createRange(); r.selectNode(element); const rect = r.getBoundingClientRect(); r.detach(); return rect; })();
   const dimensions = getElementDimensions(element);
   const elementWidth = dimensions.width;
   const elementHeight = dimensions.height;

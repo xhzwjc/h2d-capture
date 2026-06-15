@@ -8,6 +8,7 @@ import type {
   TextSnapshot,
   SimpleMatrix,
 } from '../types.js';
+import { getComputedStyleFor, getNodeDocument, getNodeWindow, isInstanceOfOwner } from './dom.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -69,7 +70,7 @@ const OFFSCREEN_MARGIN = 500;
  * off-screen elements, empty zero-size containers, etc.).
  */
 export function isNodeVisible(element: Element): boolean {
-  if (element instanceof HTMLScriptElement) return false;
+  if (element.tagName.toUpperCase() === "SCRIPT") return false;
   if (
     element.nodeType === Node.ELEMENT_NODE &&
     element.getAttribute("data-h2d-ignore") === "true"
@@ -77,7 +78,7 @@ export function isNodeVisible(element: Element): boolean {
     return false;
   }
 
-  const computed = window.getComputedStyle(element);
+  const computed = getComputedStyleFor(element);
 
   // display:none — element and all descendants are invisible
   if (computed.display === "none") return false;
@@ -134,15 +135,17 @@ export function shouldPruneNode(
   // Use scrollWidth/scrollHeight (not viewport) so that content below the fold
   // is captured — the previous viewport-based check was clipping everything
   // outside the visible 720px window.
+  const doc = getNodeDocument(element);
+  const view = getNodeWindow(element);
   const docW = Math.max(
-    document.documentElement.scrollWidth,
-    document.documentElement.clientWidth,
-    window.innerWidth,
+    doc.documentElement.scrollWidth,
+    doc.documentElement.clientWidth,
+    view.innerWidth,
   );
   const docH = Math.max(
-    document.documentElement.scrollHeight,
-    document.documentElement.clientHeight,
-    window.innerHeight,
+    doc.documentElement.scrollHeight,
+    doc.documentElement.clientHeight,
+    view.innerHeight,
   );
   if (
     rect.width > 0 && rect.height > 0 &&
@@ -167,7 +170,10 @@ export function shouldPruneNode(
  * Measure the bounding rect and line count for a text node or group.
  */
 export function getTextRect(nodeOrNodes: Node | Node[]): { x: number; y: number; width: number; height: number; lineCount: number } {
-  const range = document.createRange();
+  const ownerNode = Array.isArray(nodeOrNodes) ? nodeOrNodes[0] : nodeOrNodes;
+  const doc = getNodeDocument(ownerNode);
+  const view = getNodeWindow(ownerNode);
+  const range = doc.createRange();
 
   if (Array.isArray(nodeOrNodes)) {
     const first = nodeOrNodes[0];
@@ -181,8 +187,8 @@ export function getTextRect(nodeOrNodes: Node | Node[]): { x: number; y: number;
   const { x, y, width, height } = range.getBoundingClientRect();
 
   const isVertical =
-    range.commonAncestorContainer instanceof HTMLElement
-      ? window.getComputedStyle(range.commonAncestorContainer).writingMode.startsWith("vertical")
+    isInstanceOfOwner<HTMLElement>(range.commonAncestorContainer, ownerNode, "HTMLElement")
+      ? view.getComputedStyle(range.commonAncestorContainer).writingMode.startsWith("vertical")
       : false;
 
   const clientRects = Array.from(range.getClientRects()).filter(
@@ -216,18 +222,19 @@ export function getElementAttributes(element: Element): Record<string, string> {
   }
 
   // Always capture poster and currentSrc for media elements.
-  if (element instanceof HTMLVideoElement && element.poster) {
+  if (isInstanceOfOwner<HTMLVideoElement>(element, element, "HTMLVideoElement") && element.poster) {
     attrs.poster = element.poster;
   }
   if (
-    (element instanceof HTMLImageElement || element instanceof HTMLVideoElement) &&
+    (isInstanceOfOwner<HTMLImageElement>(element, element, "HTMLImageElement") ||
+      isInstanceOfOwner<HTMLVideoElement>(element, element, "HTMLVideoElement")) &&
     element.currentSrc
   ) {
     attrs.currentSrc = element.currentSrc;
   }
 
   // Ensure input type is always present.
-  if (element instanceof HTMLInputElement && attrs.type == null) {
+  if (isInstanceOfOwner<HTMLInputElement>(element, element, "HTMLInputElement") && attrs.type == null) {
     attrs.type = element.type;
   }
 

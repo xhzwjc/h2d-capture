@@ -4,6 +4,8 @@ const isFirefox =
   typeof (browser.runtime as unknown as Record<string, unknown>).getBrowserInfo === "function";
 const api = typeof browser !== "undefined" ? browser : chrome;
 
+const FRAME_CONTEXT_MENU_ID = "h2d-open-toolbar-in-frame";
+
 api.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return;
 
@@ -41,39 +43,110 @@ api.action.onClicked.addListener(async (tab) => {
   }
 
   try {
-    // Inject the CORS-bypass bridge into the ISOLATED world first,
-    // so the content script can relay fetch requests from MAIN world.
-    // ISOLATED is the default world — omitting `world` works on both browsers.
-    await api.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: installCorsBridge,
-    });
-
-    if (isFirefox) {
-      // Firefox: inject injector.js (ISOLATED world) which creates <script>
-      // tags to load capture.js + toolbar.js into MAIN world.
-      await api.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["injector.js"],
-      });
-    } else {
-      // Chrome: direct MAIN world injection
-      await api.scripting.executeScript({
-        target: { tabId: tab.id },
-        world: "MAIN" as chrome.scripting.ExecutionWorld,
-        files: ["capture.js"],
-      });
-
-      await api.scripting.executeScript({
-        target: { tabId: tab.id },
-        world: "MAIN" as chrome.scripting.ExecutionWorld,
-        files: ["toolbar.js"],
-      });
-    }
+    await injectIntoTargetFrame(tab.id);
   } catch (e) {
     console.error("H2D Capture: cannot inject on this page", e);
   }
 });
+
+if (!isFirefox) {
+  api.runtime.onInstalled.addListener(() => {
+    api.contextMenus.create(
+      {
+        id: FRAME_CONTEXT_MENU_ID,
+        title: "H2D Capture: Open toolbar in this frame",
+        contexts: ["frame"],
+      },
+      () => {
+        if (chrome.runtime.lastError) {
+          console.debug("H2D Capture: context menu setup skipped", chrome.runtime.lastError.message);
+        }
+      },
+    );
+  });
+
+  api.contextMenus.onClicked.addListener(async (info, tab) => {
+    if (info.menuItemId !== FRAME_CONTEXT_MENU_ID) return;
+
+    if (!tab?.id) {
+      console.error("H2D Capture: cannot inject into frame because tab id is missing", { info });
+      return;
+    }
+
+    if (typeof info.frameId !== "number") {
+      console.error("H2D Capture: cannot inject into frame because frameId is missing", { info });
+      return;
+    }
+
+    if (isUnsupportedUrl(info.frameUrl || "")) {
+      console.error("H2D Capture: cannot inject into unsupported frame URL", {
+        frameUrl: info.frameUrl,
+        frameId: info.frameId,
+      });
+      return;
+    }
+
+    try {
+      await injectIntoTargetFrame(tab.id, info.frameId);
+    } catch (e) {
+      // Chrome frame injection may require explicit host_permissions for the
+      // iframe origin, even when the parent page is accessible via activeTab.
+      console.error(
+        "H2D Capture: cannot inject toolbar into this frame. Check manifest host_permissions for the iframe origin.",
+        {
+          tabId: tab.id,
+          frameId: info.frameId,
+          frameUrl: info.frameUrl,
+          error: e,
+        },
+      );
+    }
+  });
+}
+
+function isUnsupportedUrl(url: string): boolean {
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("about:") ||
+    url.startsWith("moz-extension://")
+  );
+}
+
+async function injectIntoTargetFrame(tabId: number, frameId?: number): Promise<void> {
+  const target = frameId == null ? { tabId } : { tabId, frameIds: [frameId] };
+
+  // Inject the CORS-bypass bridge into the ISOLATED world first,
+  // so the content script can relay fetch requests from MAIN world.
+  // ISOLATED is the default world — omitting `world` works on both browsers.
+  await api.scripting.executeScript({
+    target,
+    func: installCorsBridge,
+  });
+
+  if (isFirefox) {
+    // Firefox: inject injector.js (ISOLATED world) which creates <script>
+    // tags to load capture.js + toolbar.js into MAIN world.
+    await api.scripting.executeScript({
+      target,
+      files: ["injector.js"],
+    });
+    return;
+  }
+
+  // Chrome: direct MAIN world injection
+  await api.scripting.executeScript({
+    target,
+    world: "MAIN" as chrome.scripting.ExecutionWorld,
+    files: ["capture.js"],
+  });
+
+  await api.scripting.executeScript({
+    target,
+    world: "MAIN" as chrome.scripting.ExecutionWorld,
+    files: ["toolbar.js"],
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Cross-origin image fetch (background has no CORS limits)

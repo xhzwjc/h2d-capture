@@ -7,6 +7,7 @@
  */
 
 import type { LayoutSizing } from "../types.js";
+import { getComputedStyleFor } from "./dom.js";
 
 /**
  * Infer Figma Auto Layout sizing for a flex/grid child.
@@ -32,7 +33,7 @@ export function inferLayoutSizing(
     return { horizontal: "HUG", vertical: "HUG" };
   }
 
-  const parentComputed = window.getComputedStyle(parentElement);
+  const parentComputed = getComputedStyleFor(parentElement);
   const parentDisplay = parentComputed.display;
 
   const isFlexChild =
@@ -45,7 +46,7 @@ export function inferLayoutSizing(
     return inferBlockLayoutSizing(element, styles, parentElement);
   }
 
-  const computed = window.getComputedStyle(element);
+  const computed = getComputedStyleFor(element);
   const styleMap =
     "computedStyleMap" in element
       ? (element as HTMLElement & { computedStyleMap(): StylePropertyMapReadOnly }).computedStyleMap()
@@ -206,7 +207,7 @@ function inferBlockLayoutSizing(
   styles: Record<string, string>,
   parentElement: Element,
 ): { horizontal: LayoutSizing; vertical: LayoutSizing } {
-  const computed = window.getComputedStyle(element);
+  const computed = getComputedStyleFor(element);
   const styleMap =
     "computedStyleMap" in element
       ? (element as HTMLElement & { computedStyleMap(): StylePropertyMapReadOnly }).computedStyleMap()

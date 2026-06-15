@@ -6,6 +6,7 @@
  */
 
 import type { AssetEntry, AssetCollectorOptions } from '../types.js';
+import { getNodeDocument, isInstanceOfOwner } from '../core/dom.js';
 
 /** Image MIME types that browsers may decode but Figma cannot consume directly. */
 const UNSUPPORTED_IMAGE_TYPES = new Set(["image/avif", "image/heif", "image/heic"]);
@@ -216,7 +217,7 @@ function collectBackgroundImages(assetCollector: ResourceResolver, computedStyle
  * If `element` is an `<img>`, register its `currentSrc`.
  */
 function collectImageElement(element: Element, assetCollector: ResourceResolver): void {
-  if (element instanceof HTMLImageElement) {
+  if (isInstanceOfOwner<HTMLImageElement>(element, element, "HTMLImageElement")) {
     assetCollector.addImage(element.currentSrc, element);
   }
 }
@@ -225,7 +226,7 @@ function collectImageElement(element: Element, assetCollector: ResourceResolver)
  * If `element` is a `<video>`, register its poster and/or current frame.
  */
 function collectVideoElement(element: Element, assetCollector: ResourceResolver): void {
-  if (!(element instanceof HTMLVideoElement)) return;
+  if (!isInstanceOfOwner<HTMLVideoElement>(element, element, "HTMLVideoElement")) return;
 
   if (element.poster) {
     assetCollector.addImage(element.poster);
@@ -245,7 +246,7 @@ function shouldSkipVideo(video: HTMLVideoElement): boolean {
   if (!video.poster) return false;
 
   return (
-    video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+    video.readyState < 2 ||
     video.videoWidth === 0 ||
     (video.currentTime === 0 && video.paused)
   );
@@ -325,7 +326,7 @@ async function fetchImageAsBlob(url: string, sourceElement?: HTMLImageElement): 
   }
 
   // Strategy 3: find any loaded <img> on the page with the same src
-  const existingImg = findLoadedImageOnPage(url);
+  const existingImg = findLoadedImageOnPage(url, sourceElement?.ownerDocument);
   if (existingImg) {
     try {
       const blob = await rasterizeLoadedImage(existingImg);
@@ -401,7 +402,7 @@ function fetchViaExtensionBridge(url: string): Promise<Blob | null> {
  * as no `crossorigin` attribute was set on the source element.
  */
 function rasterizeLoadedImage(img: HTMLImageElement): Promise<Blob> {
-  const canvas = document.createElement("canvas");
+  const canvas = getNodeDocument(img).createElement("canvas");
   canvas.width = img.naturalWidth;
   canvas.height = img.naturalHeight;
 
@@ -427,8 +428,8 @@ function rasterizeLoadedImage(img: HTMLImageElement): Promise<Blob> {
 /**
  * Search the page for an already-loaded `<img>` element with the given src.
  */
-function findLoadedImageOnPage(url: string): HTMLImageElement | null {
-  const images = document.querySelectorAll<HTMLImageElement>("img");
+function findLoadedImageOnPage(url: string, doc: Document = document): HTMLImageElement | null {
+  const images = doc.querySelectorAll<HTMLImageElement>("img");
   for (const img of images) {
     if (
       (img.currentSrc === url || img.src === url) &&
@@ -538,7 +539,7 @@ async function loadCrossOriginVideo(video: HTMLVideoElement): Promise<HTMLVideoE
   // Nothing to do if the video is already usable.
   if (isSameOrigin(src) || video.crossOrigin !== null) return null;
 
-  const clonedVideo = document.createElement("video");
+  const clonedVideo = getNodeDocument(video).createElement("video");
   clonedVideo.crossOrigin = "anonymous";
   clonedVideo.src = src;
   clonedVideo.muted = true;
@@ -646,7 +647,7 @@ async function captureVideoFrame(video: HTMLVideoElement): Promise<Blob> {
       throw new Error("Video has invalid dimensions");
     }
 
-    const canvas = document.createElement("canvas");
+    const canvas = getNodeDocument(sourceVideo).createElement("canvas");
     canvas.width = sourceVideo.videoWidth;
     canvas.height = sourceVideo.videoHeight;
 

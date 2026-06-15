@@ -1,3 +1,5 @@
+import { getComputedStyleFor, isElementNode } from '../core/dom.js';
+
 /**
  * SVG serialization utilities.
  *
@@ -97,7 +99,7 @@ export function bakeSvgStyles(svgElement: SVGElement): string {
 
   copySvgComputedStyles(svgElement, clone);
 
-  const { width, height } = window.getComputedStyle(svgElement);
+  const { width, height } = getComputedStyleFor(svgElement);
   if (width.endsWith("px") && height.endsWith("px")) {
     clone.setAttribute("width", width);
     clone.setAttribute("height", height);
@@ -117,9 +119,9 @@ export function bakeSvgStyles(svgElement: SVGElement): string {
  * Only SVG_STYLE_DEFAULTS properties are considered.
  */
 function copySvgComputedStyles(source: Node, target: Node): void {
-  if (!(source instanceof Element) || !(target instanceof Element)) return;
+  if (!isElementNode(source) || !isElementNode(target)) return;
 
-  const computedStyle = window.getComputedStyle(source);
+  const computedStyle = getComputedStyleFor(source);
 
   for (const [property, defaultValue] of Object.entries(SVG_STYLE_DEFAULTS)) {
     const value = computedStyle.getPropertyValue(property);

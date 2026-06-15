@@ -3,7 +3,8 @@
   "name": "H2D Capture",
   "description": "Capture any webpage and paste it into Figma canvas",
   "version": "1.6",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "contextMenus"],
+  "host_permissions": ["https://*.italent.cn/*"],
   "action": {
     "default_icon": {
       "16": "assets/icon-16.png",

@@ -4,6 +4,13 @@
   // Detect Firefox in MAIN world via CSS/navigator (browser.runtime.getBrowserInfo
   // is not available in MAIN world, only in content scripts).
   const isFirefox = navigator.userAgent.includes("Firefox");
+  const isFrame = (() => {
+    try {
+      return window.top !== window;
+    } catch {
+      return true;
+    }
+  })();
 
   // Don't create toolbar twice
   if (document.getElementById(HOST_ID)) return;
@@ -253,7 +260,7 @@
 
   const title = document.createElement("div");
   title.className = "title";
-  title.textContent = "H2D Capture";
+  title.textContent = isFrame ? "H2D Capture · Frame" : "H2D Capture";
 
   const closeBtn = document.createElement("button");
   closeBtn.className = "close-btn";
@@ -277,7 +284,7 @@
     return btn;
   }
 
-  const btnScreen = makeActionBtn("screen", "Entire screen", () => capture("body", true));
+  const btnScreen = makeActionBtn("screen", isFrame ? "This frame" : "Entire screen", () => capture("body", true));
   const btnSelect = makeActionBtn("select", "Select element", startSelection);
 
   actions.append(btnScreen, btnSelect);

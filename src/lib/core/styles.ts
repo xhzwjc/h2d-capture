@@ -6,6 +6,7 @@
  */
 
 import { BASELINE_STYLES } from './css-defaults.js';
+import { getComputedStyleFor } from './dom.js';
 
 export { BASELINE_STYLES };
 
@@ -34,7 +35,7 @@ export const BORDER_GROUPS = [
  */
 export function diffStyles(element: Element, pseudo?: string): Record<string, string> {
   const diff: Record<string, string> = {};
-  const computed = window.getComputedStyle(element, pseudo);
+  const computed = getComputedStyleFor(element, pseudo);
   const styleMap =
     "computedStyleMap" in element && !pseudo ? (element as HTMLElement & { computedStyleMap(): StylePropertyMapReadOnly }).computedStyleMap() : null;
 
@@ -99,7 +100,7 @@ export const GRID_CONTAINER_PROPS = [
  * the element is a flex container and how it lays out children.
  */
 export function ensureFlexProps(element: Element, styles: Record<string, string>): void {
-  const computed = window.getComputedStyle(element);
+  const computed = getComputedStyleFor(element);
   for (const prop of FLEX_CONTAINER_PROPS) {
     if (!(prop in styles)) {
       styles[prop] = computed.getPropertyValue(
@@ -113,7 +114,7 @@ export function ensureFlexProps(element: Element, styles: Record<string, string>
  * Ensure all grid container properties are present in the style diff.
  */
 export function ensureGridProps(element: Element, styles: Record<string, string>): void {
-  const computed = window.getComputedStyle(element);
+  const computed = getComputedStyleFor(element);
   for (const prop of GRID_CONTAINER_PROPS) {
     if (!(prop in styles)) {
       styles[prop] = computed.getPropertyValue(
@@ -127,7 +128,7 @@ export function ensureGridProps(element: Element, styles: Record<string, string>
  * Ensure flex/grid item properties are present for children of flex/grid containers.
  */
 export function ensureFlexItemProps(element: Element, styles: Record<string, string>): void {
-  const computed = window.getComputedStyle(element);
+  const computed = getComputedStyleFor(element);
   for (const prop of FLEX_ITEM_PROPS) {
     if (!(prop in styles)) {
       styles[prop] = computed.getPropertyValue(
