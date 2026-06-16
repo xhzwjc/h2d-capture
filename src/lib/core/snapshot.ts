@@ -383,6 +383,7 @@ function snapshotElement(
   ensurePositionForZIndex(computedStyles);
   ensureTopChromeTextStacking(element, computedStyles);
   ensureTextOnlyLineHeight(element, computedStyles);
+  relaxVirtualScrollClipping(element, computedStyles);
 
   // Browser propagates body background to the viewport when html has no background.
   // Replicate this so Figma shows the correct background on the root frame.
@@ -438,7 +439,12 @@ function snapshotElement(
     ensureInputPrefixIconsStackAbove(childNodes);
   } else {
     expandedIframe = true;
-    computedStyles.overflow = computedStyles.overflow || "hidden";
+    // Once a same-origin iframe is expanded into real DOM nodes, keeping the
+    // native iframe clip can make Figma discard visible descendants that sit
+    // under scrolled negative-position ancestors.
+    computedStyles.overflow = "visible";
+    computedStyles.overflowX = "visible";
+    computedStyles.overflowY = "visible";
   }
 
   // Pseudo-element styles (::before, ::after, ::placeholder).
@@ -533,6 +539,73 @@ function ensureTopChromeTextStacking(element: Element, styles: Record<string, st
   if (styles.zIndex == null || styles.zIndex === "auto" || !Number.isFinite(zIndex) || zIndex < 20) {
     styles.zIndex = "20";
   }
+}
+
+function relaxVirtualScrollClipping(element: Element, styles: Record<string, string>): void {
+  const computed = getComputedStyleFor(element);
+  if (!isScrollableOverflow(computed)) return;
+  if (!hasNegativeVirtualScrollLayer(element) && !hasScrolledVisibleContent(element)) return;
+
+  // Some enterprise shells capture the current viewport by moving scrolled
+  // content into negative coordinates. Figma can clip that offscreen parent
+  // frame before considering visible descendants, so only relax clipping for
+  // scroll viewports that still have visible descendants inside the viewport.
+  styles.overflow = "visible";
+  styles.overflowX = "visible";
+  styles.overflowY = "visible";
+}
+
+function isScrollableOverflow(computed: CSSStyleDeclaration): boolean {
+  return /^(auto|scroll)$/i.test(computed.overflow) ||
+    /^(auto|scroll)$/i.test(computed.overflowX) ||
+    /^(auto|scroll)$/i.test(computed.overflowY);
+}
+
+function hasNegativeVirtualScrollLayer(element: Element): boolean {
+  const viewportRect = element.getBoundingClientRect();
+  if (viewportRect.width < 200 || viewportRect.height < 120) return false;
+
+  for (const child of Array.from(element.children)) {
+    const childComputed = getComputedStyleFor(child);
+    if (childComputed.position !== "absolute") continue;
+
+    const top = parsePx(childComputed.top, NaN);
+    if (!Number.isFinite(top) || top > -32) continue;
+
+    const childRect = child.getBoundingClientRect();
+    const nearViewportHeight = Math.abs(childRect.height - viewportRect.height) <= Math.max(4, viewportRect.height * 0.08);
+    const fillsViewportWidth = childRect.width >= viewportRect.width * 0.7;
+    if (!nearViewportHeight || !fillsViewportWidth) continue;
+
+    if (hasVisibleDescendantInsideRect(child, viewportRect)) return true;
+  }
+
+  return false;
+}
+
+function hasScrolledVisibleContent(element: Element): boolean {
+  if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return false;
+  if (element.scrollTop <= 0 && element.scrollLeft <= 0) return false;
+  if (element.scrollHeight <= element.clientHeight && element.scrollWidth <= element.clientWidth) return false;
+
+  const viewportRect = element.getBoundingClientRect();
+  if (viewportRect.width < 200 || viewportRect.height < 120) return false;
+  return hasVisibleDescendantInsideRect(element, viewportRect);
+}
+
+function hasVisibleDescendantInsideRect(root: Element, viewportRect: DOMRect): boolean {
+  for (const descendant of Array.from(root.querySelectorAll("*"))) {
+    const rect = descendant.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    if (rect.right <= viewportRect.left || rect.left >= viewportRect.right) continue;
+    if (rect.bottom <= viewportRect.top || rect.top >= viewportRect.bottom) continue;
+
+    const computed = getComputedStyleFor(descendant);
+    if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") continue;
+    return true;
+  }
+
+  return false;
 }
 
 function hasDirectVisibleText(element: Element): boolean {
@@ -1414,13 +1487,108 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
   node.styles.width = `${roundPx(node.rect.width)}px`;
   node.styles.height = `${roundPx(node.rect.height)}px`;
   node.styles.boxSizing = "border-box";
+  if (hasSnapshotChildOutsideRect(node)) {
+    node.styles.overflow = "visible";
+    node.styles.overflowX = "visible";
+    node.styles.overflowY = "visible";
+  }
   node.layoutSizingHorizontal = "FIXED";
   node.layoutSizingVertical = "FIXED";
   delete node.declaredStyles;
 
   for (const child of node.childNodes) {
+    if (isElementNodeSnapshot(child)) {
+      rebaseNegativeScrollLayer(node, child);
+    }
     lockSnapshotGeometry(child, node.rect);
   }
+}
+
+function rebaseNegativeScrollLayer(parent: ElementSnapshot, child: ElementSnapshot): void {
+  if (!shouldRebaseNegativeScrollLayer(parent, child)) return;
+
+  if (child.rect.x < parent.rect.x) {
+    child.rect.x = parent.rect.x;
+    child.rect.cssWidth = Math.round(child.rect.width);
+  }
+
+  if (child.rect.y < parent.rect.y) {
+    child.rect.y = parent.rect.y;
+    child.rect.height = Math.min(child.rect.height, parent.rect.height);
+    child.rect.cssHeight = Math.round(child.rect.height);
+  }
+
+  child.styles.overflow = "visible";
+  child.styles.overflowX = "visible";
+  child.styles.overflowY = "visible";
+}
+
+function shouldRebaseNegativeScrollLayer(parent: ElementSnapshot, child: ElementSnapshot): boolean {
+  if (parent.rect.width < 200 || parent.rect.height < 120) return false;
+
+  const aboveOrLeft = child.rect.y < parent.rect.y - 8 || child.rect.x < parent.rect.x - 8;
+  if (!aboveOrLeft) return false;
+
+  const layerSized =
+    child.rect.width >= parent.rect.width * 0.5 ||
+    child.rect.height >= parent.rect.height * 0.5;
+  if (!layerSized) return false;
+
+  return hasSnapshotDescendantInsideRect(child.childNodes, parent.rect);
+}
+
+function hasSnapshotDescendantInsideRect(
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  for (const child of childNodes) {
+    if (isSnapshotRectIntersectingRect(child.rect, rect)) return true;
+    if (
+      child.nodeType === NODE_TYPES.ELEMENT_NODE &&
+      hasSnapshotDescendantInsideRect(child.childNodes, rect)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasSnapshotChildOutsideRect(node: ElementSnapshot): boolean {
+  return node.childNodes.some((child) => isSnapshotRectOutsideRect(child.rect, node.rect));
+}
+
+function isSnapshotRectIntersectingRect(
+  child: { x: number; y: number; width: number; height: number },
+  parent: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (child.width <= 0 || child.height <= 0) return false;
+
+  return !(
+    child.x + child.width <= parent.x ||
+    child.x >= parent.x + parent.width ||
+    child.y + child.height <= parent.y ||
+    child.y >= parent.y + parent.height
+  );
+}
+
+function isSnapshotRectOutsideRect(
+  child: { x: number; y: number; width: number; height: number },
+  parent: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (child.width <= 0 || child.height <= 0) return false;
+
+  const parentRight = parent.x + parent.width;
+  const parentBottom = parent.y + parent.height;
+  const childRight = child.x + child.width;
+  const childBottom = child.y + child.height;
+
+  return (
+    child.x < parent.x ||
+    child.y < parent.y ||
+    childRight > parentRight ||
+    childBottom > parentBottom
+  );
 }
 
 function roundPx(value: number): number {

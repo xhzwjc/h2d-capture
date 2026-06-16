@@ -203,11 +203,48 @@ export function shouldPruneNode(
      rect.y > docH + OFFSCREEN_MARGIN)
   ) {
     if (tag !== "HTML" && tag !== "BODY") {
+      if (hasVisibleSnapshotDescendantInBounds(childNodes, docW, docH)) {
+        return false;
+      }
       return true;
     }
   }
 
   return false;
+}
+
+function hasVisibleSnapshotDescendantInBounds(
+  childNodes: SnapshotNode[],
+  docW: number,
+  docH: number,
+): boolean {
+  for (const child of childNodes) {
+    if (isSnapshotRectInBounds(child.rect, docW, docH)) return true;
+
+    if (
+      child.nodeType === NODE_TYPES.ELEMENT_NODE &&
+      hasVisibleSnapshotDescendantInBounds(child.childNodes, docW, docH)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isSnapshotRectInBounds(
+  rect: { x: number; y: number; width: number; height: number },
+  docW: number,
+  docH: number,
+): boolean {
+  return (
+    rect.width > 0 &&
+    rect.height > 0 &&
+    rect.x + rect.width >= -OFFSCREEN_MARGIN &&
+    rect.x <= docW + OFFSCREEN_MARGIN &&
+    rect.y + rect.height >= -OFFSCREEN_MARGIN &&
+    rect.y <= docH + OFFSCREEN_MARGIN
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -524,11 +524,13 @@
     }, 5000);
 
     try {
+      const beforeDiagnostics = collectDebugDiagnostics(selector);
       const json = await window.figma.capturePage(selector);
+      const afterDiagnostics = collectDebugDiagnostics(selector);
       if (captureAborted) return;
 
       showStatus("Copying debug data...", false);
-      await copyTextToClipboard(makeDebugPayload(json, selector));
+      await copyTextToClipboard(makeDebugPayload(json, selector, beforeDiagnostics, afterDiagnostics));
 
       showStatus("Debug data copied", true);
       if (autoDestroy) {
@@ -548,7 +550,12 @@
     }
   }
 
-  function makeDebugPayload(json: string, selector: string): string {
+  function makeDebugPayload(
+    json: string,
+    selector: string,
+    beforeDiagnostics: ReturnType<typeof collectDebugDiagnostics>,
+    afterDiagnostics: ReturnType<typeof collectDebugDiagnostics>,
+  ): string {
     let payload: unknown;
     try {
       payload = JSON.parse(json);
@@ -572,11 +579,350 @@
           devicePixelRatio: window.devicePixelRatio,
           isFrame,
         },
+        diagnostics: {
+          beforeCapture: beforeDiagnostics,
+          afterCapture: afterDiagnostics,
+        },
         payload,
       },
       null,
       2,
     );
+  }
+
+  function collectDebugDiagnostics(selector: string): Record<string, unknown> {
+    const target = selector === "body" || selector === "html"
+      ? document.documentElement
+      : document.querySelector(selector);
+
+    return {
+      context: {
+        href: location.href,
+        origin: location.origin,
+        title: document.title,
+        readyState: document.readyState,
+        visibilityState: document.visibilityState,
+        hasFocus: document.hasFocus(),
+        isFrame,
+        frameElement: getFrameElementSummary(),
+      },
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+        documentWidth: document.documentElement.scrollWidth,
+        documentHeight: document.documentElement.scrollHeight,
+      },
+      target: isElementNode(target) ? summarizeElement(target) : null,
+      textPresence: collectTextPresence(document.body),
+      keyContainers: collectKeyContainers(),
+      frames: collectFrames(),
+      scrollables: collectScrollableElements(),
+      shadowHosts: collectShadowHosts(),
+      pointHits: collectPointHits(),
+    };
+  }
+
+  function getFrameElementSummary(): Record<string, unknown> | null {
+    try {
+      return isElementNode(window.frameElement) ? summarizeElement(window.frameElement) : null;
+    } catch (err) {
+      return { error: String(err) };
+    }
+  }
+
+  function collectTextPresence(root: Node | null): Record<string, unknown> {
+    const text = root ? normalizeText(root.textContent || "") : "";
+    const visibleText = root ? normalizeText(getVisibleText(root)) : "";
+
+    return {
+      textLength: text.length,
+      sample: text.slice(0, 500),
+      terms: Object.fromEntries(DEBUG_TEXT_TERMS.map((term) => [term, text.includes(term)])),
+      visibleTextLength: visibleText.length,
+      visibleSample: visibleText.slice(0, 500),
+      visibleTerms: Object.fromEntries(DEBUG_TEXT_TERMS.map((term) => [term, visibleText.includes(term)])),
+    };
+  }
+
+  const DEBUG_TEXT_TERMS = [
+    "渠道运营",
+    "招聘提效",
+    "保存并发布广告",
+    "仅保存",
+    "职位信息",
+    "职位详情",
+    "职位设置",
+    "岗位招聘要求对照",
+    "txq@xiaowubrother.com",
+    "请选择",
+    "请输入",
+    "招聘管理系统",
+    "CS_招聘",
+    "简历收取邮箱",
+    "招聘提效",
+  ];
+
+  function collectKeyContainers(
+    doc: Document = document,
+    includeIframeAppSelectors: boolean = false,
+  ): Array<Record<string, unknown>> {
+    const selectors = [
+      "#convoy-container",
+      "#subapp-container",
+      "#iTalentFrame",
+      "#bsMain",
+      "#bs_layout_container",
+      "[data-page='main']",
+      "main",
+      "body",
+      ...(includeIframeAppSelectors
+        ? [
+            "[id*='SystemStandardForm']",
+            "[class*='SystemStandardForm']",
+            "[class*='bs-']",
+            "[class*='scroll']",
+            "[class*='Scroll']",
+            "[style*='translate']",
+          ]
+        : []),
+    ];
+
+    const containers: Array<Record<string, unknown>> = [];
+    for (const selector of selectors) {
+      let elements: Element[] = [];
+      try {
+        elements = Array.from(doc.querySelectorAll(selector)).slice(0, 8);
+      } catch (err) {
+        containers.push({ selector, error: String(err) });
+        continue;
+      }
+
+      for (const element of elements) {
+        containers.push({ selector, ...summarizeElement(element) });
+      }
+    }
+
+    return containers;
+  }
+
+  function collectFrames(): Array<Record<string, unknown>> {
+    return Array.from(document.querySelectorAll("iframe, frame")).slice(0, 20).map((frame) => {
+      const summary = summarizeElement(frame);
+      const frameElement = frame as HTMLIFrameElement;
+      let readable: Record<string, unknown>;
+
+      try {
+        const frameDocument = frameElement.contentDocument;
+        readable = frameDocument
+          ? {
+              readable: true,
+              href: frameDocument.location.href,
+              title: frameDocument.title,
+              readyState: frameDocument.readyState,
+              body: frameDocument.body ? summarizeElement(frameDocument.body) : null,
+              textPresence: collectTextPresence(frameDocument.body),
+              keyContainers: collectKeyContainers(frameDocument, true),
+              scrollables: collectScrollableElements(frameDocument),
+              pointHits: collectPointHits(frameDocument),
+              visibleTextNodes: collectVisibleTextNodes(frameDocument),
+            }
+          : { readable: false, reason: "contentDocument is null" };
+      } catch (err) {
+        readable = { readable: false, error: String(err) };
+      }
+
+      return {
+        ...summary,
+        src: frameElement.src || frame.getAttribute("src"),
+        name: frameElement.name || frame.getAttribute("name"),
+        readable,
+      };
+    });
+  }
+
+  function collectScrollableElements(doc: Document = document): Array<Record<string, unknown>> {
+    return Array.from(doc.querySelectorAll("*"))
+      .filter((element) => element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth)
+      .slice(0, 50)
+      .map((element) => summarizeElement(element, false));
+  }
+
+  function collectShadowHosts(doc: Document = document): Array<Record<string, unknown>> {
+    return Array.from(doc.querySelectorAll("*"))
+      .filter((element) => Boolean(element.shadowRoot))
+      .slice(0, 20)
+      .map((element) => ({
+        ...summarizeElement(element, false),
+        shadowTextPresence: collectTextPresence(element.shadowRoot),
+      }));
+  }
+
+  function collectPointHits(doc: Document = document): Array<Record<string, unknown>> {
+    const view = doc.defaultView ?? window;
+    const points = [
+      { name: "center", x: view.innerWidth / 2, y: view.innerHeight / 2 },
+      { name: "contentCenter", x: view.innerWidth * 0.55, y: view.innerHeight * 0.55 },
+      { name: "contentBottom", x: view.innerWidth * 0.55, y: view.innerHeight * 0.78 },
+      { name: "rightNav", x: view.innerWidth * 0.9, y: view.innerHeight * 0.5 },
+      { name: "leftNav", x: 80, y: view.innerHeight * 0.5 },
+    ];
+
+    return points.map((point) => {
+      const element = doc.elementFromPoint(point.x, point.y);
+      return {
+        ...point,
+        hit: isElementNode(element) ? summarizeElement(element) : null,
+        chain: isElementNode(element) ? summarizeElementChain(element) : [],
+      };
+    });
+  }
+
+  function summarizeElementChain(element: Element): Array<Record<string, unknown>> {
+    const chain: Array<Record<string, unknown>> = [];
+    let current: Element | null = element;
+    while (current && chain.length < 8) {
+      chain.push(summarizeElement(current, false));
+      current = current.parentElement;
+    }
+    return chain;
+  }
+
+  function collectVisibleTextNodes(doc: Document): Array<Record<string, unknown>> {
+    if (!doc.body) return [];
+
+    const matches: Array<Record<string, unknown>> = [];
+    const walker = doc.createTreeWalker(doc.body, 4);
+    let node = walker.nextNode();
+
+    while (node && matches.length < 30) {
+      const text = normalizeText(node.textContent || "");
+      if (text && DEBUG_TEXT_TERMS.some((term) => text.includes(term))) {
+        const parent = node.parentElement;
+        if (parent && isTextNodeVisible(node, parent)) {
+          const range = doc.createRange();
+          range.selectNodeContents(node);
+          const rect = range.getBoundingClientRect();
+          range.detach();
+
+          matches.push({
+            text: text.slice(0, 240),
+            rect: {
+              x: roundNumber(rect.x),
+              y: roundNumber(rect.y),
+              width: roundNumber(rect.width),
+              height: roundNumber(rect.height),
+            },
+            parent: summarizeElement(parent, false),
+          });
+        }
+      }
+
+      node = walker.nextNode();
+    }
+
+    return matches;
+  }
+
+  function isTextNodeVisible(node: Node, parent: Element): boolean {
+    const computed = getElementWindow(parent).getComputedStyle(parent);
+    if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+    const range = getElementDocument(parent).createRange();
+    range.selectNodeContents(node);
+    const rect = range.getBoundingClientRect();
+    range.detach();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function summarizeElement(element: Element, includeText: boolean = true): Record<string, unknown> {
+    const computed = getElementWindow(element).getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    const text = includeText ? normalizeText(element.textContent || "") : "";
+
+    const summary: Record<string, unknown> = {
+      tag: element.tagName,
+      id: element.id || undefined,
+      className: stringifyClassName(element).slice(0, 180) || undefined,
+      role: element.getAttribute("role") || undefined,
+      ariaHidden: element.getAttribute("aria-hidden") || undefined,
+      dataPage: element.getAttribute("data-page") || undefined,
+      rect: {
+        x: roundNumber(rect.x),
+        y: roundNumber(rect.y),
+        width: roundNumber(rect.width),
+        height: roundNumber(rect.height),
+      },
+      scroll: {
+        top: roundNumber(element.scrollTop),
+        left: roundNumber(element.scrollLeft),
+        width: roundNumber(element.scrollWidth),
+        height: roundNumber(element.scrollHeight),
+        clientWidth: roundNumber(element.clientWidth),
+        clientHeight: roundNumber(element.clientHeight),
+      },
+      computed: {
+        display: computed.display,
+        position: computed.position,
+        overflow: computed.overflow,
+        overflowX: computed.overflowX,
+        overflowY: computed.overflowY,
+        visibility: computed.visibility,
+        opacity: computed.opacity,
+        transform: computed.transform,
+        zIndex: computed.zIndex,
+        top: computed.top,
+        left: computed.left,
+        width: computed.width,
+        height: computed.height,
+      },
+      childElementCount: element.childElementCount,
+    };
+
+    if (includeText) {
+      summary.textLength = text.length;
+      summary.textSample = text.slice(0, 300);
+    }
+
+    return summary;
+  }
+
+  function stringifyClassName(element: Element): string {
+    const className = (element as HTMLElement | SVGElement).className;
+    if (typeof className === "string") return className;
+    if (className && typeof className === "object" && "baseVal" in className) {
+      return String((className as SVGAnimatedString).baseVal || "");
+    }
+    return "";
+  }
+
+  function normalizeText(value: string): string {
+    return value.replace(/\s+/g, " ").trim();
+  }
+
+  function getVisibleText(root: Node): string {
+    if ("innerText" in root && typeof root.innerText === "string") {
+      return root.innerText;
+    }
+    return root.textContent || "";
+  }
+
+  function isElementNode(value: unknown): value is Element {
+    return Boolean(value && typeof value === "object" && (value as Node).nodeType === Node.ELEMENT_NODE);
+  }
+
+  function getElementDocument(element: Element): Document {
+    return element.ownerDocument ?? document;
+  }
+
+  function getElementWindow(element: Element): Window {
+    return getElementDocument(element).defaultView ?? window;
+  }
+
+  function roundNumber(value: number): number {
+    return Math.round(value * 1000) / 1000;
   }
 
   function stripAssetBase64(value: unknown): void {
