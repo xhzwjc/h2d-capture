@@ -171,12 +171,14 @@ async function captureDOMInner(
 
     const blobMap = await assetCollector.getBlobMap();
     const fonts = fontCollector.getFonts();
-    const { width, height } = element.getBoundingClientRect();
+    const elementRect = element.getBoundingClientRect();
+    const { width, height } = elementRect;
 
     if (!serialized || serialized.nodeType !== NODE_TYPES.ELEMENT_NODE) {
       throw new Error("Container node could not be serialized");
     }
     const rootSnapshot = serialized as ElementSnapshot;
+    normalizeElementCaptureOrigin(rootSnapshot, elementRect);
     removeStackedSelectClones(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
@@ -254,6 +256,11 @@ async function captureDOMInner(
   }
 
   throw new Error("Container node must be an Element or Document");
+}
+
+function normalizeElementCaptureOrigin(rootSnapshot: ElementSnapshot, elementRect: DOMRect): void {
+  if (elementRect.x === 0 && elementRect.y === 0) return;
+  offsetSnapshotNode(rootSnapshot, -elementRect.x, -elementRect.y);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +454,8 @@ function snapshotElement(
     computedStyles.overflowY = "visible";
   }
 
+  stabilizeTopChromeLayout(element, computedStyles, childNodes);
+
   // Pseudo-element styles (::before, ::after, ::placeholder).
   let pseudoElementStyles: Record<string, Record<string, string>> | undefined;
   const materializedPseudoElements = materializePseudoElements(element, childNodes);
@@ -482,6 +491,7 @@ function snapshotElement(
   // Element bounding rect (may include rotated quad).
   let rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
+  rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
 
   // Prune invisible nodes (zero-size without children, offscreen, etc.)
   if (shouldPruneNode(element, rect, childNodes)) {
@@ -732,6 +742,178 @@ function getDirectTextNodes(element: Element): Node[] {
   }
 
   return textNodes;
+}
+
+function stabilizeTopChromeLayout(
+  element: Element,
+  styles: Record<string, string>,
+  childNodes: SnapshotNode[],
+): void {
+  if (!isTopChromeContainer(element, childNodes)) return;
+
+  styles.position = styles.position && styles.position !== "static" ? styles.position : "relative";
+  styles.overflow = "visible";
+  styles.overflowX = "visible";
+  styles.overflowY = "visible";
+
+  const parentRect = element.getBoundingClientRect();
+  for (const child of childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (!isDirectTopChromeChild(child, parentRect)) continue;
+    anchorSnapshotToParent(child, parentRect);
+  }
+}
+
+function isTopChromeContainer(element: Element, childNodes: SnapshotNode[]): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.y > 96 || rect.height < 12 || rect.height > 72 || rect.width <= 0) return false;
+  if (isTopChromeInlineGroup(element, childNodes, rect)) return true;
+  if (rect.width < 320) return false;
+
+  const identity = getElementIdentity(element);
+  if (/(^|[-_\s])(navbar|nav-bar|topbar|top-bar|app-header|header)([-_\s]|$)/i.test(identity)) {
+    return hasTopChromeDirectChildren(childNodes, rect);
+  }
+
+  if (!hasTopChromeAnchors(element)) return false;
+  return hasTopChromeDirectChildren(childNodes, rect);
+}
+
+function isTopChromeInlineGroup(
+  element: Element,
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (!hasElementSnapshotChild(childNodes)) return false;
+
+  const identity = getElementIdentity(element);
+  if (!/(^|[-_\s])(breadcrumb|right-menu|avatar|hamburger|user-avatar|hover-effect|el-breadcrumb|el-dropdown)([-_\s]|$)/i.test(identity)) {
+    return false;
+  }
+
+  return childNodes.some((child) => isElementNodeSnapshot(child) && isDirectTopChromeChild(child, rect));
+}
+
+function hasElementSnapshotChild(childNodes: SnapshotNode[]): boolean {
+  return childNodes.some(isElementNodeSnapshot);
+}
+
+function hasTopChromeAnchors(element: Element): boolean {
+  return Boolean(element.querySelector(
+    "#breadcrumb-container, #hamburger-container, .right-menu, .avatar-container, .navbar",
+  ));
+}
+
+function hasTopChromeDirectChildren(
+  childNodes: SnapshotNode[],
+  parentRect: { x: number; y: number; width: number; height: number },
+): boolean {
+  let leftChrome = false;
+  let rightChrome = false;
+
+  for (const child of childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (!isDirectTopChromeChild(child, parentRect)) continue;
+
+    const childCenter = child.rect.x + child.rect.width / 2;
+    if (childCenter < parentRect.x + parentRect.width * 0.35) leftChrome = true;
+    if (childCenter > parentRect.x + parentRect.width * 0.65) rightChrome = true;
+  }
+
+  return leftChrome || rightChrome;
+}
+
+function isDirectTopChromeChild(
+  child: ElementSnapshot,
+  parentRect: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (child.rect.width <= 0 || child.rect.height <= 0) return false;
+  if (child.rect.height > parentRect.height + 8) return false;
+  if (child.rect.y < parentRect.y - 4 || child.rect.y > parentRect.y + parentRect.height + 4) return false;
+  if (child.rect.x + child.rect.width < parentRect.x - 4) return false;
+  if (child.rect.x > parentRect.x + parentRect.width + 4) return false;
+  return true;
+}
+
+function anchorSnapshotToParent(
+  node: ElementSnapshot,
+  parentRect: { x: number; y: number; width: number; height: number },
+): void {
+  delete node.styles.flexGrow;
+  delete node.styles.flexShrink;
+  delete node.styles.flexBasis;
+  delete node.styles.alignSelf;
+  delete node.styles.order;
+  delete node.styles.gridColumn;
+  delete node.styles.gridColumnStart;
+  delete node.styles.gridColumnEnd;
+  delete node.styles.gridRow;
+  delete node.styles.gridRowStart;
+  delete node.styles.gridRowEnd;
+  delete node.styles.margin;
+  delete node.styles.marginTop;
+  delete node.styles.marginRight;
+  delete node.styles.marginBottom;
+  delete node.styles.marginLeft;
+
+  node.styles.position = "absolute";
+  node.styles.left = `${roundPx(node.rect.x - parentRect.x)}px`;
+  node.styles.top = `${roundPx(node.rect.y - parentRect.y)}px`;
+  node.styles.width = `${roundPx(node.rect.width)}px`;
+  node.styles.height = `${roundPx(node.rect.height)}px`;
+  node.styles.boxSizing = "border-box";
+  node.styles.cssFloat = "none";
+  node.layoutSizingHorizontal = "FIXED";
+  node.layoutSizingVertical = "FIXED";
+}
+
+function getElementIdentity(element: Element): string {
+  return `${String((element as HTMLElement | SVGElement).className || "")} ${element.id || ""} ${element.getAttribute("role") || ""}`;
+}
+
+function normalizeTopChromeTextLineBox(
+  element: Element,
+  styles: Record<string, string>,
+  childNodes: SnapshotNode[],
+  rect: ElementRect,
+): ElementRect {
+  if (!hasDirectTextSnapshot(childNodes)) return rect;
+
+  const lineBox = getBreadcrumbLineBox(element);
+  if (!lineBox) return rect;
+  if (rect.width <= 0 || rect.height <= 0 || rect.height >= lineBox.height * 0.75) return rect;
+
+  const targetTextTop = lineBox.y + Math.max(0, (lineBox.height - rect.height) / 2);
+  const textDelta = targetTextTop - rect.y;
+  for (const child of childNodes) {
+    if (child.nodeType !== NODE_TYPES.TEXT_NODE || !child.text.trim()) continue;
+    child.rect.y = roundPx(child.rect.y + textDelta);
+  }
+
+  styles.display = styles.display === "inline" ? "block" : styles.display;
+  styles.height = `${roundPx(lineBox.height)}px`;
+  styles.lineHeight = `${roundPx(lineBox.height)}px`;
+  styles.verticalAlign = "top";
+
+  return {
+    ...rect,
+    y: lineBox.y,
+    height: lineBox.height,
+    cssHeight: Math.round(lineBox.height),
+  };
+}
+
+function hasDirectTextSnapshot(childNodes: SnapshotNode[]): boolean {
+  return childNodes.some((child) => child.nodeType === NODE_TYPES.TEXT_NODE && child.text.trim());
+}
+
+function getBreadcrumbLineBox(element: Element): DOMRect | null {
+  const breadcrumb = element.closest?.("#breadcrumb-container, .el-breadcrumb, [aria-label=\"面包屑\"]");
+  if (!breadcrumb) return null;
+
+  const rect = breadcrumb.getBoundingClientRect();
+  if (rect.y > 96 || rect.height < 32 || rect.height > 72 || rect.width <= 0) return null;
+  return rect;
 }
 
 function ensureInputPrefixIconsStackAbove(childNodes: SnapshotNode[]): void {

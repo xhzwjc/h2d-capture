@@ -865,6 +865,7 @@
       },
       computed: {
         display: computed.display,
+        cssFloat: computed.cssFloat,
         position: computed.position,
         overflow: computed.overflow,
         overflowX: computed.overflowX,

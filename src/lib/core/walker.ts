@@ -98,9 +98,12 @@ function isHiddenPopupLayer(element: Element): boolean {
 
   const identity = `${String((element as HTMLElement | SVGElement).className || "")} ${element.id || ""} ${element.getAttribute("role") || ""}`;
   if (/(^|[-_\s])(anticon|svg-icon|icon)([-_\s]|$)/i.test(identity)) return false;
-  const definitePopup = /(^|[-_\s])(popper|popover|dropdown|select-dropdown|picker-dropdown|menu|listbox)([-_\s]|$)/i.test(identity);
-  if (!definitePopup && /(^|[-_\s])(trigger|reference)([-_\s]|$)/i.test(identity)) return false;
+  if (isVisibleChromeControl(element, identity)) return false;
+  if (isPopupTriggerElement(element, identity)) return false;
 
+  const definitePopup =
+    /(^|[-_\s])(popper|popover|select-dropdown|picker-dropdown|menu|listbox)([-_\s]|$)/i.test(identity) ||
+    /(^|[-_\s])dropdown[-_\s_]*(menu|popper|panel|content)([-_\s]|$)/i.test(identity);
   const looksLikePopup = definitePopup || /(^|[-_\s])tooltip([-_\s]|$)/i.test(identity);
   if (!looksLikePopup) return false;
 
@@ -117,6 +120,34 @@ function isHiddenPopupLayer(element: Element): boolean {
   }
 
   return isEmptyPopupLayer(element);
+}
+
+function isPopupTriggerElement(element: Element, identity: string): boolean {
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  if (role === "button" || role === "link" || role === "combobox") return true;
+  if (/(^|[-_\s])(trigger|reference)([-_\s]|$)/i.test(identity)) return true;
+
+  // Element Plus uses `el-dropdown` for the visible trigger wrapper and
+  // `el-dropdown__popper` / menu classes for the detached popup.
+  return (
+    /(^|[-_\s])el-dropdown([-_\s]|$)/i.test(identity) &&
+    !/(popper|menu|panel|content|listbox)/i.test(identity)
+  );
+}
+
+function isVisibleChromeControl(element: Element, identity: string): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  if (!/(^|[-_\s])(avatar|right-menu|navbar|breadcrumb|hamburger|user-avatar|hover-effect)([-_\s]|$)/i.test(identity)) {
+    const closest = element.closest?.(
+      ".avatar-container, .right-menu, .navbar, #breadcrumb-container, #hamburger-container",
+    );
+    if (!closest) return false;
+  }
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+  return true;
 }
 
 function isEmptyPopupLayer(element: Element): boolean {

@@ -72,6 +72,7 @@ export const BASELINE_STYLES: Record<string, string> = {
   containerType: "normal",
   content: "normal",
   contentVisibility: "visible",
+  cssFloat: "none",
   display: "",
   filter: "none",
   flexBasis: "auto",

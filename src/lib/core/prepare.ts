@@ -72,13 +72,17 @@ export function cleanupScrollbar(): void {
 }
 
 /**
- * Hide scrollbars by injecting a <style> that forces overlay/hidden scrollbars.
+ * Install temporary capture styles: hide scrollbars and force immediate
+ * scrolling so capture does not sample during a smooth-scroll transition.
  * Returns a cleanup function to restore the original state.
  */
-function hideScrollbars(): () => void {
+function installCapturePreparationStyles(): () => void {
   const styleEl = document.createElement("style");
   styleEl.setAttribute("data-h2d-capture", "scrollbar-hide");
   styleEl.textContent = `
+    html, body, * {
+      scroll-behavior: auto !important;
+    }
     html, body {
       scrollbar-width: none !important;
     }
@@ -114,13 +118,14 @@ async function scrollToTriggerLazyLoad(container: Element): Promise<void> {
   const isRoot =
     container === document.documentElement || container === document.body;
 
+  // Do not scroll the top-level page during interactive extension captures.
+  // Admin shells often hide or animate top chrome while the window scrolls;
+  // sampling during or just after that transition drops navbar content.
+  if (isRoot) return;
+
   // Snapshot height ONCE — do not re-read, as infinite scroll sites grow it
-  const rawHeight = isRoot
-    ? document.documentElement.scrollHeight
-    : container.scrollHeight;
-  const viewportHeight = isRoot
-    ? window.innerHeight
-    : (container as HTMLElement).clientHeight;
+  const rawHeight = container.scrollHeight;
+  const viewportHeight = (container as HTMLElement).clientHeight;
 
   if (rawHeight <= viewportHeight) return;
 
@@ -131,15 +136,51 @@ async function scrollToTriggerLazyLoad(container: Element): Promise<void> {
   for (let i = 0; i <= steps; i++) {
     const scrollTo = Math.min(i * stepSize, totalHeight);
     if (isRoot) {
-      window.scrollTo(0, scrollTo);
+      setRootScroll(0, scrollTo);
     } else {
-      container.scrollTop = scrollTo;
+      setElementScroll(container, 0, scrollTo);
     }
     await new Promise((r) => setTimeout(r, 150));
   }
 
   // Brief wait for final images to start loading
   await new Promise((r) => setTimeout(r, 300));
+}
+
+function setRootScroll(left: number, top: number): void {
+  window.scrollTo({ left, top, behavior: "auto" });
+  document.documentElement.scrollLeft = left;
+  document.documentElement.scrollTop = top;
+  document.body.scrollLeft = left;
+  document.body.scrollTop = top;
+}
+
+function setElementScroll(container: Element, left: number, top: number): void {
+  container.scrollLeft = left;
+  container.scrollTop = top;
+}
+
+async function waitForScrollRestore(container: Element, isRoot: boolean): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    const currentLeft = isRoot
+      ? window.scrollX || document.documentElement.scrollLeft || document.body.scrollLeft
+      : container.scrollLeft;
+    const currentTop = isRoot
+      ? window.scrollY || document.documentElement.scrollTop || document.body.scrollTop
+      : container.scrollTop;
+
+    if (Math.abs(currentLeft) <= 1 && Math.abs(currentTop) <= 1) {
+      return;
+    }
+
+    if (isRoot) {
+      setRootScroll(0, 0);
+    } else {
+      setElementScroll(container, 0, 0);
+    }
+  }
 }
 
 /**
@@ -223,6 +264,10 @@ export async function prepareForCapture(container: Element): Promise<void> {
   const isRoot =
     container === document.documentElement || container === document.body;
 
+  // Install before any scrolling so pages with `scroll-behavior: smooth` do
+  // not leave sticky headers mid-transition when snapshotting starts.
+  restoreScrollbar = installCapturePreparationStyles();
+
   // Step 1: rewrite data-src / data-srcset attributes directly
   forceLazyImages(container);
 
@@ -231,15 +276,11 @@ export async function prepareForCapture(container: Element): Promise<void> {
 
   // Step 3: scroll to top for consistent rect measurement
   if (isRoot) {
-    window.scrollTo(0, 0);
+    setRootScroll(0, 0);
   } else {
-    container.scrollTop = 0;
+    setElementScroll(container, 0, 0);
   }
-
-  // Step 4: hide scrollbars so they don't eat into viewport width
-  // (e.g. 1280 - 15px scrollbar = 1265). Overlay scrollbar via CSS
-  // keeps the content at the full viewport width.
-  restoreScrollbar = hideScrollbars();
+  await waitForScrollRestore(container, isRoot);
 
   // Wait for layout to settle
   await new Promise((r) => setTimeout(r, 100));
