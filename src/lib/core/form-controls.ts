@@ -1,0 +1,773 @@
+import type { ElementRect, ElementSnapshot, SnapshotNode, TextSnapshot } from '../types.js';
+import { getComputedStyleFor } from './dom.js';
+import { NODE_TYPES, isNodeVisible } from './walker.js';
+
+type IdFactory = (node: Node | null) => string;
+
+type PlaceholderSource = "visible text" | "placeholder element" | "input.placeholder" | "aria-placeholder" | "title" | "empty";
+
+interface SelectDisplayText {
+  text: string;
+  source: PlaceholderSource;
+  sourceElement?: Element;
+  isPlaceholder: boolean;
+}
+
+interface SelectControl {
+  root: Element;
+  visualBox: Element;
+  input?: HTMLInputElement;
+  displayText: SelectDisplayText;
+  arrow?: Element;
+  arrowRect: DOMRect;
+  arrowInside: boolean;
+}
+
+const SELECT_ROOT_CLASS_PATTERN =
+  /(^|[-_\s])(select|dropdown|picker|cascader|combobox)([-_\s]|$)/i;
+const SELECT_VISUAL_CLASS_PATTERN =
+  /(^|[-_\s])(selector|selection|control|wrapper|trigger|field)([-_\s]|$)/i;
+const SELECT_INTERNAL_CLASS_PATTERN =
+  /(^|[-_\s])(placeholder|search|rendered|arrow|suffix|prefix|caret|icon|clear|item|option|menu|list)([-_\s]|$)/i;
+const PLACEHOLDER_CLASS_PATTERN = /(^|[-_\s])placeholder([-_\s]|$)/i;
+const ARROW_CLASS_PATTERN = /(^|[-_\s])(arrow|suffix|caret|chevron|icon)([-_\s]|$)/i;
+const SELECT_ARIA_POPUPS = new Set(["listbox", "menu", "tree", "grid", "dialog"]);
+
+let debugLoggedCount = 0;
+let debugLoggedControls = new WeakSet<Element>();
+
+export function resetFormControlDebugState(): void {
+  debugLoggedCount = 0;
+  debugLoggedControls = new WeakSet<Element>();
+}
+
+export function snapshotSelectControl(element: Element, createId: IdFactory): ElementSnapshot | null {
+  const control = detectSelectControl(element);
+  if (!control) return null;
+
+  logSelectControlDebug(control);
+  return createSelectSnapshot(control, createId);
+}
+
+export function detectSelectControl(element: Element): SelectControl | null {
+  if (!isSelectRootCandidate(element)) return null;
+
+  const visualBox = findSelectVisualBox(element);
+  const visualRect = visualBox.getBoundingClientRect();
+  if (!isReasonableControlRect(visualRect)) return null;
+
+  if (hasCanonicalSelectAncestor(element, visualBox)) return null;
+
+  const displayText = extractSelectDisplayText(element);
+  const arrow = findSelectArrow(element, visualBox);
+  const arrowRect = computeArrowRect(arrow, visualBox);
+
+  return {
+    root: element,
+    visualBox,
+    input: findSelectInput(element),
+    displayText,
+    arrow,
+    arrowRect,
+    arrowInside: arrow ? isRectInside(arrow.getBoundingClientRect(), visualRect) : false,
+  };
+}
+
+export function findSelectVisualBox(root: Element): Element {
+  const rootRect = root.getBoundingClientRect();
+  let best: { element: Element; score: number } | null = null;
+
+  for (const element of [root, ...Array.from(root.querySelectorAll("*"))]) {
+    if (!canBeSelectVisualBox(element)) continue;
+
+    const rect = element.getBoundingClientRect();
+    if (!isReasonableControlRect(rect)) continue;
+
+    const className = getElementIdentity(element);
+    if (SELECT_INTERNAL_CLASS_PATTERN.test(className) && !/selection/i.test(className)) continue;
+
+    const computed = getComputedStyleFor(element);
+    const visualScore = getVisualBoxScore(element, computed, rootRect);
+    if (visualScore <= 0) continue;
+
+    if (!best || visualScore > best.score) {
+      best = { element, score: visualScore };
+    }
+  }
+
+  return best?.element ?? root;
+}
+
+function canBeSelectVisualBox(element: Element): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" || tag === "UL" || tag === "LI" || tag === "SVG" || tag === "I") {
+    return false;
+  }
+
+  const identity = getElementIdentity(element);
+  if (/(^|[-_\s])(search|rendered|placeholder|arrow|suffix|prefix|caret|icon|clear|item|option|menu|list)([-_\s]|$)/i.test(identity)) {
+    return false;
+  }
+
+  return true;
+}
+
+export function extractSelectDisplayText(root: Element): SelectDisplayText {
+  const selectedText = findSelectedVisibleText(root);
+  if (selectedText.text) return selectedText;
+
+  const placeholderElement = findPlaceholderElement(root);
+  if (placeholderElement) {
+    const text = getVisibleText(placeholderElement);
+    if (text) {
+      return {
+        text,
+        source: "placeholder element",
+        sourceElement: placeholderElement,
+        isPlaceholder: true,
+      };
+    }
+  }
+
+  const input = findSelectInput(root);
+  if (input?.value) {
+    return {
+      text: input.value,
+      source: "visible text",
+      sourceElement: input,
+      isPlaceholder: false,
+    };
+  }
+
+  if (input?.placeholder) {
+    return {
+      text: input.placeholder,
+      source: "input.placeholder",
+      sourceElement: input,
+      isPlaceholder: true,
+    };
+  }
+
+  const ariaPlaceholder = root.getAttribute("aria-placeholder");
+  if (ariaPlaceholder) {
+    return { text: ariaPlaceholder, source: "aria-placeholder", isPlaceholder: true };
+  }
+
+  const title = root.getAttribute("title");
+  if (title) {
+    return { text: title, source: "title", isPlaceholder: true };
+  }
+
+  return { text: "", source: "empty", isPlaceholder: true };
+}
+
+export function findSelectArrow(root: Element, visualBox: Element): Element | undefined {
+  const visualRect = visualBox.getBoundingClientRect();
+  let best: { element: Element; score: number } | undefined;
+
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    const tag = element.tagName.toUpperCase();
+    const className = getElementIdentity(element);
+    const classMatch = ARROW_CLASS_PATTERN.test(className);
+    const svgLike = tag === "SVG" || tag === "I";
+    if (!classMatch && !svgLike) continue;
+
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+
+    const rightDistance = Math.abs(visualRect.right - rect.right);
+    const centerDelta = Math.abs((rect.top + rect.height / 2) - (visualRect.top + visualRect.height / 2));
+    if (!classMatch && rightDistance > 40) continue;
+
+    const score =
+      (classMatch ? 60 : 0) +
+      (svgLike ? 20 : 0) +
+      Math.max(0, 40 - rightDistance) +
+      Math.max(0, 20 - centerDelta);
+
+    if (!best || score > best.score) {
+      best = { element, score };
+    }
+  }
+
+  return best?.element;
+}
+
+function createSelectSnapshot(control: SelectControl, createId: IdFactory): ElementSnapshot {
+  const visualRect = control.visualBox.getBoundingClientRect();
+  const visualComputed = getComputedStyleFor(control.visualBox);
+  const textComputed = control.displayText.sourceElement
+    ? getComputedStyleFor(control.displayText.sourceElement)
+    : visualComputed;
+  const rootRect = toElementRect(visualRect);
+  const textRect = computeTextRect(control, visualComputed, textComputed);
+  const arrowRect = clampArrowRect(control.arrowRect, visualRect);
+  const border = getBorderStyles(control.visualBox, visualComputed);
+
+  const textNode: TextSnapshot = {
+    nodeType: NODE_TYPES.TEXT_NODE,
+    id: createId(null),
+    text: control.displayText.text,
+    rect: {
+      x: textRect.x,
+      y: textRect.y,
+      width: textRect.width,
+      height: textRect.height,
+    },
+    lineCount: 1,
+  };
+
+  const textLayer: ElementSnapshot = {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-select-text": control.displayText.source },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: `${roundPx(textRect.x - visualRect.x)}px`,
+      top: `${roundPx(textRect.y - visualRect.y)}px`,
+      width: `${roundPx(textRect.width)}px`,
+      height: `${roundPx(textRect.height)}px`,
+      overflow: "hidden",
+      color: firstVisibleColor(textComputed.color, control.displayText.isPlaceholder ? "rgb(176, 178, 184)" : visualComputed.color),
+      fontFamily: textComputed.fontFamily || visualComputed.fontFamily,
+      fontSize: textComputed.fontSize || visualComputed.fontSize,
+      fontWeight: textComputed.fontWeight || visualComputed.fontWeight,
+      lineHeight: textComputed.lineHeight || visualComputed.lineHeight,
+      whiteSpace: "nowrap",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(textRect),
+    childNodes: control.displayText.text ? [textNode] : [],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+
+  const arrowLayer: ElementSnapshot = {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(null),
+    tag: "SVG",
+    attributes: { "data-h2d-select-arrow": control.arrow ? "source" : "generated" },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: `${roundPx(arrowRect.x - visualRect.x)}px`,
+      top: `${roundPx(arrowRect.y - visualRect.y)}px`,
+      width: `${roundPx(arrowRect.width)}px`,
+      height: `${roundPx(arrowRect.height)}px`,
+      color: control.arrow ? getComputedStyleFor(control.arrow).color : firstVisibleColor(visualComputed.color, "rgb(134, 136, 143)"),
+      overflow: "visible",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(arrowRect),
+    childNodes: [],
+    content: createChevronSvg(control.arrow ? getComputedStyleFor(control.arrow).color : firstVisibleColor(visualComputed.color, "rgb(134, 136, 143)")),
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(control.root),
+    tag: "DIV",
+    attributes: {
+      "data-h2d-select-control": "true",
+      role: "combobox",
+    },
+    styles: {
+      display: "block",
+      position: "relative",
+      boxSizing: "border-box",
+      width: `${roundPx(visualRect.width)}px`,
+      height: `${roundPx(visualRect.height)}px`,
+      overflow: "hidden",
+      backgroundColor: getBackgroundColor(visualComputed),
+      ...border,
+      borderTopLeftRadius: getRadius(visualComputed, "borderTopLeftRadius"),
+      borderTopRightRadius: getRadius(visualComputed, "borderTopRightRadius"),
+      borderBottomRightRadius: getRadius(visualComputed, "borderBottomRightRadius"),
+      borderBottomLeftRadius: getRadius(visualComputed, "borderBottomLeftRadius"),
+      fontFamily: visualComputed.fontFamily,
+      fontSize: visualComputed.fontSize,
+      fontWeight: visualComputed.fontWeight,
+      lineHeight: visualComputed.lineHeight,
+      color: visualComputed.color,
+    },
+    rect: rootRect,
+    childNodes: [textLayer, arrowLayer],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function isSelectRootCandidate(element: Element): boolean {
+  if (!isNodeVisible(element)) return false;
+
+  const tag = element.tagName.toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON" || tag === "SELECT") return false;
+  if (tag === "SVG" || tag === "I" || tag === "UL" || tag === "LI") return false;
+
+  const identity = getElementIdentity(element);
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  const ariaHasPopup = (element.getAttribute("aria-haspopup") || "").toLowerCase();
+  const hasSelectClass = SELECT_ROOT_CLASS_PATTERN.test(identity);
+  const hasSelectRole = role === "combobox";
+  const hasSelectPopup = ariaHasPopup.split(/\s+/).some((value) => SELECT_ARIA_POPUPS.has(value));
+  const hasExplicitSelfSignal = hasSelectClass || hasSelectRole || hasSelectPopup;
+  const input = findSelectInput(element);
+  const arrow = findSelectArrow(element, element);
+  const hasReadonlyInput = Boolean(input?.readOnly);
+  const hasComboboxInput = Boolean(input?.getAttribute("role")?.toLowerCase() === "combobox");
+  const hasFallbackVisualSelf = elementLooksLikeControlSurface(element);
+
+  if (!hasExplicitSelfSignal && hasExplicitSelectDescendant(element)) {
+    return false;
+  }
+
+  return (
+    hasExplicitSelfSignal ||
+    ((hasReadonlyInput || hasComboboxInput) && Boolean(arrow) && hasFallbackVisualSelf)
+  );
+}
+
+function hasExplicitSelectDescendant(element: Element): boolean {
+  return Array.from(element.querySelectorAll("*")).some((descendant) => {
+    const tag = descendant.tagName.toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON" || tag === "SELECT" || tag === "SVG" || tag === "I" || tag === "UL" || tag === "LI") {
+      return false;
+    }
+
+    const identity = getElementIdentity(descendant);
+    if (isInternalSelectIdentity(identity)) {
+      return false;
+    }
+
+    const role = descendant.getAttribute("role")?.toLowerCase() || "";
+    const ariaHasPopup = (descendant.getAttribute("aria-haspopup") || "").toLowerCase();
+    return (
+      SELECT_ROOT_CLASS_PATTERN.test(identity) ||
+      role === "combobox" ||
+      ariaHasPopup.split(/\s+/).some((value) => SELECT_ARIA_POPUPS.has(value))
+    );
+  });
+}
+
+function isInternalSelectIdentity(identity: string): boolean {
+  return SELECT_INTERNAL_CLASS_PATTERN.test(identity) && !/(selector|selection|control|wrapper|trigger)/i.test(identity);
+}
+
+function elementLooksLikeControlSurface(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  if (!isReasonableControlRect(rect) || rect.height > 60) return false;
+
+  const computed = getComputedStyleFor(element);
+  return (
+    SELECT_VISUAL_CLASS_PATTERN.test(getElementIdentity(element)) ||
+    hasVisibleBorder(computed) ||
+    Boolean(computed.boxShadow && computed.boxShadow !== "none") ||
+    hasVisibleRadius(computed)
+  );
+}
+
+function hasCanonicalSelectAncestor(element: Element, visualBox: Element): boolean {
+  if (element === visualBox) return false;
+
+  let ancestor = element.parentElement;
+
+  while (ancestor) {
+    if (isSelectRootCandidate(ancestor)) {
+      const ancestorVisualBox = findSelectVisualBox(ancestor);
+      if (ancestorVisualBox === visualBox || ancestorVisualBox.contains(visualBox) || visualBox.contains(ancestorVisualBox)) {
+        return true;
+      }
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  return false;
+}
+
+function getVisualBoxScore(element: Element, computed: CSSStyleDeclaration, rootRect: DOMRect): number {
+  const rect = element.getBoundingClientRect();
+  const identity = getElementIdentity(element);
+  const hasCommonClass = SELECT_VISUAL_CLASS_PATTERN.test(identity);
+  const hasBorder = hasVisibleBorder(computed);
+  const hasBackground = isVisibleColor(computed.backgroundColor);
+  const hasRadius = hasVisibleRadius(computed);
+  const hasShadow = computed.boxShadow && computed.boxShadow !== "none";
+  const closeToRoot = rect.width >= rootRect.width * 0.7 && rect.height <= Math.max(rootRect.height + 4, 36);
+  const containsDisplay = Boolean(findPlaceholderElement(element) || findSelectInput(element));
+  const containsArrow = Boolean(findSelectArrow(element, element));
+
+  let score = 0;
+  if (element === (element.ownerDocument?.documentElement ?? null)) score -= 100;
+  if (hasCommonClass) score += 60;
+  if (hasBorder) score += 50;
+  if (hasShadow) score += 35;
+  if (hasRadius) score += 20;
+  if (hasBackground) score += 10;
+  if (closeToRoot) score += 20;
+  if (containsDisplay) score += 12;
+  if (containsArrow) score += 12;
+  if (SELECT_ROOT_CLASS_PATTERN.test(identity)) score += 8;
+
+  if (!hasCommonClass && !hasBorder && !hasShadow && !hasRadius && !hasBackground) return 0;
+  return score;
+}
+
+function findSelectedVisibleText(root: Element): SelectDisplayText {
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    const identity = getElementIdentity(element);
+    if (PLACEHOLDER_CLASS_PATTERN.test(identity)) continue;
+    if (SELECT_INTERNAL_CLASS_PATTERN.test(identity) && !/selected|value|label/i.test(identity)) continue;
+    if (findPlaceholderElement(element)) continue;
+    if (!isNodeVisible(element)) continue;
+
+    const text = getVisibleText(element);
+    if (!text || isOnlyArrowText(text)) continue;
+
+    return {
+      text,
+      source: "visible text",
+      sourceElement: element,
+      isPlaceholder: false,
+    };
+  }
+
+  return { text: "", source: "empty", isPlaceholder: false };
+}
+
+function findPlaceholderElement(root: Element): Element | undefined {
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    if (!PLACEHOLDER_CLASS_PATTERN.test(getElementIdentity(element))) continue;
+    if (!isNodeVisible(element)) continue;
+    if (getVisibleText(element)) return element;
+  }
+
+  return undefined;
+}
+
+function findSelectInput(root: Element): HTMLInputElement | undefined {
+  return Array.from(root.querySelectorAll("input")).find((input) => {
+    const type = input.getAttribute("type")?.toLowerCase() || "text";
+    return type !== "hidden";
+  }) as HTMLInputElement | undefined;
+}
+
+function computeTextRect(
+  control: SelectControl,
+  visualComputed: CSSStyleDeclaration,
+  textComputed: CSSStyleDeclaration,
+): DOMRect {
+  const visualRect = control.visualBox.getBoundingClientRect();
+  const sourceRect = control.displayText.sourceElement?.getBoundingClientRect();
+  const lineHeight = getLineHeight(textComputed, visualRect.height);
+
+  if (sourceRect && sourceRect.width > 0 && sourceRect.height > 0) {
+    const height = Math.min(sourceRect.height, visualRect.height);
+    const centeredY = visualRect.y + Math.max(0, (visualRect.height - Math.min(height, lineHeight)) / 2);
+    const y = clamp(centeredY + getSelectTextYOffset(visualRect), visualRect.y, visualRect.bottom - height);
+    return new DOMRect(sourceRect.x, y, sourceRect.width, height);
+  }
+
+  const paddingLeft = parsePx(visualComputed.paddingLeft, 8);
+  const paddingRight = parsePx(visualComputed.paddingRight, 8);
+  const arrowSpace = Math.max(32, control.arrowRect.width + 16);
+  const x = visualRect.x + paddingLeft;
+  const y = visualRect.y + Math.max(0, (visualRect.height - lineHeight) / 2) + getSelectTextYOffset(visualRect);
+  const width = Math.max(0, visualRect.width - paddingLeft - paddingRight - arrowSpace);
+  const height = Math.min(visualRect.height, lineHeight);
+
+  return new DOMRect(x, y, width, height);
+}
+
+function computeArrowRect(arrow: Element | undefined, visualBox: Element): DOMRect {
+  const visualRect = visualBox.getBoundingClientRect();
+  if (arrow) {
+    return normalizeArrowRect(arrow.getBoundingClientRect(), visualRect);
+  }
+
+  return normalizeArrowRect(undefined, visualRect);
+}
+
+function normalizeArrowRect(sourceRect: DOMRect | undefined, visualRect: DOMRect): DOMRect {
+  const sourceSize = sourceRect ? Math.max(sourceRect.width, sourceRect.height) : 0;
+  const size = Math.min(16, Math.max(14, sourceSize || visualRect.height - 18));
+  const rightInset = sourceRect ? clamp(visualRect.right - sourceRect.right, 6, 12) : 8;
+  return clampArrowRect(
+    new DOMRect(
+      visualRect.right - rightInset - size,
+      visualRect.y + (visualRect.height - size) / 2,
+      size,
+      size,
+    ),
+    visualRect,
+  );
+}
+
+function clampArrowRect(rect: DOMRect, visualRect: DOMRect): DOMRect {
+  const width = Math.max(8, Math.min(rect.width || 12, Math.max(8, visualRect.width - 8)));
+  const height = Math.max(8, Math.min(rect.height || 12, Math.max(8, visualRect.height - 4)));
+  const x = clamp(rect.x, visualRect.x + 4, visualRect.right - width - 8);
+  const y = clamp(rect.y, visualRect.y + 2, visualRect.bottom - height - 2);
+  return new DOMRect(x, y, width, height);
+}
+
+function getBorderStyles(element: Element, computed: CSSStyleDeclaration): Record<string, string> {
+  if (hasVisibleBorder(computed)) {
+    return {
+      borderTopWidth: computed.borderTopWidth,
+      borderRightWidth: computed.borderRightWidth,
+      borderBottomWidth: computed.borderBottomWidth,
+      borderLeftWidth: computed.borderLeftWidth,
+      borderTopStyle: computed.borderTopStyle,
+      borderRightStyle: computed.borderRightStyle,
+      borderBottomStyle: computed.borderBottomStyle,
+      borderLeftStyle: computed.borderLeftStyle,
+      borderTopColor: computed.borderTopColor,
+      borderRightColor: computed.borderRightColor,
+      borderBottomColor: computed.borderBottomColor,
+      borderLeftColor: computed.borderLeftColor,
+    };
+  }
+
+  const color = findNearbyInputBorderColor(element) || "rgb(230, 231, 235)";
+  return {
+    borderTopWidth: "1px",
+    borderRightWidth: "1px",
+    borderBottomWidth: "1px",
+    borderLeftWidth: "1px",
+    borderTopStyle: "solid",
+    borderRightStyle: "solid",
+    borderBottomStyle: "solid",
+    borderLeftStyle: "solid",
+    borderTopColor: color,
+    borderRightColor: color,
+    borderBottomColor: color,
+    borderLeftColor: color,
+  };
+}
+
+function findNearbyInputBorderColor(element: Element): string | undefined {
+  const doc = element.ownerDocument ?? document;
+  const rect = element.getBoundingClientRect();
+  let best: { color: string; distance: number } | undefined;
+
+  for (const candidate of Array.from(doc.querySelectorAll("input, textarea, select"))) {
+    if (!(candidate instanceof Element) || candidate === element || !isNodeVisible(candidate)) continue;
+
+    const candidateRect = candidate.getBoundingClientRect();
+    if (!isReasonableControlRect(candidateRect)) continue;
+
+    const computed = getComputedStyleFor(candidate);
+    if (!hasVisibleBorder(computed)) continue;
+
+    const color = firstVisibleColor(computed.borderTopColor, computed.borderRightColor, computed.borderBottomColor, computed.borderLeftColor);
+    const distance =
+      Math.abs(candidateRect.x + candidateRect.width / 2 - (rect.x + rect.width / 2)) +
+      Math.abs(candidateRect.y + candidateRect.height / 2 - (rect.y + rect.height / 2));
+
+    if (!best || distance < best.distance) {
+      best = { color, distance };
+    }
+  }
+
+  return best?.color;
+}
+
+function logSelectControlDebug(control: SelectControl): void {
+  const view = control.root.ownerDocument.defaultView ?? window;
+  if (!(view as Window & { __H2D_DEBUG_FORM_CONTROLS?: boolean }).__H2D_DEBUG_FORM_CONTROLS) return;
+  if (debugLoggedCount >= 20 || debugLoggedControls.has(control.root)) return;
+
+  debugLoggedControls.add(control.root);
+  debugLoggedCount += 1;
+
+  const input = control.input;
+  const arrow = control.arrow;
+  console.debug("[H2D form-control]", {
+    index: debugLoggedCount,
+    root: describeElement(control.root),
+    visualBox: {
+      ...describeElement(control.visualBox),
+      computedWidth: getComputedStyleFor(control.visualBox).width,
+      computedHeight: getComputedStyleFor(control.visualBox).height,
+    },
+    input: input
+      ? {
+        value: input.value,
+        placeholder: input.placeholder,
+        readonly: input.readOnly,
+        rect: rectToPlain(input.getBoundingClientRect()),
+      }
+      : null,
+    placeholderSource: control.displayText,
+    arrow: arrow
+      ? {
+        className: getClassName(arrow),
+        tagName: arrow.tagName,
+        rect: rectToPlain(arrow.getBoundingClientRect()),
+        insideVisualBox: control.arrowInside,
+      }
+      : {
+        generated: true,
+        rect: rectToPlain(control.arrowRect),
+        insideVisualBox: true,
+      },
+  });
+}
+
+function describeElement(element: Element): Record<string, unknown> {
+  const computed = getComputedStyleFor(element);
+  return {
+    tagName: element.tagName,
+    className: getClassName(element),
+    role: element.getAttribute("role"),
+    ariaHasPopup: element.getAttribute("aria-haspopup"),
+    rect: rectToPlain(element.getBoundingClientRect()),
+    computed: {
+      display: computed.display,
+      position: computed.position,
+      boxSizing: computed.boxSizing,
+      padding: `${computed.paddingTop} ${computed.paddingRight} ${computed.paddingBottom} ${computed.paddingLeft}`,
+      border: `${computed.borderTopWidth} ${computed.borderTopStyle} ${computed.borderTopColor}`,
+      borderRadius: `${computed.borderTopLeftRadius} ${computed.borderTopRightRadius} ${computed.borderBottomRightRadius} ${computed.borderBottomLeftRadius}`,
+      background: computed.backgroundColor,
+      lineHeight: computed.lineHeight,
+      fontSize: computed.fontSize,
+    },
+  };
+}
+
+function getVisibleText(element: Element): string {
+  return Array.from(element.childNodes)
+    .map((node) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || "";
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const child = node as Element;
+        if (!isNodeVisible(child)) return "";
+        if (ARROW_CLASS_PATTERN.test(getElementIdentity(child))) return "";
+        return getVisibleText(child);
+      }
+      return "";
+    })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getElementIdentity(element: Element): string {
+  return `${getClassName(element)} ${element.id || ""} ${element.getAttribute("data-role") || ""}`;
+}
+
+function getClassName(element: Element): string {
+  return String((element as HTMLElement | SVGElement).className || "");
+}
+
+function isReasonableControlRect(rect: DOMRect): boolean {
+  return rect.width >= 40 && rect.height >= 16 && rect.height <= 120;
+}
+
+function hasVisibleBorder(computed: CSSStyleDeclaration): boolean {
+  return [
+    [computed.borderTopWidth, computed.borderTopStyle],
+    [computed.borderRightWidth, computed.borderRightStyle],
+    [computed.borderBottomWidth, computed.borderBottomStyle],
+    [computed.borderLeftWidth, computed.borderLeftStyle],
+  ].some(([width, style]) => parsePx(width, 0) > 0 && style !== "none" && style !== "hidden");
+}
+
+function hasVisibleRadius(computed: CSSStyleDeclaration): boolean {
+  return [
+    computed.borderTopLeftRadius,
+    computed.borderTopRightRadius,
+    computed.borderBottomRightRadius,
+    computed.borderBottomLeftRadius,
+  ].some((radius) => parsePx(radius, 0) > 0);
+}
+
+function isVisibleColor(color: string): boolean {
+  return Boolean(color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)");
+}
+
+function getBackgroundColor(computed: CSSStyleDeclaration): string {
+  return isVisibleColor(computed.backgroundColor) ? computed.backgroundColor : "rgb(255, 255, 255)";
+}
+
+function getRadius(computed: CSSStyleDeclaration, key: keyof CSSStyleDeclaration): string {
+  const value = String(computed[key] || "");
+  return value && value !== "0px" ? value : "5px";
+}
+
+function getLineHeight(computed: CSSStyleDeclaration, fallbackHeight: number): number {
+  const parsed = parsePx(computed.lineHeight, NaN);
+  if (Number.isFinite(parsed)) return parsed;
+
+  const fontSize = parsePx(computed.fontSize, 14);
+  return Math.min(fallbackHeight, fontSize * 1.4);
+}
+
+function getSelectTextYOffset(visualRect: DOMRect): number {
+  return visualRect.height <= 40 ? 1 : 0;
+}
+
+function createChevronSvg(color: string): string {
+  const stroke = escapeSvgAttribute(firstVisibleColor(color, "rgb(134, 136, 143)"));
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14"><path d="M3.5 5.25 7 8.75 10.5 5.25" fill="none" stroke="${stroke}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
+function escapeSvgAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function parsePx(value: string, fallback: number): number {
+  const parsed = parseFloat(value || "");
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function firstVisibleColor(...colors: string[]): string {
+  return colors.find(isVisibleColor) || "rgb(134, 136, 143)";
+}
+
+function isOnlyArrowText(text: string): boolean {
+  return /^[⌄⌃⌵⌄˅∨vV<>›‹\s]+$/.test(text);
+}
+
+function isRectInside(rect: DOMRect, container: DOMRect): boolean {
+  return (
+    rect.left >= container.left &&
+    rect.right <= container.right &&
+    rect.top >= container.top &&
+    rect.bottom <= container.bottom
+  );
+}
+
+function toElementRect(rect: DOMRect): ElementRect {
+  return {
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    cssWidth: Math.round(rect.width),
+    cssHeight: Math.round(rect.height),
+  };
+}
+
+function rectToPlain(rect: DOMRect): Record<string, number> {
+  return {
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (max < min) return min;
+  return Math.min(Math.max(value, min), max);
+}
+
+function roundPx(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}

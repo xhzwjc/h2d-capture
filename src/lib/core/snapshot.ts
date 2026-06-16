@@ -10,14 +10,16 @@ import { resolveTransform, multiplyMatrices, getElementRect } from '../transform
 import { extractComponentTree, findParentComponent } from '../react/tree.js';
 import { inferLayoutSizing } from './layout.js';
 import { NODE_TYPES, isNodeVisible, shouldPruneNode, iterateChildNodes, getTextRect, getElementAttributes, matrixToSimple, INPUT_TYPES_WITH_PLACEHOLDER } from './walker.js';
-import { diffStyles, ensureFlexProps, ensureGridProps, ensureFlexItemProps, BASELINE_STYLES } from './styles.js';
+import { diffStyles, ensureFlexProps, ensureGridProps, ensureFlexItemProps } from './styles.js';
 import { prepareForCapture, decodeImages, assertLayoutValid, resetScrollbarState, cleanupScrollbar } from './prepare.js';
 import { getDeclaredLayoutStyles } from './declared.js';
 import { getComputedStyleFor, getNodeDocument, getNodeWindow, isInstanceOfOwner } from './dom.js';
+import { resetFormControlDebugState, snapshotSelectControl } from './form-controls.js';
 import type {
   CaptureTree,
   SnapshotNode,
   ElementSnapshot,
+  ElementRect,
   TextSnapshot,
   CaptureOptions,
   CaptureContext,
@@ -66,28 +68,6 @@ const LAYOUT_STYLE_PROPS = [
   "gridColumn",
   "gridRow",
 ] as const;
-
-const CONTROL_LIKE_CLASS_PATTERN =
-  /(^|[-_\s])(select|selector|dropdown|picker|cascader|combobox|autocomplete|input|textarea)([-_\s]|$)/i;
-const CONTROL_LIKE_ROLES = new Set([
-  "combobox",
-  "listbox",
-  "searchbox",
-  "spinbutton",
-  "textbox",
-]);
-const NON_TEXT_INPUT_TYPES = new Set([
-  "button",
-  "checkbox",
-  "color",
-  "file",
-  "hidden",
-  "image",
-  "radio",
-  "range",
-  "reset",
-  "submit",
-]);
 
 // ---------------------------------------------------------------------------
 // Node ID tracking
@@ -151,6 +131,7 @@ export async function captureDOM(elementOrDocument: Element | Document, options?
 
   assertLayoutValid(mergedOptions);
   nodeIdCounter = 0;
+  resetFormControlDebugState();
   resetScrollbarState();
 
   const assetCollector = new ResourceResolver(mergedOptions);
@@ -362,6 +343,11 @@ function snapshotElement(
     return null;
   }
 
+  const selectControlSnapshot = snapshotSelectControl(element, generateNodeId);
+  if (selectControlSnapshot) {
+    return selectControlSnapshot;
+  }
+
   // Source annotations from React/Figma instrumentation.
   const sources = getSourceAnnotations(element);
   if (sources && sources.length > 0) {
@@ -376,7 +362,6 @@ function snapshotElement(
 
   // Computed style diff vs defaults.
   const computedStyles = diffStyles(element);
-  ensureFormControlAppearance(element, computedStyles);
 
   // Browser propagates body background to the viewport when html has no background.
   // Replicate this so Figma shows the correct background on the root frame.
@@ -436,12 +421,14 @@ function snapshotElement(
 
   // Pseudo-element styles (::before, ::after, ::placeholder).
   let pseudoElementStyles: Record<string, Record<string, string>> | undefined;
+  const materializedPseudoElements = materializeTextPseudoElements(element, childNodes);
 
   // ::before / ::after — capture when they have visible content
   for (const pseudo of ["::before", "::after"] as const) {
     const pseudoComputed = getComputedStyleFor(element, pseudo);
     const contentValue = pseudoComputed.content;
     if (contentValue && contentValue !== "none" && contentValue !== "normal") {
+      if (materializedPseudoElements.has(pseudo)) continue;
       if (!pseudoElementStyles) pseudoElementStyles = {};
       const styles = diffStyles(element, pseudo);
       styles.content = contentValue;
@@ -502,101 +489,176 @@ function snapshotElement(
 }
 
 // ---------------------------------------------------------------------------
-// Form-control appearance helpers
+// Pseudo-element text materialization
 // ---------------------------------------------------------------------------
 
-function ensureFormControlAppearance(element: Element, styles: Record<string, string>): void {
-  if (!isFormControlLikeElement(element)) return;
+function materializeTextPseudoElements(element: Element, childNodes: SnapshotNode[]): Set<string> {
+  const materialized = new Set<string>();
 
-  const rect = element.getBoundingClientRect();
-  if (rect.width < 40 || rect.height < 16) return;
+  for (const pseudo of ["::before", "::after"] as const) {
+    const pseudoNode = snapshotTextPseudoElement(element, pseudo);
+    if (!pseudoNode) continue;
 
-  if (!styles.boxSizing) styles.boxSizing = "border-box";
-
-  const hasVisibleBorder = [
-    styles.borderTopWidth,
-    styles.borderRightWidth,
-    styles.borderBottomWidth,
-    styles.borderLeftWidth,
-  ].some((width) => parseFloat(width || "0") > 0);
-
-  const hasVisibleBackground =
-    styles.backgroundColor != null &&
-    styles.backgroundColor !== "rgba(0, 0, 0, 0)" &&
-    styles.backgroundColor !== "transparent";
-
-  if (!hasVisibleBackground) {
-    styles.backgroundColor = "rgb(255, 255, 255)";
-  }
-
-  if (!hasVisibleBorder) {
-    const computed = getComputedStyleFor(element);
-    const borderColor = getControlBorderFallbackColor(computed);
-
-    styles.borderTopWidth = "1px";
-    styles.borderRightWidth = "1px";
-    styles.borderBottomWidth = "1px";
-    styles.borderLeftWidth = "1px";
-    styles.borderTopStyle = "solid";
-    styles.borderRightStyle = "solid";
-    styles.borderBottomStyle = "solid";
-    styles.borderLeftStyle = "solid";
-    styles.borderTopColor = borderColor;
-    styles.borderRightColor = borderColor;
-    styles.borderBottomColor = borderColor;
-    styles.borderLeftColor = borderColor;
-  }
-
-  if (!styles.borderTopLeftRadius || styles.borderTopLeftRadius === "0px") {
-    const computed = getComputedStyleFor(element);
-    const radius = computed.borderTopLeftRadius && computed.borderTopLeftRadius !== "0px"
-      ? computed.borderTopLeftRadius
-      : "4px";
-    styles.borderTopLeftRadius = radius;
-    styles.borderTopRightRadius = radius;
-    styles.borderBottomRightRadius = radius;
-    styles.borderBottomLeftRadius = radius;
-  }
-}
-
-function isFormControlLikeElement(element: Element): boolean {
-  const tag = element.tagName.toUpperCase();
-  if (tag === "TEXTAREA" || tag === "SELECT") return true;
-
-  if (tag === "INPUT") {
-    const type = element.getAttribute("type")?.toLowerCase() || "text";
-    return !NON_TEXT_INPUT_TYPES.has(type);
-  }
-
-  const role = element.getAttribute("role")?.toLowerCase();
-  if (role && CONTROL_LIKE_ROLES.has(role)) return true;
-
-  const ariaExpanded = element.getAttribute("aria-expanded");
-  const ariaHasPopup = element.getAttribute("aria-haspopup");
-  if (ariaExpanded != null && ariaHasPopup != null) return true;
-
-  const className = String((element as HTMLElement | SVGElement).className || "");
-  const id = element.id || "";
-  const dataRole = element.getAttribute("data-role") || "";
-  return CONTROL_LIKE_CLASS_PATTERN.test(`${className} ${id} ${dataRole}`);
-}
-
-function firstUsableColor(...colors: string[]): string {
-  for (const color of colors) {
-    if (color && color !== "rgba(0, 0, 0, 0)" && color !== "transparent") {
-      return color;
+    if (pseudo === "::before") {
+      childNodes.unshift(pseudoNode);
+    } else {
+      childNodes.push(pseudoNode);
     }
+    materialized.add(pseudo);
   }
-  return "rgb(217, 217, 217)";
+
+  return materialized;
 }
 
-function getControlBorderFallbackColor(computed: CSSStyleDeclaration): string {
-  if (parseFloat(computed.outlineWidth || "0") > 0 && computed.outlineStyle !== "none") {
-    return firstUsableColor(computed.outlineColor);
+function snapshotTextPseudoElement(element: Element, pseudo: "::before" | "::after"): ElementSnapshot | null {
+  const computed = getComputedStyleFor(element, pseudo);
+  const text = parseCssTextContent(computed.content);
+  if (!text || !isPlainPseudoText(text)) return null;
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 && hostRect.height <= 0) return null;
+
+  const fontSize = parsePx(computed.fontSize, parsePx(getComputedStyleFor(element).fontSize, 12));
+  const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
+  const width = getPseudoTextWidth(text, computed, fontSize);
+  const height = Math.max(1, parsePx(computed.height, 0), lineHeight);
+  const rect = computePseudoTextRect(pseudo, hostRect, computed, width, height, fontSize);
+  const styles = getPseudoTextStyles(computed, fontSize, lineHeight);
+
+  const textNode: TextSnapshot = {
+    nodeType: Node.TEXT_NODE as 3,
+    id: generateNodeId(null),
+    text,
+    rect: {
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+    },
+    lineCount: 1,
+  };
+
+  return {
+    nodeType: Node.ELEMENT_NODE as 1,
+    id: generateNodeId(null),
+    tag: "SPAN",
+    attributes: {
+      "data-h2d-pseudo": pseudo === "::before" ? "before" : "after",
+    },
+    styles,
+    rect: toElementRect(rect),
+    childNodes: [textNode],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function parseCssTextContent(content: string): string | null {
+  if (!content || content === "none" || content === "normal") return null;
+  if (content.startsWith("url(")) return null;
+
+  const quote = content[0];
+  if ((quote === "\"" || quote === "'") && content[content.length - 1] === quote) {
+    return content
+      .slice(1, -1)
+      .replace(/\\A/g, "\n")
+      .replace(/\\([\\'"])/g, "$1");
   }
 
-  const shadowColor = computed.boxShadow.match(/rgba?\([^)]+\)/)?.[0];
-  return firstUsableColor(shadowColor || "", "rgb(217, 217, 217)");
+  return content;
+}
+
+function isPlainPseudoText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith("<svg") || trimmed.startsWith("<")) return false;
+  return trimmed.length <= 8;
+}
+
+function computePseudoTextRect(
+  pseudo: "::before" | "::after",
+  hostRect: DOMRect,
+  computed: CSSStyleDeclaration,
+  width: number,
+  height: number,
+  fontSize: number,
+): DOMRect {
+  const marginLeft = parsePx(computed.marginLeft, 0);
+  const marginTop = parsePx(computed.marginTop, 0);
+  const left = parsePx(computed.left, NaN);
+  const right = parsePx(computed.right, NaN);
+  const top = parsePx(computed.top, NaN);
+  const bottom = parsePx(computed.bottom, NaN);
+  const explicitHeight = parsePx(computed.height, NaN);
+  const hasUsableHeight = Number.isFinite(explicitHeight) && explicitHeight > 0;
+
+  let x: number;
+  if (Number.isFinite(left)) {
+    x = hostRect.x + left + marginLeft;
+  } else if (Number.isFinite(right)) {
+    x = hostRect.right - right - width + marginLeft;
+  } else {
+    x = pseudo === "::before" ? hostRect.x - width + marginLeft : hostRect.right + marginLeft;
+  }
+
+  let y: number;
+  if (Number.isFinite(top) && hasUsableHeight) {
+    y = hostRect.y + top + marginTop;
+  } else if (Number.isFinite(bottom) && hasUsableHeight) {
+    y = hostRect.bottom - bottom - height + marginTop;
+  } else {
+    y = hostRect.y + Math.max(0, (hostRect.height - Math.max(fontSize, 1)) / 2) + marginTop;
+  }
+
+  return new DOMRect(x, y, width, height);
+}
+
+function getPseudoTextStyles(computed: CSSStyleDeclaration, fontSize: number, lineHeight: number): Record<string, string> {
+  return {
+    display: "block",
+    position: "absolute",
+    left: "0px",
+    top: "0px",
+    width: `${roundPx(getPseudoTextWidth(parseCssTextContent(computed.content) || "", computed, fontSize))}px`,
+    height: `${roundPx(lineHeight)}px`,
+    overflow: "visible",
+    color: computed.color,
+    fontFamily: computed.fontFamily,
+    fontSize: `${roundPx(fontSize)}px`,
+    fontWeight: computed.fontWeight,
+    lineHeight: `${roundPx(lineHeight)}px`,
+    whiteSpace: computed.whiteSpace || "pre",
+    textAlign: computed.textAlign,
+    boxSizing: "border-box",
+  };
+}
+
+function getPseudoTextWidth(text: string, computed: CSSStyleDeclaration, fontSize: number): number {
+  const explicitWidth = parsePx(computed.width, NaN);
+  if (Number.isFinite(explicitWidth) && explicitWidth > 0) return explicitWidth;
+  return Math.max(1, text.length * fontSize * 0.55);
+}
+
+function parseLineHeight(value: string, fontSize: number): number {
+  const parsed = parseFloat(value || "");
+  if (!Number.isFinite(parsed) || parsed <= 0) return fontSize;
+  return parsed;
+}
+
+function parsePx(value: string, fallback: number): number {
+  const parsed = parseFloat(value || "");
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toElementRect(rect: DOMRect): ElementRect {
+  return {
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    cssWidth: Math.round(rect.width),
+    cssHeight: Math.round(rect.height),
+  };
 }
 
 // ---------------------------------------------------------------------------

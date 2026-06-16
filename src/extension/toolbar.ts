@@ -99,9 +99,53 @@
 
     /* Actions */
     .actions {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 6px;
-      padding: 0 10px 10px;
+      padding: 0 10px 4px;
+    }
+
+    .debug-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      padding: 0 10px 8px;
+    }
+    .debug-actions[hidden] {
+      display: none;
+    }
+
+    .debug-toggle-wrap {
+      display: flex;
+      justify-content: center;
+      padding: 0 10px 6px;
+    }
+    .debug-toggle {
+      width: 32px;
+      height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: rgba(255,255,255,0.48);
+      cursor: pointer;
+      transition: background 0.1s, color 0.1s;
+    }
+    .debug-toggle:hover {
+      background: rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.76);
+    }
+    .debug-toggle svg {
+      transition: transform 0.12s ease-out;
+    }
+    .debug-toggle[aria-expanded="true"] svg {
+      transform: rotate(180deg);
+    }
+    .debug-toggle.disabled {
+      opacity: 0.4;
+      pointer-events: none;
     }
 
     .action-btn {
@@ -120,6 +164,17 @@
       cursor: pointer;
       transition: background 0.1s;
       white-space: nowrap;
+    }
+    .action-btn.debug {
+      background: rgba(255,255,255,0.05);
+      color: rgba(255,255,255,0.72);
+      font-size: 11px;
+    }
+    .action-btn.debug:hover { background: rgba(255,255,255,0.1); }
+    .action-btn.debug.active {
+      background: rgba(13, 153, 255, 0.14);
+      color: #7cc7ff;
+      box-shadow: inset 0 0 0 1px rgba(13, 153, 255, 0.3);
     }
     .action-btn:hover { background: rgba(255,255,255,0.13); }
     .action-btn:active { background: rgba(255,255,255,0.18); }
@@ -239,6 +294,7 @@
   const iconPaths: Record<string, string[]> = {
     screen: ["M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v7a1.5 1.5 0 0 1-1.5 1.5H9v2h2a.5.5 0 0 1 0 1H5a.5.5 0 0 1 0-1h2v-2H3.5A1.5 1.5 0 0 1 2 10.5v-7ZM3.5 3a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.5-.5h-9Z"],
     select: ["M3 2a1 1 0 0 0-1 1v2.5a.5.5 0 0 1-1 0V3a2 2 0 0 1 2-2h2.5a.5.5 0 0 1 0 1H3Zm7.5-1a.5.5 0 0 1 .5-.5H13a2 2 0 0 1 2 2v2.5a.5.5 0 0 1-1 0V3a1 1 0 0 0-1-1h-2.5a.5.5 0 0 1-.5-.5ZM1.5 10a.5.5 0 0 1 .5.5V13a1 1 0 0 0 1 1h2.5a.5.5 0 0 1 0 1H3a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5Zm13 0a.5.5 0 0 1 .5.5V13a2 2 0 0 1-2 2h-2.5a.5.5 0 0 1 0-1H13a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 .5-.5Z"],
+    chevronDown: ["M4.22 5.22a.75.75 0 0 1 1.06 0L8 7.94l2.72-2.72a.75.75 0 1 1 1.06 1.06L8.53 9.53a.75.75 0 0 1-1.06 0L4.22 6.28a.75.75 0 0 1 0-1.06Z"],
     close: ["M3.47 3.47a.75.75 0 0 1 1.06 0L8 6.94l3.47-3.47a.75.75 0 1 1 1.06 1.06L9.06 8l3.47 3.47a.75.75 0 1 1-1.06 1.06L8 9.06l-3.47 3.47a.75.75 0 0 1-1.06-1.06L6.94 8 3.47 4.53a.75.75 0 0 1 0-1.06Z"],
     x: ["M21.742 21.75l-7.563-11.179 7.056-8.321h-2.456l-5.691 6.714-4.54-6.714H2.359l7.29 10.776L2.25 21.75h2.456l6.035-7.118 4.818 7.118h6.191-.008zM7.739 3.818L18.81 20.182h-2.447L5.29 3.818h2.447z"],
   };
@@ -285,9 +341,37 @@
   }
 
   const btnScreen = makeActionBtn("screen", isFrame ? "This frame" : "Entire screen", () => capture("body", true));
-  const btnSelect = makeActionBtn("select", "Select element", startSelection);
+  const btnSelect = makeActionBtn("select", "Select element", () => startSelection("figma"));
+  const btnDebugScreen = makeActionBtn("screen", "Copy screen", () => copyDebugData("body", true));
+  btnDebugScreen.classList.add("debug");
+  const btnDebugSelect = makeActionBtn("select", "Copy element", () => startSelection("debug"));
+  btnDebugSelect.classList.add("debug");
 
   actions.append(btnScreen, btnSelect);
+
+  const debugToggleWrap = document.createElement("div");
+  debugToggleWrap.className = "debug-toggle-wrap";
+  const debugToggle = document.createElement("button");
+  debugToggle.className = "debug-toggle";
+  debugToggle.type = "button";
+  debugToggle.title = "Show copy debug tools";
+  debugToggle.setAttribute("aria-label", "Show copy debug tools");
+  debugToggle.setAttribute("aria-expanded", "false");
+  debugToggle.appendChild(makeSvg(14, "0 0 16 16", iconPaths.chevronDown, "currentColor"));
+  debugToggleWrap.appendChild(debugToggle);
+
+  const debugActions = document.createElement("div");
+  debugActions.className = "debug-actions";
+  debugActions.hidden = true;
+  debugActions.append(btnDebugScreen, btnDebugSelect);
+
+  debugToggle.addEventListener("click", () => {
+    const expanded = debugActions.hidden;
+    debugActions.hidden = !expanded;
+    debugToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    debugToggle.title = expanded ? "Hide copy debug tools" : "Show copy debug tools";
+    debugToggle.setAttribute("aria-label", expanded ? "Hide copy debug tools" : "Show copy debug tools");
+  });
 
   // Footer (doubles as status area)
   const footer = document.createElement("div");
@@ -311,7 +395,7 @@
 
   footer.append(footerDefault, statusText, stopBtn);
 
-  panel.append(dragHandle, header, actions, footer);
+  panel.append(dragHandle, header, actions, debugToggleWrap, debugActions, footer);
   shadow.appendChild(panel);
 
   // --- Drag logic ---
@@ -385,7 +469,7 @@
       reject: (e: unknown) => void;
       writePromise: Promise<void>;
     } | null = null;
-    if (isFirefox) {
+    if (isFirefox && typeof ClipboardItem === "function" && typeof navigator.clipboard?.write === "function") {
       let resolve!: (b: Blob) => void;
       let reject!: (e: unknown) => void;
       const blobPromise = new Promise<Blob>((res, rej) => { resolve = res; reject = rej; });
@@ -422,6 +506,126 @@
       setLoading(false);
     } finally {
       clearStopTimer();
+    }
+  }
+
+  async function copyDebugData(selector: string, autoDestroy: boolean = false): Promise<void> {
+    if (!window.figma?.capturePage) {
+      showStatus("Error: capture script not loaded", false);
+      return;
+    }
+
+    captureAborted = false;
+    setLoading(true);
+    showStatus("Capturing debug data...", false);
+
+    stopTimer = setTimeout(() => {
+      if (!captureAborted) stopBtn.classList.add("visible");
+    }, 5000);
+
+    try {
+      const json = await window.figma.capturePage(selector);
+      if (captureAborted) return;
+
+      showStatus("Copying debug data...", false);
+      await copyTextToClipboard(makeDebugPayload(json, selector));
+
+      showStatus("Debug data copied", true);
+      if (autoDestroy) {
+        setTimeout(() => {
+          if (!captureAborted) destroy();
+        }, 1500);
+      } else {
+        setLoading(false);
+      }
+    } catch (err) {
+      if (!captureAborted) {
+        showStatus("Error: " + ((err as Error).message || String(err)), false);
+      }
+      setLoading(false);
+    } finally {
+      clearStopTimer();
+    }
+  }
+
+  function makeDebugPayload(json: string, selector: string): string {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(json);
+      stripAssetBase64(payload);
+    } catch (_err) {
+      payload = json;
+    }
+
+    return JSON.stringify(
+      {
+        type: "h2d-capture-debug",
+        version: 1,
+        capturedAt: new Date().toISOString(),
+        url: location.href,
+        title: document.title,
+        selector,
+        userAgent: navigator.userAgent,
+        viewport: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+          devicePixelRatio: window.devicePixelRatio,
+          isFrame,
+        },
+        payload,
+      },
+      null,
+      2,
+    );
+  }
+
+  function stripAssetBase64(value: unknown): void {
+    if (value == null || typeof value !== "object") return;
+
+    const record = value as Record<string, unknown>;
+    if (typeof record.base64Blob === "string") {
+      record.base64Length = record.base64Blob.length;
+      record.base64Blob = "[omitted from debug payload]";
+    }
+
+    for (const child of Object.values(record)) {
+      stripAssetBase64(child);
+    }
+  }
+
+  async function copyTextToClipboard(text: string): Promise<void> {
+    if (typeof navigator.clipboard?.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "true");
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    textarea.style.top = "0";
+
+    const selection = window.getSelection();
+    const previousRanges: Range[] = [];
+    if (selection) {
+      for (let index = 0; index < selection.rangeCount; index += 1) {
+        previousRanges.push(selection.getRangeAt(index).cloneRange());
+      }
+    }
+
+    try {
+      document.body.appendChild(textarea);
+      textarea.select();
+      if (!document.execCommand("copy")) {
+        throw new Error("document.execCommand('copy') returned false");
+      }
+    } finally {
+      textarea.remove();
+      if (selection) {
+        selection.removeAllRanges();
+        for (const range of previousRanges) selection.addRange(range);
+      }
     }
   }
 
@@ -474,16 +678,24 @@
   function setLoading(loading: boolean): void {
     btnScreen.classList.toggle("disabled", loading);
     btnSelect.classList.toggle("disabled", loading);
+    btnDebugScreen.classList.toggle("disabled", loading);
+    btnDebugSelect.classList.toggle("disabled", loading);
+    debugToggle.classList.toggle("disabled", loading);
   }
 
   // --- Element selection ---
+  type SelectionMode = "figma" | "debug";
+
   let selecting = false;
+  let selectionMode: SelectionMode | null = null;
   let selectedEl: Element | null = null;
 
-  function startSelection(): void {
+  function startSelection(mode: SelectionMode): void {
     if (selecting) return;
     selecting = true;
-    btnSelect.classList.add("active");
+    selectionMode = mode;
+    btnDebugSelect.classList.toggle("active", mode === "debug");
+    btnSelect.classList.toggle("active", mode === "figma");
     document.addEventListener("mousemove", onSelectionMove, true);
     document.addEventListener("click", onSelectionClick, true);
     document.addEventListener("keydown", onSelectionKey, true);
@@ -491,7 +703,9 @@
 
   function stopSelection(): void {
     selecting = false;
+    selectionMode = null;
     btnSelect.classList.remove("active");
+    btnDebugSelect.classList.remove("active");
     highlight.style.display = "none";
     selectedEl = null;
     document.removeEventListener("mousemove", onSelectionMove, true);
@@ -515,13 +729,17 @@
     e.preventDefault();
     e.stopPropagation();
     const el = selectedEl;
+    const mode = selectionMode;
     stopSelection();
 
     if (el) {
       const tempId = "__figcap_" + Math.random().toString(36).slice(2, 10);
       const hadId = el.id;
       el.id = tempId;
-      capture(`#${tempId}`).finally(() => {
+      const task = mode === "debug"
+        ? copyDebugData(`#${tempId}`)
+        : capture(`#${tempId}`);
+      task.finally(() => {
         if (hadId) el.id = hadId;
         else el.removeAttribute("id");
       });

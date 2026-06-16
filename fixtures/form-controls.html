@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>H2D Form Controls Fixture</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: #f5f6f8;
+        color: #5e5f66;
+        font-family: "PingFang SC", Arial, sans-serif;
+        font-size: 12px;
+      }
+
+      .page {
+        width: 1120px;
+        margin: 40px auto;
+        padding: 32px 40px;
+        background: #fff;
+      }
+
+      .section-title {
+        margin: 0 0 24px;
+        color: #202124;
+        font-size: 16px;
+        font-weight: 600;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        column-gap: 56px;
+        row-gap: 16px;
+      }
+
+      .field {
+        display: flex;
+        align-items: center;
+        min-width: 0;
+        height: 32px;
+      }
+
+      .field.wide {
+        grid-column: 1 / -1;
+        align-items: flex-start;
+        height: auto;
+      }
+
+      label {
+        position: relative;
+        flex: 0 0 88px;
+        margin-right: 20px;
+        text-align: right;
+        line-height: 22px;
+      }
+
+      label.required::before {
+        content: "*";
+        position: absolute;
+        left: 0;
+        top: 12px;
+        width: 6px;
+        height: 0;
+        margin-left: -8px;
+        color: rgb(204, 41, 41);
+        font-size: 12px;
+        line-height: 0;
+      }
+
+      input,
+      textarea {
+        width: 350px;
+        height: 32px;
+        border: 1px solid rgb(230, 231, 235);
+        border-radius: 5px;
+        padding: 4px 8px;
+        color: #0f1014;
+        font-size: 14px;
+        line-height: 22px;
+        outline: none;
+      }
+
+      textarea {
+        width: 964px;
+        height: 84px;
+        resize: none;
+      }
+
+      input::placeholder,
+      textarea::placeholder {
+        color: #b0b2b8;
+      }
+
+      .h2d-select {
+        position: relative;
+        width: 350px;
+        height: 32px;
+        min-height: 30px;
+        color: #b0b2b8;
+        font-size: 14px;
+        line-height: 22px;
+      }
+
+      .h2d-select-selection {
+        position: relative;
+        display: flex;
+        align-items: center;
+        width: 100%;
+        height: 32px;
+        min-height: 26px;
+        overflow: hidden;
+        border: 1px solid rgb(230, 231, 235);
+        border-radius: 5px;
+        background: #fff;
+      }
+
+      .h2d-select-placeholder {
+        position: absolute;
+        left: 8px;
+        top: 50%;
+        max-width: calc(100% - 40px);
+        height: 20px;
+        margin-top: -10px;
+        overflow: hidden;
+        white-space: nowrap;
+      }
+
+      .h2d-select-rendered {
+        width: 100%;
+        height: 26px;
+        margin: 0;
+        padding: 0 24px 0 8px;
+        overflow: hidden;
+        list-style: none;
+      }
+
+      .h2d-select-search {
+        width: 100%;
+        height: 26px;
+      }
+
+      .h2d-select-search-input {
+        width: 100%;
+        height: 26px;
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: rgba(0, 0, 0, 0);
+        outline: none;
+      }
+
+      .h2d-select-arrow {
+        position: absolute;
+        right: 8px;
+        top: 50%;
+        width: 12px;
+        height: 12px;
+        transform: translateY(-50%);
+        color: #86888f;
+        pointer-events: none;
+      }
+
+      .italent-like-field {
+        grid-column: 1 / -1;
+      }
+
+      .italent-select-shell {
+        position: relative;
+        width: 425.296875px;
+        height: 32px;
+        overflow: hidden;
+        border: 1px solid rgb(230, 231, 235);
+        border-radius: 5px;
+        background: #fff;
+        color: #b0b2b8;
+        font-size: 14px;
+        line-height: 22px;
+      }
+
+      .wtspe-select-placeholder {
+        position: absolute;
+        left: 8px;
+        top: 5px;
+        width: 389.359375px;
+        height: 22px;
+        overflow: hidden;
+        white-space: nowrap;
+      }
+
+      .wtspe-select-search-field {
+        position: absolute;
+        left: 8px;
+        top: 3px;
+        width: 389.359375px;
+        height: 26px;
+      }
+
+      .wtspe-select-search-field-input {
+        width: 100%;
+        height: 26px;
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: rgba(0, 0, 0, 0);
+        outline: none;
+      }
+
+      .wtspe-select-arrow {
+        position: absolute;
+        right: 8px;
+        top: 10px;
+        width: 12px;
+        height: 12px;
+        color: #86888f;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <h1 class="section-title">表单控件还原 Fixture</h1>
+      <section class="grid">
+        <div class="field">
+          <label class="required">职位名称</label>
+          <input placeholder="请输入" />
+        </div>
+
+        <div class="field">
+          <label class="required">招聘类别</label>
+          <div class="h2d-select" aria-haspopup="listbox">
+            <div class="h2d-select-selection">
+              <span class="h2d-select-placeholder">请选择</span>
+              <ul class="h2d-select-rendered">
+                <li class="h2d-select-search">
+                  <input
+                    class="h2d-select-search-input"
+                    role="combobox"
+                    readonly
+                    placeholder="请选择"
+                    aria-haspopup="listbox"
+                  />
+                </li>
+              </ul>
+              <svg class="h2d-select-arrow" viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="required">需求部门</label>
+          <div class="h2d-select" aria-haspopup="listbox">
+            <div class="h2d-select-selection">
+              <span class="h2d-select-placeholder">请选择</span>
+              <ul class="h2d-select-rendered">
+                <li class="h2d-select-search">
+                  <input
+                    class="h2d-select-search-input"
+                    role="combobox"
+                    readonly
+                    placeholder="请选择"
+                    aria-haspopup="listbox"
+                  />
+                </li>
+              </ul>
+              <svg class="h2d-select-arrow" viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>专业要求</label>
+          <input placeholder="请输入" />
+        </div>
+
+        <div class="field italent-like-field">
+          <label>iTalent 下拉</label>
+          <div class="italent-select-shell">
+            <span class="wtspe-select-placeholder">请选择</span>
+            <div class="wtspe-select-search-field" aria-haspopup="listbox">
+              <input
+                class="wtspe-select-search-field-input"
+                role="combobox"
+                readonly
+                placeholder="请选择"
+                aria-haspopup="listbox"
+              />
+            </div>
+            <svg class="wtspe-select-arrow" viewBox="0 0 12 12" aria-hidden="true">
+              <path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          </div>
+        </div>
+
+        <div class="field wide">
+          <label>工作职责</label>
+          <textarea placeholder="请说明该职位的工作职责"></textarea>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

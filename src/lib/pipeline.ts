@@ -209,10 +209,68 @@ export async function writeToClipboard(json: string): Promise<void> {
   if (window.figma?.useHtmlClipboardEncoding !== false) {
     const html = await wrapForClipboard(json);
     await waitForFocus();
-    const item = new ClipboardItem({ 'text/html': html });
-    await navigator.clipboard.write([item]);
+    if (typeof ClipboardItem === "function" && typeof navigator.clipboard?.write === "function") {
+      const item = new ClipboardItem({ 'text/html': html });
+      await navigator.clipboard.write([item]);
+    } else {
+      await copyHtmlWithExecCommand(await html.text(), json);
+    }
   } else {
     await waitForFocus();
     await navigator.clipboard.writeText(json);
+  }
+}
+
+async function copyHtmlWithExecCommand(html: string, plainText: string): Promise<void> {
+  await waitForFocus();
+
+  const marker = document.createElement("span");
+  marker.style.position = "fixed";
+  marker.style.left = "-9999px";
+  marker.style.top = "0";
+  marker.style.width = "1px";
+  marker.style.height = "1px";
+  marker.setAttribute("aria-hidden", "true");
+  marker.textContent = "H2D Capture clipboard payload";
+
+  const selection = window.getSelection();
+  const previousRanges: Range[] = [];
+  if (selection) {
+    for (let index = 0; index < selection.rangeCount; index += 1) {
+      previousRanges.push(selection.getRangeAt(index).cloneRange());
+    }
+  }
+
+  const onCopy = (event: ClipboardEvent): void => {
+    event.preventDefault();
+    event.clipboardData?.setData("text/html", html);
+    event.clipboardData?.setData("text/plain", plainText);
+  };
+
+  try {
+    document.body.appendChild(marker);
+    const range = document.createRange();
+    range.selectNodeContents(marker);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    document.addEventListener("copy", onCopy, true);
+    const copied = document.execCommand("copy");
+    if (!copied) {
+      throw new Error("document.execCommand('copy') returned false");
+    }
+  } catch (err) {
+    throw new Error(
+      `ClipboardItem is not available in this page, and the fallback copy path failed: ${
+        (err as Error).message || String(err)
+      }`,
+    );
+  } finally {
+    document.removeEventListener("copy", onCopy, true);
+    marker.remove();
+    if (selection) {
+      selection.removeAllRanges();
+      for (const range of previousRanges) selection.addRange(range);
+    }
   }
 }
