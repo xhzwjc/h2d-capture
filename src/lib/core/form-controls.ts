@@ -51,23 +51,24 @@ export function snapshotSelectControl(element: Element, createId: IdFactory): El
 }
 
 export function detectSelectControl(element: Element): SelectControl | null {
-  if (!isSelectRootCandidate(element)) return null;
+  const root = findSelectControlRoot(element);
+  if (!root) return null;
 
-  const visualBox = findSelectVisualBox(element);
+  const visualBox = findSelectVisualBox(root);
   const visualRect = visualBox.getBoundingClientRect();
   if (!isReasonableControlRect(visualRect)) return null;
 
-  if (hasCanonicalSelectAncestor(element, visualBox)) return null;
+  if (hasCanonicalSelectAncestor(root, visualBox)) return null;
 
-  const displayText = extractSelectDisplayText(element);
-  const input = findSelectInput(element);
+  const displayText = extractSelectDisplayText(root);
+  const input = findSelectInput(root);
   if (!displayText.text && !input) return null;
 
-  const arrow = findSelectArrow(element, visualBox);
+  const arrow = findSelectArrow(root, visualBox);
   const arrowRect = computeArrowRect(arrow, visualBox);
 
   return {
-    root: element,
+    root,
     visualBox,
     input,
     displayText,
@@ -75,6 +76,29 @@ export function detectSelectControl(element: Element): SelectControl | null {
     arrowRect,
     arrowInside: arrow ? isRectInside(arrow.getBoundingClientRect(), visualRect) : false,
   };
+}
+
+function findSelectControlRoot(element: Element): Element | null {
+  if (isSelectRootCandidate(element)) return element;
+
+  const tag = element.tagName.toUpperCase();
+  const identity = getElementIdentity(element);
+  const canPromoteFromInnerNode =
+    tag === "INPUT" ||
+    PLACEHOLDER_CLASS_PATTERN.test(identity) ||
+    SELECT_INTERNAL_CLASS_PATTERN.test(identity);
+
+  if (!canPromoteFromInnerNode) return null;
+
+  let ancestor = element.parentElement;
+  let depth = 0;
+  while (ancestor && depth < 6) {
+    if (isSelectRootCandidate(ancestor)) return ancestor;
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+
+  return null;
 }
 
 export function findSelectVisualBox(root: Element): Element {
@@ -538,7 +562,7 @@ function findSelectedVisibleText(root: Element): SelectDisplayText {
   for (const element of Array.from(root.querySelectorAll("*"))) {
     const identity = getElementIdentity(element);
     if (PLACEHOLDER_CLASS_PATTERN.test(identity)) continue;
-    if (SELECT_INTERNAL_CLASS_PATTERN.test(identity) && !/selected|value|label/i.test(identity)) continue;
+    if (SELECT_INTERNAL_CLASS_PATTERN.test(identity) && !/selected|value|label|rendered/i.test(identity)) continue;
     if (findPlaceholderElement(element)) continue;
     if (!isNodeVisible(element)) continue;
 
@@ -598,17 +622,17 @@ function computeTextRect(
     const fontSize = parsePx(textComputed.fontSize, parsePx(visualComputed.fontSize, 14));
     const textHeight = Math.min(visualRect.height, Math.max(fontSize * 1.2, Math.min(lineHeight, fontSize * 1.6)));
     const arrowSpace = Math.max(32, control.arrowRect.width + 16);
-    const paddingLeft = parsePx(visualComputed.paddingLeft, 12);
-    const x = sourceLooksLikeWholeBox ? visualRect.x + paddingLeft : sourceRect.x;
+    const paddingLeft = getSelectTextPaddingLeft(visualComputed);
+    const sourceX = sourceLooksLikeWholeBox ? visualRect.x + paddingLeft : Math.max(sourceRect.x, visualRect.x + paddingLeft);
     const width = sourceLooksLikeWholeBox
       ? Math.max(0, visualRect.width - paddingLeft - parsePx(visualComputed.paddingRight, 8) - arrowSpace)
-      : sourceRect.width;
+      : Math.max(0, Math.min(sourceRect.right, visualRect.right - arrowSpace) - sourceX);
     const y = visualRect.y + Math.max(0, (visualRect.height - textHeight) / 2) + getSelectTextYOffset(visualRect);
-    return new DOMRect(x, y, width, textHeight);
+    return new DOMRect(sourceX, y, width, textHeight);
   }
 
-  const paddingLeft = parsePx(visualComputed.paddingLeft, 8);
-  const paddingRight = parsePx(visualComputed.paddingRight, 8);
+  const paddingLeft = getSelectTextPaddingLeft(visualComputed);
+  const paddingRight = getSelectTextPaddingRight(visualComputed);
   const arrowSpace = Math.max(32, control.arrowRect.width + 16);
   const x = visualRect.x + paddingLeft;
   const y = visualRect.y + Math.max(0, (visualRect.height - lineHeight) / 2) + getSelectTextYOffset(visualRect);
@@ -691,7 +715,32 @@ function getDisplayTextColor(control: SelectControl, textComputed: CSSStyleDecla
     return firstVisibleColor(placeholderComputed.color, "rgb(134, 144, 156)");
   }
 
-  return firstVisibleColor(textComputed.color, control.displayText.isPlaceholder ? "rgb(176, 178, 184)" : visualComputed.color);
+  if (control.displayText.isPlaceholder) {
+    return firstVisibleColor(textComputed.color, "rgb(176, 178, 184)");
+  }
+
+  const color = firstVisibleColor(textComputed.color, visualComputed.color);
+  if (!isMutedPlaceholderLikeColor(color)) return color;
+
+  return firstStrongTextColor(
+    getAncestorTextColor(control.displayText.sourceElement),
+    getAncestorTextColor(control.visualBox),
+    control.visualBox.ownerDocument?.body ? getComputedStyleFor(control.visualBox.ownerDocument.body).color : "",
+    "rgb(31, 35, 41)",
+  );
+}
+
+function getAncestorTextColor(element: Element | undefined): string {
+  let current = element?.parentElement;
+  let depth = 0;
+  while (current && depth < 6) {
+    const color = getComputedStyleFor(current).color;
+    if (!isMutedPlaceholderLikeColor(color)) return color;
+    current = current.parentElement;
+    depth += 1;
+  }
+
+  return "";
 }
 
 function findNearbyInputBorderColor(element: Element): string | undefined {
@@ -853,6 +902,16 @@ function getLineHeight(computed: CSSStyleDeclaration, fallbackHeight: number): n
   return Math.min(fallbackHeight, fontSize * 1.4);
 }
 
+function getSelectTextPaddingLeft(computed: CSSStyleDeclaration): number {
+  const parsed = parsePx(computed.paddingLeft, 0);
+  return parsed > 2 ? parsed : 8;
+}
+
+function getSelectTextPaddingRight(computed: CSSStyleDeclaration): number {
+  const parsed = parsePx(computed.paddingRight, 0);
+  return parsed > 2 ? parsed : 8;
+}
+
 function getSelectTextYOffset(visualRect: DOMRect): number {
   return visualRect.height <= 40 ? 1 : 0;
 }
@@ -873,6 +932,33 @@ function parsePx(value: string, fallback: number): number {
 
 function firstVisibleColor(...colors: string[]): string {
   return colors.find(isVisibleColor) || "rgb(134, 136, 143)";
+}
+
+function firstStrongTextColor(...colors: string[]): string {
+  return colors.find((color) => isVisibleColor(color) && !isMutedPlaceholderLikeColor(color)) || "rgb(31, 35, 41)";
+}
+
+function isMutedPlaceholderLikeColor(color: string): boolean {
+  const channels = parseRgbChannels(color);
+  if (!channels) return false;
+
+  const [red, green, blue, alpha] = channels;
+  if (alpha != null && alpha < 0.75) return true;
+
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const average = (red + green + blue) / 3;
+  return max - min <= 24 && average >= 145;
+}
+
+function parseRgbChannels(color: string): [number, number, number, number?] | null {
+  const match = color.match(/rgba?\(([^)]+)\)/i);
+  if (!match) return null;
+
+  const parts = match[1].split(",").map((part) => Number.parseFloat(part.trim()));
+  if (parts.length < 3 || parts.some((part, index) => index < 3 && !Number.isFinite(part))) return null;
+
+  return [parts[0], parts[1], parts[2], Number.isFinite(parts[3]) ? parts[3] : undefined];
 }
 
 function isOnlyArrowText(text: string): boolean {
