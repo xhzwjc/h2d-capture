@@ -771,6 +771,8 @@ function isStackedSelectClone(previous: SelectSnapshotEntry, candidate: SelectSn
 
   const first = previous.node.rect;
   const second = candidate.node.rect;
+  if (isContainedSelectClone(first, second, candidate.node)) return true;
+
   const verticalGap = second.y - (first.y + first.height);
   if (verticalGap < -4 || verticalGap > 12) return false;
 
@@ -781,6 +783,37 @@ function isStackedSelectClone(previous: SelectSnapshotEntry, candidate: SelectSn
 
   const overlap = Math.min(first.x + first.width, second.x + second.width) - Math.max(first.x, second.x);
   return overlap >= Math.min(first.width, second.width) * 0.8;
+}
+
+function isContainedSelectClone(
+  outer: ElementRect,
+  inner: ElementRect,
+  innerNode: ElementSnapshot,
+): boolean {
+  if (inner.width <= 0 || inner.height <= 0) return false;
+  if (inner.width > outer.width || inner.height > outer.height) return false;
+
+  const overlapWidth = Math.min(outer.x + outer.width, inner.x + inner.width) - Math.max(outer.x, inner.x);
+  const overlapHeight = Math.min(outer.y + outer.height, inner.y + inner.height) - Math.max(outer.y, inner.y);
+  if (overlapWidth <= 0 || overlapHeight <= 0) return false;
+
+  const overlapArea = overlapWidth * overlapHeight;
+  const innerArea = inner.width * inner.height;
+  if (overlapArea < innerArea * 0.9) return false;
+
+  const isMeaningfullySmaller =
+    inner.width <= outer.width - 12 ||
+    inner.height <= outer.height - 2 ||
+    hasGeneratedSelectArrow(innerNode);
+  return isMeaningfullySmaller;
+}
+
+function hasGeneratedSelectArrow(node: ElementSnapshot): boolean {
+  return node.childNodes.some((child) => {
+    if (!isElementNodeSnapshot(child)) return false;
+    if (child.attributes["data-h2d-select-arrow"] === "generated") return true;
+    return hasGeneratedSelectArrow(child);
+  });
 }
 
 function getSnapshotText(node: SnapshotNode): string {
