@@ -89,6 +89,7 @@ export const BASELINE_STYLES: Record<string, string> = {
   fontStretch: "100%",
   fontStyle: "normal",
   fontWeight: "400",
+  gap: "normal",
   gridAutoColumns: "auto",
   gridAutoFlow: "row",
   gridAutoRows: "auto",

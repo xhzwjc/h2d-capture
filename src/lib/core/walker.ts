@@ -78,6 +78,8 @@ export function isNodeVisible(element: Element): boolean {
     return false;
   }
 
+  if (isHiddenPopupLayer(element)) return false;
+
   const computed = getComputedStyleFor(element);
 
   // display:none — element and all descendants are invisible
@@ -88,6 +90,52 @@ export function isNodeVisible(element: Element): boolean {
   if (computed.visibility === "hidden") return false;
 
   return true;
+}
+
+function isHiddenPopupLayer(element: Element): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (tag === "SVG" || tag === "PATH" || tag === "USE") return false;
+
+  const identity = `${String((element as HTMLElement | SVGElement).className || "")} ${element.id || ""} ${element.getAttribute("role") || ""}`;
+  if (/(^|[-_\s])(anticon|svg-icon|icon)([-_\s]|$)/i.test(identity)) return false;
+  const definitePopup = /(^|[-_\s])(popper|popover|dropdown|select-dropdown|picker-dropdown|menu|listbox)([-_\s]|$)/i.test(identity);
+  if (!definitePopup && /(^|[-_\s])(trigger|reference)([-_\s]|$)/i.test(identity)) return false;
+
+  const looksLikePopup = definitePopup || /(^|[-_\s])tooltip([-_\s]|$)/i.test(identity);
+  if (!looksLikePopup) return false;
+
+  const computed = getComputedStyleFor(element);
+
+  if (
+    element.getAttribute("aria-hidden") === "true" ||
+    element.getAttribute("data-popper-reference-hidden") === "true" ||
+    element.hasAttribute("hidden") ||
+    computed.opacity === "0" ||
+    computed.pointerEvents === "none"
+  ) {
+    return true;
+  }
+
+  return isEmptyPopupLayer(element);
+}
+
+function isEmptyPopupLayer(element: Element): boolean {
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  if (role === "menu") return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return true;
+
+  const options = Array.from(element.querySelectorAll('[role="option"], [role="menuitem"], li'));
+  const hasVisibleOption = options.some((option) => {
+    if (!(option instanceof Element) || !isNodeVisible(option)) return false;
+    return Boolean((option.textContent || "").trim());
+  });
+  if (hasVisibleOption) return false;
+
+  const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+  if (!text) return true;
+  return /^(请选择|请选择[\u4e00-\u9fa5A-Za-z0-9_ -]*|Select|Please select)$/i.test(text);
 }
 
 /**
@@ -233,9 +281,17 @@ export function getElementAttributes(element: Element): Record<string, string> {
     attrs.currentSrc = element.currentSrc;
   }
 
-  // Ensure input type is always present.
-  if (isInstanceOfOwner<HTMLInputElement>(element, element, "HTMLInputElement") && attrs.type == null) {
-    attrs.type = element.type;
+  if (isInstanceOfOwner<HTMLInputElement>(element, element, "HTMLInputElement")) {
+    // Ensure input type is always present.
+    if (attrs.type == null) {
+      attrs.type = element.type;
+    }
+
+    // Some component libraries keep the current value only on the DOM property
+    // (for example pagination jump inputs), not as a value attribute.
+    if (element.type !== "password" && element.value && attrs.value == null) {
+      attrs.value = element.value;
+    }
   }
 
   return attrs;

@@ -24,7 +24,8 @@ interface SelectControl {
 }
 
 const SELECT_ROOT_CLASS_PATTERN =
-  /(^|[-_\s])(select|dropdown|picker|cascader|combobox)([-_\s]|$)/i;
+  /(^|[-_\s])(select|picker|cascader|combobox)([-_\s]|$)/i;
+const DROPDOWN_CLASS_PATTERN = /(^|[-_\s])dropdown([-_\s]|$)/i;
 const SELECT_VISUAL_CLASS_PATTERN =
   /(^|[-_\s])(selector|selection|control|wrapper|trigger|field)([-_\s]|$)/i;
 const SELECT_INTERNAL_CLASS_PATTERN =
@@ -59,13 +60,16 @@ export function detectSelectControl(element: Element): SelectControl | null {
   if (hasCanonicalSelectAncestor(element, visualBox)) return null;
 
   const displayText = extractSelectDisplayText(element);
+  const input = findSelectInput(element);
+  if (!displayText.text && !input) return null;
+
   const arrow = findSelectArrow(element, visualBox);
   const arrowRect = computeArrowRect(arrow, visualBox);
 
   return {
     root: element,
     visualBox,
-    input: findSelectInput(element),
+    input,
     displayText,
     arrow,
     arrowRect,
@@ -230,11 +234,11 @@ function createSelectSnapshot(control: SelectControl, createId: IdFactory): Elem
       width: `${roundPx(textRect.width)}px`,
       height: `${roundPx(textRect.height)}px`,
       overflow: "hidden",
-      color: firstVisibleColor(textComputed.color, control.displayText.isPlaceholder ? "rgb(176, 178, 184)" : visualComputed.color),
+      color: getDisplayTextColor(control, textComputed, visualComputed),
       fontFamily: textComputed.fontFamily || visualComputed.fontFamily,
       fontSize: textComputed.fontSize || visualComputed.fontSize,
       fontWeight: textComputed.fontWeight || visualComputed.fontWeight,
-      lineHeight: textComputed.lineHeight || visualComputed.lineHeight,
+      lineHeight: `${roundPx(textRect.height)}px`,
       whiteSpace: "nowrap",
       boxSizing: "border-box",
     },
@@ -303,6 +307,7 @@ function createSelectSnapshot(control: SelectControl, createId: IdFactory): Elem
 
 function isSelectRootCandidate(element: Element): boolean {
   if (!isNodeVisible(element)) return false;
+  if (isNonSelectPickerCandidate(element)) return false;
 
   const tag = element.tagName.toUpperCase();
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON" || tag === "SELECT") return false;
@@ -310,16 +315,23 @@ function isSelectRootCandidate(element: Element): boolean {
 
   const identity = getElementIdentity(element);
   const role = element.getAttribute("role")?.toLowerCase() || "";
-  const ariaHasPopup = (element.getAttribute("aria-haspopup") || "").toLowerCase();
+  const ariaPopupValues = (element.getAttribute("aria-haspopup") || "").toLowerCase().split(/\s+/);
   const hasSelectClass = SELECT_ROOT_CLASS_PATTERN.test(identity);
+  const hasDropdownClass = DROPDOWN_CLASS_PATTERN.test(identity);
   const hasSelectRole = role === "combobox";
-  const hasSelectPopup = ariaHasPopup.split(/\s+/).some((value) => SELECT_ARIA_POPUPS.has(value));
-  const hasExplicitSelfSignal = hasSelectClass || hasSelectRole || hasSelectPopup;
   const input = findSelectInput(element);
   const arrow = findSelectArrow(element, element);
   const hasReadonlyInput = Boolean(input?.readOnly);
   const hasComboboxInput = Boolean(input?.getAttribute("role")?.toLowerCase() === "combobox");
   const hasFallbackVisualSelf = elementLooksLikeControlSurface(element);
+  const hasDropdownFormContent = hasDropdownFormControlContent(element);
+  const hasSelectPopup = ariaPopupValues.some((value) => value !== "menu" && SELECT_ARIA_POPUPS.has(value)) ||
+    (ariaPopupValues.includes("menu") && hasFallbackVisualSelf && hasDropdownFormContent);
+  const hasFormDropdownSignal =
+    hasDropdownClass &&
+    hasFallbackVisualSelf &&
+    (hasReadonlyInput || hasComboboxInput || hasDropdownFormContent);
+  const hasExplicitSelfSignal = hasSelectClass || hasSelectRole || hasSelectPopup || hasFormDropdownSignal;
 
   if (!hasExplicitSelfSignal && hasExplicitSelectDescendant(element)) {
     return false;
@@ -368,6 +380,112 @@ function elementLooksLikeControlSurface(element: Element): boolean {
     Boolean(computed.boxShadow && computed.boxShadow !== "none") ||
     hasVisibleRadius(computed)
   );
+}
+
+function hasDropdownFormControlContent(element: Element): boolean {
+  return Boolean(findSelectInput(element) || findPlaceholderElement(element));
+}
+
+function isNonSelectPickerCandidate(element: Element): boolean {
+  const identity = getElementIdentity(element);
+  if (/(^|[-_\s])(date|time|daterange|timerange|range|calendar|avatar|user)([-_\s]|$)/i.test(identity)) {
+    return true;
+  }
+
+  if (isCompactMediaDropdown(element)) return true;
+
+  if (isInsideDateTimePicker(element)) return true;
+
+  const inputs = Array.from(element.querySelectorAll("input")).filter((input) => {
+    const type = input.getAttribute("type")?.toLowerCase() || "text";
+    return type !== "hidden";
+  });
+  if (inputs.length > 1) return true;
+
+  const rect = element.getBoundingClientRect();
+  const hasOnlyMediaAndArrow =
+    rect.width <= 80 &&
+    rect.height <= 80 &&
+    (element.querySelector("img, picture, canvas") || /avatar|user/i.test(element.innerHTML));
+
+  return Boolean(hasOnlyMediaAndArrow);
+}
+
+function isCompactMediaDropdown(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width > 140 || rect.height > 90) return false;
+  if (findSelectInput(element) || findPlaceholderElement(element)) return false;
+
+  const hasImageLikeMedia = Boolean(element.querySelector("img, picture, canvas"));
+  const hasOnlyIconAndText =
+    !hasImageLikeMedia &&
+    Boolean(element.querySelector("svg, i")) &&
+    (element.textContent || "").trim().length <= 16 &&
+    /avatar|user|profile|account|dropdown|trigger|admin|管理员/i.test(`${getElementIdentity(element)} ${element.textContent || ""}`);
+
+  return hasImageLikeMedia || hasOnlyIconAndText;
+}
+
+function isInsideDateTimePicker(element: Element): boolean {
+  const inputs = getVisibleInputs(element);
+  const hasDateTimeInput = inputs.some(isDateTimeInput);
+  const hasDateTimeIdentity = /(^|[-_\s])(date|time|daterange|timerange|range|calendar)([-_\s]|$)/i.test(getElementIdentity(element));
+  if (hasDateTimeInput && (hasDateTimeIdentity || hasCalendarSignal(element))) return true;
+
+  let ancestor = element.parentElement;
+  let depth = 0;
+  while (ancestor && depth < 4) {
+    const ancestorInputs = getVisibleInputs(ancestor);
+    const ancestorHasDateTimeInput = ancestorInputs.some(isDateTimeInput);
+    const ancestorIdentity = getElementIdentity(ancestor);
+    const ancestorRect = ancestor.getBoundingClientRect();
+    const ancestorLooksLikeCompactControl = ancestorRect.width <= 640 && ancestorRect.height <= 80;
+    const ancestorLooksLikeDatePicker =
+      /(^|[-_\s])(date|time|daterange|timerange|range|calendar)([-_\s]|$)/i.test(ancestorIdentity) ||
+      (/(^|[-_\s])picker([-_\s]|$)/i.test(ancestorIdentity) && ancestorHasDateTimeInput) ||
+      (ancestorLooksLikeCompactControl && hasCalendarSignal(ancestor));
+
+    if (ancestorHasDateTimeInput && ancestorLooksLikeDatePicker) return true;
+
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+
+  return false;
+}
+
+function getVisibleInputs(element: Element): HTMLInputElement[] {
+  return Array.from(element.querySelectorAll("input")).filter((input) => {
+    const type = input.getAttribute("type")?.toLowerCase() || "text";
+    return type !== "hidden";
+  }) as HTMLInputElement[];
+}
+
+function isDateTimeInput(input: HTMLInputElement): boolean {
+  const type = input.getAttribute("type")?.toLowerCase() || "text";
+  if (/^(date|datetime-local|time|month|week)$/.test(type)) return true;
+
+  const text = [
+    input.placeholder,
+    input.getAttribute("aria-label") || "",
+    input.getAttribute("title") || "",
+  ].join(" ");
+  return /(日期|时间|开始|结束|date|time|start|end)/i.test(text);
+}
+
+function hasCalendarSignal(element: Element): boolean {
+  return Array.from(element.querySelectorAll("*")).some((candidate) => {
+    const tag = candidate.tagName.toUpperCase();
+    const identity = getElementIdentity(candidate);
+    const ariaLabel = candidate.getAttribute("aria-label") || "";
+    const dataIcon = candidate.getAttribute("data-icon") || "";
+    return (
+      /(^|[-_\s])(calendar|datepicker|timepicker|picker-suffix)([-_\s]|$)/i.test(identity) ||
+      /calendar|date|time/i.test(ariaLabel) ||
+      /calendar|date|time/i.test(dataIcon) ||
+      (tag === "SVG" && /calendar|date|time/i.test(`${ariaLabel} ${dataIcon} ${identity}`))
+    );
+  });
 }
 
 function hasCanonicalSelectAncestor(element: Element, visualBox: Element): boolean {
@@ -465,10 +583,28 @@ function computeTextRect(
   const lineHeight = getLineHeight(textComputed, visualRect.height);
 
   if (sourceRect && sourceRect.width > 0 && sourceRect.height > 0) {
-    const height = Math.min(sourceRect.height, visualRect.height);
-    const centeredY = visualRect.y + Math.max(0, (visualRect.height - Math.min(height, lineHeight)) / 2);
-    const y = clamp(centeredY + getSelectTextYOffset(visualRect), visualRect.y, visualRect.bottom - height);
-    return new DOMRect(sourceRect.x, y, sourceRect.width, height);
+    if (control.displayText.source === "input.placeholder") {
+      const fontSize = parsePx(textComputed.fontSize, 14);
+      const textHeight = Math.min(visualRect.height, Math.max(fontSize * 1.2, fontSize));
+      const arrowSpace = Math.max(32, control.arrowRect.width + 16);
+      const width = Math.max(0, Math.min(sourceRect.width, visualRect.right - sourceRect.x - arrowSpace));
+      const y = visualRect.y + Math.max(0, (visualRect.height - textHeight) / 2) + getSelectTextYOffset(visualRect);
+      return new DOMRect(sourceRect.x, y, width, textHeight);
+    }
+
+    const sourceLooksLikeWholeBox =
+      Math.abs(sourceRect.x - visualRect.x) <= 2 &&
+      Math.abs(sourceRect.width - visualRect.width) <= 4;
+    const fontSize = parsePx(textComputed.fontSize, parsePx(visualComputed.fontSize, 14));
+    const textHeight = Math.min(visualRect.height, Math.max(fontSize * 1.2, Math.min(lineHeight, fontSize * 1.6)));
+    const arrowSpace = Math.max(32, control.arrowRect.width + 16);
+    const paddingLeft = parsePx(visualComputed.paddingLeft, 12);
+    const x = sourceLooksLikeWholeBox ? visualRect.x + paddingLeft : sourceRect.x;
+    const width = sourceLooksLikeWholeBox
+      ? Math.max(0, visualRect.width - paddingLeft - parsePx(visualComputed.paddingRight, 8) - arrowSpace)
+      : sourceRect.width;
+    const y = visualRect.y + Math.max(0, (visualRect.height - textHeight) / 2) + getSelectTextYOffset(visualRect);
+    return new DOMRect(x, y, width, textHeight);
   }
 
   const paddingLeft = parsePx(visualComputed.paddingLeft, 8);
@@ -547,6 +683,15 @@ function getBorderStyles(element: Element, computed: CSSStyleDeclaration): Recor
     borderBottomColor: color,
     borderLeftColor: color,
   };
+}
+
+function getDisplayTextColor(control: SelectControl, textComputed: CSSStyleDeclaration, visualComputed: CSSStyleDeclaration): string {
+  if (control.displayText.source === "input.placeholder" && control.input) {
+    const placeholderComputed = getComputedStyleFor(control.input, "::placeholder");
+    return firstVisibleColor(placeholderComputed.color, "rgb(134, 144, 156)");
+  }
+
+  return firstVisibleColor(textComputed.color, control.displayText.isPlaceholder ? "rgb(176, 178, 184)" : visualComputed.color);
 }
 
 function findNearbyInputBorderColor(element: Element): string | undefined {

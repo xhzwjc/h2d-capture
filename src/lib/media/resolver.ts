@@ -293,6 +293,7 @@ async function fetchImageAsBlob(url: string, sourceElement?: HTMLImageElement): 
         if (UNSUPPORTED_IMAGE_TYPES.has(blob.type)) {
           blob = await convertUnsupportedImage(blob);
         }
+        blob = await maybeRasterizeSmallSvgIcon(url, blob, sourceElement);
         return { url, blob };
       }
     } catch { /* fall through */ }
@@ -307,7 +308,9 @@ async function fetchImageAsBlob(url: string, sourceElement?: HTMLImageElement): 
   if (!bridgeUnavailable) {
     try {
       const blob = await fetchViaExtensionBridge(url);
-      if (blob) return { url, blob };
+      if (blob) {
+        return { url, blob: await maybeRasterizeSmallSvgIcon(url, blob, sourceElement) };
+      }
       // null result means timeout — bridge not installed
       bridgeUnavailable = true;
     } catch {
@@ -503,6 +506,63 @@ async function convertUnsupportedImage(blob: Blob): Promise<Blob> {
     }
 
     ctx.drawImage(image, 0, 0);
+    return await canvasToBlob(canvas);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function maybeRasterizeSmallSvgIcon(
+  url: string,
+  blob: Blob,
+  sourceElement?: HTMLImageElement,
+): Promise<Blob> {
+  if (!sourceElement || !isSvgImage(url, blob) || !isSmallIconImage(sourceElement)) {
+    return blob;
+  }
+
+  try {
+    return await rasterizeImageBlob(blob);
+  } catch {
+    return blob;
+  }
+}
+
+function isSvgImage(url: string, blob: Blob): boolean {
+  return blob.type === "image/svg+xml" || /\.svg(?:$|[?#])/i.test(url);
+}
+
+function isSmallIconImage(img: HTMLImageElement): boolean {
+  const rect = img.getBoundingClientRect();
+  const view = img.ownerDocument.defaultView;
+  const computedWidth = view ? parseFloat(view.getComputedStyle(img).width || "") : NaN;
+  const width = firstFinitePositive(rect.width, computedWidth, img.width, img.naturalWidth);
+  const naturalWidth = firstFinitePositive(img.naturalWidth, width);
+
+  return width > 0 && width <= 32 && naturalWidth <= 96;
+}
+
+function firstFinitePositive(...values: number[]): number {
+  return values.find((value) => Number.isFinite(value) && value > 0) ?? 0;
+}
+
+async function rasterizeImageBlob(blob: Blob): Promise<Blob> {
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const image = new Image();
+    image.src = objectUrl;
+    await image.decode();
+
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth || image.width || 32;
+    canvas.height = image.naturalHeight || image.height || canvas.width;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("Failed to get canvas context for SVG icon rasterization");
+    }
+
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
     return await canvasToBlob(canvas);
   } finally {
     URL.revokeObjectURL(objectUrl);

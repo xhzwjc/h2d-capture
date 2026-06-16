@@ -176,13 +176,15 @@ async function captureDOMInner(
     if (!serialized || serialized.nodeType !== NODE_TYPES.ELEMENT_NODE) {
       throw new Error("Container node could not be serialized");
     }
+    const rootSnapshot = serialized as ElementSnapshot;
+    removeStackedSelectClones(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
       ? { reactFiberTree: extractComponentTree(element, getNodeId) }
       : undefined;
 
     return {
-      root: serialized as ElementSnapshot,
+      root: rootSnapshot,
       documentTitle: ownerDoc.title || undefined,
       experimental,
       documentRect: {
@@ -222,6 +224,8 @@ async function captureDOMInner(
     if (!serialized || serialized.nodeType !== NODE_TYPES.ELEMENT_NODE) {
       throw new Error("Container node must have a body element");
     }
+    const rootSnapshot = serialized as ElementSnapshot;
+    removeStackedSelectClones(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
       ? { reactFiberTree: extractComponentTree(doc.documentElement, getNodeId) }
@@ -229,7 +233,7 @@ async function captureDOMInner(
 
     return {
       documentTitle: doc.title || undefined,
-      root: serialized as ElementSnapshot,
+      root: rootSnapshot,
       experimental,
       documentRect: {
         x: 0,
@@ -334,14 +338,27 @@ function snapshotElement(
   let selectionSourceId: string | undefined;
   let expandedIframe = false;
 
-  if (!isNodeVisible(element)) return null;
-
   const tag = element.tagName.toUpperCase();
+
+  if (element.getAttribute("data-h2d-ignore") === "true") {
+    return null;
+  }
 
   // Skip non-visual elements entirely.
   if (tag === "HEAD" || tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
     return null;
   }
+
+  // Menu expand/collapse arrows are often zero-height <i>/<span> hosts whose
+  // visible shape lives entirely in two rotated pseudo bars. Capture them
+  // before popup filtering so class names like "menu-arrow" are not mistaken
+  // for empty hidden menus.
+  const pseudoChevronSnapshot = snapshotPseudoChevronIcon(element);
+  if (pseudoChevronSnapshot) {
+    return pseudoChevronSnapshot;
+  }
+
+  if (!isNodeVisible(element)) return null;
 
   const selectControlSnapshot = snapshotSelectControl(element, generateNodeId);
   if (selectControlSnapshot) {
@@ -362,6 +379,10 @@ function snapshotElement(
 
   // Computed style diff vs defaults.
   const computedStyles = diffStyles(element);
+  ensureInsetShadowBorder(element, computedStyles);
+  ensurePositionForZIndex(computedStyles);
+  ensureTopChromeTextStacking(element, computedStyles);
+  ensureTextOnlyLineHeight(element, computedStyles);
 
   // Browser propagates body background to the viewport when html has no background.
   // Replicate this so Figma shows the correct background on the root frame.
@@ -414,6 +435,7 @@ function snapshotElement(
       const serialized = snapshotNode(childOrGroup, assetCollector, fontCollector, combinedTransform, ctx);
       if (serialized != null) childNodes.push(serialized);
     }
+    ensureInputPrefixIconsStackAbove(childNodes);
   } else {
     expandedIframe = true;
     computedStyles.overflow = computedStyles.overflow || "hidden";
@@ -421,7 +443,7 @@ function snapshotElement(
 
   // Pseudo-element styles (::before, ::after, ::placeholder).
   let pseudoElementStyles: Record<string, Record<string, string>> | undefined;
-  const materializedPseudoElements = materializeTextPseudoElements(element, childNodes);
+  const materializedPseudoElements = materializePseudoElements(element, childNodes);
 
   // ::before / ::after — capture when they have visible content
   for (const pseudo of ["::before", "::after"] as const) {
@@ -452,7 +474,8 @@ function snapshotElement(
   resolveFonts(element, computedStyles as unknown as CSSStyleDeclaration, fontCollector);
 
   // Element bounding rect (may include rotated quad).
-  const rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
+  let rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
+  rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
 
   // Prune invisible nodes (zero-size without children, offscreen, etc.)
   if (shouldPruneNode(element, rect, childNodes)) {
@@ -488,15 +511,300 @@ function snapshotElement(
   return node;
 }
 
+function ensurePositionForZIndex(styles: Record<string, string>): void {
+  if (styles.zIndex == null) return;
+  if (styles.position == null || styles.position === "static") {
+    styles.position = "relative";
+  }
+}
+
+function ensureTopChromeTextStacking(element: Element, styles: Record<string, string>): void {
+  const rect = element.getBoundingClientRect();
+  if (rect.y > 96 || rect.height <= 0 || rect.height > 96 || rect.width <= 0 || rect.width > 480) return;
+  if (!hasDirectVisibleText(element) && !hasTopChromeTextDescendant(element)) return;
+
+  const computed = getComputedStyleFor(element);
+  if (isVisiblePaint(computed.backgroundColor) || hasVisibleBorderStyles(computed)) return;
+
+  if (styles.position == null || styles.position === "static") {
+    styles.position = "relative";
+  }
+  const zIndex = parseInt(styles.zIndex || "", 10);
+  if (styles.zIndex == null || styles.zIndex === "auto" || !Number.isFinite(zIndex) || zIndex < 20) {
+    styles.zIndex = "20";
+  }
+}
+
+function hasDirectVisibleText(element: Element): boolean {
+  return Array.from(element.childNodes).some((child) => (
+    child.nodeType === Node.TEXT_NODE &&
+    Boolean((child.textContent || "").trim()) &&
+    getTextRect(child).width > 0
+  ));
+}
+
+function hasTopChromeTextDescendant(element: Element): boolean {
+  return Array.from(element.querySelectorAll("*")).some((descendant) => {
+    const rect = descendant.getBoundingClientRect();
+    if (rect.y > 96 || rect.width <= 0 || rect.height <= 0) return false;
+    return hasDirectVisibleText(descendant);
+  });
+}
+
+function isVisiblePaint(color: string): boolean {
+  return Boolean(color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)");
+}
+
+function ensureInsetShadowBorder(element: Element, styles: Record<string, string>): void {
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 20 || rect.height < 16 || rect.height > 80) return;
+  if (!isFormControlSurface(element)) return;
+
+  const computed = getComputedStyleFor(element);
+  if (!computed.boxShadow || computed.boxShadow === "none" || !/\binset\b/i.test(computed.boxShadow)) return;
+  if (hasVisibleBorderStyles(computed)) return;
+
+  const color = extractCssColor(computed.boxShadow) || "rgb(220, 223, 230)";
+  styles.borderTopWidth = "1px";
+  styles.borderRightWidth = "1px";
+  styles.borderBottomWidth = "1px";
+  styles.borderLeftWidth = "1px";
+  styles.borderTopStyle = "solid";
+  styles.borderRightStyle = "solid";
+  styles.borderBottomStyle = "solid";
+  styles.borderLeftStyle = "solid";
+  styles.borderTopColor = color;
+  styles.borderRightColor = color;
+  styles.borderBottomColor = color;
+  styles.borderLeftColor = color;
+}
+
+function isFormControlSurface(element: Element): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+
+  const directInput = Array.from(element.children).some((child) => {
+    const childTag = child.tagName.toUpperCase();
+    return childTag === "INPUT" || childTag === "TEXTAREA" || childTag === "SELECT";
+  });
+  if (directInput) return true;
+
+  const identity = `${String((element as HTMLElement | SVGElement).className || "")} ${element.id || ""} ${element.getAttribute("role") || ""}`;
+  return /(^|[-_\s])(input|textarea|select|combobox|picker|control|wrapper)([-_\s]|$)/i.test(identity);
+}
+
+function hasVisibleBorderStyles(computed: CSSStyleDeclaration): boolean {
+  return [
+    [computed.borderTopWidth, computed.borderTopStyle],
+    [computed.borderRightWidth, computed.borderRightStyle],
+    [computed.borderBottomWidth, computed.borderBottomStyle],
+    [computed.borderLeftWidth, computed.borderLeftStyle],
+  ].some(([width, style]) => parsePx(width, 0) > 0 && style !== "none" && style !== "hidden");
+}
+
+function extractCssColor(value: string): string | undefined {
+  return value.match(/rgba?\([^)]+\)/)?.[0];
+}
+
+function normalizeSmallSvgImageRect(
+  element: Element,
+  styles: Record<string, string>,
+  rect: ElementRect,
+): ElementRect {
+  if (!isInstanceOfOwner<HTMLImageElement>(element, element, "HTMLImageElement")) return rect;
+  if (rect.width <= 0 || rect.width > 32 || rect.height <= rect.width * 1.8) return rect;
+
+  const src = element.currentSrc || element.src || element.getAttribute("src") || "";
+  if (!/\\.svg(?:$|[?#])/i.test(src) && !src.startsWith("data:image/svg")) return rect;
+
+  const size = rect.width;
+  const y = rect.y + (rect.height - size) / 2;
+  styles.width = `${roundPx(size)}px`;
+  styles.height = `${roundPx(size)}px`;
+  styles.lineHeight = `${roundPx(size)}px`;
+  styles.objectFit = "contain";
+
+  return {
+    ...rect,
+    y,
+    height: size,
+    cssHeight: Math.round(size),
+  };
+}
+
+function ensureTextOnlyLineHeight(element: Element, styles: Record<string, string>): void {
+  const lineHeight = parsePx(styles.lineHeight, NaN);
+  const fontSize = parsePx(styles.fontSize, NaN);
+  if (!Number.isFinite(lineHeight) || !Number.isFinite(fontSize)) return;
+  if (lineHeight <= Math.max(32, fontSize * 2)) return;
+
+  const textNodes = getDirectTextNodes(element);
+  if (textNodes.length === 0) return;
+
+  const textRect = getTextRect(textNodes.length === 1 ? textNodes[0] : textNodes);
+  if (textRect.lineCount !== 1 || textRect.width <= 0 || textRect.height <= 0) return;
+  if (textRect.height >= lineHeight * 0.75) return;
+
+  styles.lineHeight = `${roundPx(Math.max(textRect.height, fontSize * 1.2))}px`;
+}
+
+function getDirectTextNodes(element: Element): Node[] {
+  const textNodes: Node[] = [];
+
+  for (const child of Array.from(element.childNodes)) {
+    if (child.nodeType === Node.ELEMENT_NODE) return [];
+    if (child.nodeType !== Node.TEXT_NODE) continue;
+    if (!(child.textContent || "").trim()) continue;
+    textNodes.push(child);
+  }
+
+  return textNodes;
+}
+
+function ensureInputPrefixIconsStackAbove(childNodes: SnapshotNode[]): void {
+  if (childNodes.length < 2) return;
+
+  const inputNodes = childNodes.filter(isInputSnapshot);
+  if (inputNodes.length === 0) return;
+
+  const prefixNodes: ElementSnapshot[] = [];
+  for (const child of childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (!isInputPrefixIconSnapshot(child, inputNodes)) continue;
+    prefixNodes.push(child);
+  }
+  if (prefixNodes.length === 0) return;
+
+  for (const prefixNode of prefixNodes) {
+    const currentIndex = childNodes.indexOf(prefixNode);
+    if (currentIndex < 0) continue;
+    childNodes.splice(currentIndex, 1);
+    childNodes.push(prefixNode);
+  }
+}
+
+function isInputSnapshot(node: SnapshotNode): node is ElementSnapshot {
+  return isElementNodeSnapshot(node) && node.tag === "INPUT";
+}
+
+function isInputPrefixIconSnapshot(node: ElementSnapshot, inputNodes: ElementSnapshot[]): boolean {
+  if (node.rect.width <= 0 || node.rect.height <= 0 || node.rect.width > 40 || node.rect.height > 40) return false;
+  if (!hasSvgDescendant(node)) return false;
+
+  const position = node.styles.position || "";
+  const zIndex = parseInt(node.styles.zIndex || "", 10);
+  if (position !== "absolute" && (!Number.isFinite(zIndex) || zIndex <= 0)) return false;
+
+  return inputNodes.some((input) => {
+    const iconCenterX = node.rect.x + node.rect.width / 2;
+    const iconCenterY = node.rect.y + node.rect.height / 2;
+    const leftZoneWidth = Math.min(48, Math.max(24, input.rect.width * 0.25));
+
+    return (
+      iconCenterX >= input.rect.x &&
+      iconCenterX <= input.rect.x + leftZoneWidth &&
+      iconCenterY >= input.rect.y &&
+      iconCenterY <= input.rect.y + input.rect.height
+    );
+  });
+}
+
+function hasSvgDescendant(node: ElementSnapshot): boolean {
+  if (node.tag === "SVG") return true;
+  return node.childNodes.some((child) => isElementNodeSnapshot(child) && hasSvgDescendant(child));
+}
+
+interface SelectSnapshotEntry {
+  node: ElementSnapshot;
+  parent: ElementSnapshot;
+  text: string;
+}
+
+function removeStackedSelectClones(root: ElementSnapshot): void {
+  const entries: SelectSnapshotEntry[] = [];
+  collectSelectSnapshots(root, entries);
+  if (entries.length < 2) return;
+
+  const sorted = [...entries].sort((a, b) => a.node.rect.y - b.node.rect.y);
+  const remove = new Set<ElementSnapshot>();
+
+  for (let index = 0; index < sorted.length; index += 1) {
+    const candidate = sorted[index];
+    if (!candidate || remove.has(candidate.node)) continue;
+
+    for (let prevIndex = 0; prevIndex < index; prevIndex += 1) {
+      const previous = sorted[prevIndex];
+      if (!previous || remove.has(previous.node)) continue;
+      if (!isStackedSelectClone(previous, candidate)) continue;
+
+      remove.add(candidate.node);
+      break;
+    }
+  }
+
+  if (remove.size === 0) return;
+
+  for (const entry of entries) {
+    if (!remove.has(entry.node)) continue;
+    entry.parent.childNodes = entry.parent.childNodes.filter((child) => child !== entry.node);
+  }
+}
+
+function collectSelectSnapshots(node: ElementSnapshot, entries: SelectSnapshotEntry[]): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (child.attributes["data-h2d-select-control"] === "true") {
+      entries.push({
+        node: child,
+        parent: node,
+        text: getSnapshotText(child),
+      });
+    }
+
+    collectSelectSnapshots(child, entries);
+  }
+}
+
+function isStackedSelectClone(previous: SelectSnapshotEntry, candidate: SelectSnapshotEntry): boolean {
+  if (!previous.text || previous.text !== candidate.text) return false;
+
+  const first = previous.node.rect;
+  const second = candidate.node.rect;
+  const verticalGap = second.y - (first.y + first.height);
+  if (verticalGap < -4 || verticalGap > 12) return false;
+
+  const widthDelta = Math.abs(first.width - second.width);
+  const heightDelta = Math.abs(first.height - second.height);
+  if (widthDelta > Math.max(8, first.width * 0.08)) return false;
+  if (heightDelta > Math.max(4, first.height * 0.2)) return false;
+
+  const overlap = Math.min(first.x + first.width, second.x + second.width) - Math.max(first.x, second.x);
+  return overlap >= Math.min(first.width, second.width) * 0.8;
+}
+
+function getSnapshotText(node: SnapshotNode): string {
+  if (node.nodeType === NODE_TYPES.TEXT_NODE) return node.text.replace(/\s+/g, " ").trim();
+  if (!isElementNodeSnapshot(node)) return "";
+
+  return node.childNodes
+    .map((child) => getSnapshotText(child))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // ---------------------------------------------------------------------------
-// Pseudo-element text materialization
+// Pseudo-element materialization
 // ---------------------------------------------------------------------------
 
-function materializeTextPseudoElements(element: Element, childNodes: SnapshotNode[]): Set<string> {
+function materializePseudoElements(element: Element, childNodes: SnapshotNode[]): Set<string> {
   const materialized = new Set<string>();
 
   for (const pseudo of ["::before", "::after"] as const) {
-    const pseudoNode = snapshotTextPseudoElement(element, pseudo);
+    const pseudoNode =
+      snapshotTextPseudoElement(element, pseudo) ??
+      snapshotPaintPseudoElement(element, pseudo);
     if (!pseudoNode) continue;
 
     if (pseudo === "::before") {
@@ -508,6 +816,278 @@ function materializeTextPseudoElements(element: Element, childNodes: SnapshotNod
   }
 
   return materialized;
+}
+
+function snapshotPseudoChevronIcon(element: Element): ElementSnapshot | null {
+  const tag = element.tagName.toUpperCase();
+  if (tag !== "I" && tag !== "SPAN") return null;
+
+  const before = getComputedStyleFor(element, "::before");
+  const after = getComputedStyleFor(element, "::after");
+  if (!isPaintPseudoCandidate(element, before) || !isPaintPseudoCandidate(element, after)) return null;
+  if (!isChevronPseudoBar(before) || !isChevronPseudoBar(after)) return null;
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 && hostRect.height <= 0) return null;
+
+  const size = Math.max(10, Math.min(14, Math.max(hostRect.width || 0, hostRect.height || 12)));
+  const x = hostRect.x + (hostRect.width - size) / 2;
+  const y = hostRect.height > 0
+    ? hostRect.y + (hostRect.height - size) / 2
+    : hostRect.y - size / 2;
+  const direction = getPseudoChevronDirection(element, before, after);
+  const color = getPseudoChevronColor(element, before, after);
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: generateNodeId(element),
+    tag: "SVG",
+    attributes: {
+      "data-h2d-pseudo-chevron": direction,
+    },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: "0px",
+      top: "0px",
+      width: `${roundPx(size)}px`,
+      height: `${roundPx(size)}px`,
+      color,
+      overflow: "visible",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(new DOMRect(x, y, size, size)),
+    childNodes: [],
+    content: createPseudoChevronSvg(direction, color),
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function isChevronPseudoBar(computed: CSSStyleDeclaration): boolean {
+  if (!computed.transform || computed.transform === "none") return false;
+
+  const width = parsePx(computed.width, 0);
+  const height = parsePx(computed.height, 0);
+  if (width <= 0 || height <= 0) return false;
+  return Math.max(width, height) / Math.max(1, Math.min(width, height)) >= 2;
+}
+
+function getPseudoChevronDirection(
+  element: Element,
+  before: CSSStyleDeclaration,
+  after: CSSStyleDeclaration,
+): "up" | "down" {
+  let current: Element | null = element;
+  let depth = 0;
+  while (current && depth < 5) {
+    const expanded = current.getAttribute("aria-expanded");
+    if (expanded === "true") return "up";
+    if (expanded === "false") return "down";
+    current = current.parentElement;
+    depth += 1;
+  }
+
+  const beforeAngle = getTransformRotationAngle(before.transform);
+  const afterAngle = getTransformRotationAngle(after.transform);
+  if (Number.isFinite(beforeAngle) && Number.isFinite(afterAngle) && beforeAngle < afterAngle) {
+    return "up";
+  }
+
+  return "down";
+}
+
+function getTransformRotationAngle(transform: string): number {
+  if (!transform || transform === "none") return NaN;
+
+  const matrixMatch = transform.match(/matrix\(([^)]+)\)/);
+  if (matrixMatch) {
+    const values = matrixMatch[1].split(",").map((value) => parseFloat(value.trim()));
+    if (values.length >= 2 && Number.isFinite(values[0]) && Number.isFinite(values[1])) {
+      return Math.atan2(values[1], values[0]) * (180 / Math.PI);
+    }
+  }
+
+  const rotateMatch = transform.match(/rotate\(([-\d.]+)deg\)/);
+  if (rotateMatch) {
+    const angle = parseFloat(rotateMatch[1]);
+    if (Number.isFinite(angle)) return angle;
+  }
+
+  return NaN;
+}
+
+function getPseudoChevronColor(
+  element: Element,
+  before: CSSStyleDeclaration,
+  after: CSSStyleDeclaration,
+): string {
+  if (isVisiblePaint(before.backgroundColor)) return before.backgroundColor;
+  if (isVisiblePaint(after.backgroundColor)) return after.backgroundColor;
+
+  const computed = getComputedStyleFor(element);
+  return isVisiblePaint(computed.color) ? computed.color : "rgb(134, 136, 143)";
+}
+
+function createPseudoChevronSvg(direction: "up" | "down", color: string): string {
+  const path = direction === "up"
+    ? "M3 7.5 6 4.5 9 7.5"
+    : "M3 4.5 6 7.5 9 4.5";
+  const stroke = escapeSvgAttribute(color);
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="${path}" fill="none" stroke="${stroke}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
+function escapeSvgAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function snapshotPaintPseudoElement(element: Element, pseudo: "::before" | "::after"): ElementSnapshot | null {
+  const computed = getComputedStyleFor(element, pseudo);
+  if (!isPaintPseudoCandidate(element, computed)) return null;
+
+  const width = parsePx(computed.width, NaN);
+  const height = parsePx(computed.height, NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 && hostRect.height <= 0) return null;
+
+  const rect = computePaintPseudoRect(pseudo, hostRect, computed, width, height);
+  const styles = getPaintPseudoStyles(computed, width, height);
+  const transform = resolveTransform(computed);
+
+  return {
+    nodeType: Node.ELEMENT_NODE as 1,
+    id: generateNodeId(null),
+    tag: "SPAN",
+    attributes: {
+      "data-h2d-pseudo": pseudo === "::before" ? "before" : "after",
+      "data-h2d-pseudo-kind": "paint",
+    },
+    styles,
+    rect: toElementRect(rect),
+    childNodes: [],
+    relativeTransform: transform ? matrixToSimple(transform) : undefined,
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function isPaintPseudoCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
+  const hostTag = element.tagName.toUpperCase();
+  if (hostTag !== "I" && hostTag !== "SPAN") return false;
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width > 48 || hostRect.height > 48) return false;
+
+  const text = parseCssTextContent(computed.content);
+  if (text && text.trim()) return false;
+
+  const width = parsePx(computed.width, NaN);
+  const height = parsePx(computed.height, NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
+  if (width <= 0 || height <= 0 || width > 32 || height > 32) return false;
+
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") {
+    return false;
+  }
+
+  return isVisiblePaint(computed.backgroundColor) || hasVisibleBorderStyles(computed);
+}
+
+function computePaintPseudoRect(
+  pseudo: "::before" | "::after",
+  hostRect: DOMRect,
+  computed: CSSStyleDeclaration,
+  width: number,
+  height: number,
+): DOMRect {
+  const marginLeft = parsePx(computed.marginLeft, 0);
+  const marginRight = parsePx(computed.marginRight, 0);
+  const marginTop = parsePx(computed.marginTop, 0);
+  const marginBottom = parsePx(computed.marginBottom, 0);
+  const left = parsePx(computed.left, NaN);
+  const right = parsePx(computed.right, NaN);
+  const top = parsePx(computed.top, NaN);
+  const bottom = parsePx(computed.bottom, NaN);
+
+  let x: number;
+  if (Number.isFinite(left)) {
+    x = hostRect.x + left + marginLeft;
+  } else if (Number.isFinite(right)) {
+    x = hostRect.right - right - width - marginRight;
+  } else {
+    x = pseudo === "::before" ? hostRect.x + marginLeft : hostRect.right - width - marginRight;
+  }
+
+  let y: number;
+  if (Number.isFinite(top)) {
+    y = hostRect.y + top + marginTop;
+  } else if (Number.isFinite(bottom)) {
+    y = hostRect.bottom - bottom - height - marginBottom;
+  } else {
+    y = hostRect.y + Math.max(0, (hostRect.height - height) / 2) + marginTop;
+  }
+
+  return new DOMRect(x, y, width, height);
+}
+
+function getPaintPseudoStyles(computed: CSSStyleDeclaration, width: number, height: number): Record<string, string> {
+  const styles: Record<string, string> = {
+    display: "block",
+    position: "absolute",
+    left: "0px",
+    top: "0px",
+    width: `${roundPx(width)}px`,
+    height: `${roundPx(height)}px`,
+    boxSizing: computed.boxSizing || "border-box",
+    overflow: "visible",
+  };
+
+  if (isVisiblePaint(computed.backgroundColor)) {
+    styles.backgroundColor = computed.backgroundColor;
+  }
+  if (computed.backgroundImage && computed.backgroundImage !== "none") {
+    styles.backgroundImage = computed.backgroundImage;
+  }
+  if (computed.opacity && computed.opacity !== "1") {
+    styles.opacity = computed.opacity;
+  }
+  if (computed.transform && computed.transform !== "none") {
+    styles.transform = computed.transform;
+  }
+  if (computed.transformOrigin) {
+    styles.transformOrigin = computed.transformOrigin;
+  }
+
+  copyPaintPseudoBorderStyles(computed, styles);
+  copyPaintPseudoRadiusStyles(computed, styles);
+
+  return styles;
+}
+
+function copyPaintPseudoBorderStyles(computed: CSSStyleDeclaration, styles: Record<string, string>): void {
+  for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
+    const width = computed[`border${side}Width` as keyof CSSStyleDeclaration] as string;
+    const style = computed[`border${side}Style` as keyof CSSStyleDeclaration] as string;
+    const color = computed[`border${side}Color` as keyof CSSStyleDeclaration] as string;
+    if (parsePx(width, 0) <= 0 || style === "none" || style === "hidden") continue;
+
+    styles[`border${side}Width`] = width;
+    styles[`border${side}Style`] = style;
+    styles[`border${side}Color`] = color;
+  }
+}
+
+function copyPaintPseudoRadiusStyles(computed: CSSStyleDeclaration, styles: Record<string, string>): void {
+  for (const corner of ["TopLeft", "TopRight", "BottomRight", "BottomLeft"] as const) {
+    const key = `border${corner}Radius` as keyof CSSStyleDeclaration;
+    const value = computed[key] as string;
+    if (parsePx(value, 0) <= 0) continue;
+    styles[`border${corner}Radius`] = value;
+  }
 }
 
 function snapshotTextPseudoElement(element: Element, pseudo: "::before" | "::after"): ElementSnapshot | null {
@@ -522,7 +1102,7 @@ function snapshotTextPseudoElement(element: Element, pseudo: "::before" | "::aft
   const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
   const width = getPseudoTextWidth(text, computed, fontSize);
   const height = Math.max(1, parsePx(computed.height, 0), lineHeight);
-  const rect = computePseudoTextRect(pseudo, hostRect, computed, width, height, fontSize);
+  const rect = computePseudoTextRect(element, pseudo, hostRect, computed, width, height, fontSize);
   const styles = getPseudoTextStyles(computed, fontSize, lineHeight);
 
   const textNode: TextSnapshot = {
@@ -576,6 +1156,7 @@ function isPlainPseudoText(text: string): boolean {
 }
 
 function computePseudoTextRect(
+  element: Element,
   pseudo: "::before" | "::after",
   hostRect: DOMRect,
   computed: CSSStyleDeclaration,
@@ -583,6 +1164,9 @@ function computePseudoTextRect(
   height: number,
   fontSize: number,
 ): DOMRect {
+  const inlineRect = computeInlinePseudoTextRect(element, pseudo, computed, width, height);
+  if (inlineRect) return inlineRect;
+
   const marginLeft = parsePx(computed.marginLeft, 0);
   const marginTop = parsePx(computed.marginTop, 0);
   const left = parsePx(computed.left, NaN);
@@ -611,6 +1195,50 @@ function computePseudoTextRect(
   }
 
   return new DOMRect(x, y, width, height);
+}
+
+function computeInlinePseudoTextRect(
+  element: Element,
+  pseudo: "::before" | "::after",
+  computed: CSSStyleDeclaration,
+  width: number,
+  height: number,
+): DOMRect | null {
+  if (computed.position === "absolute" || computed.position === "fixed") return null;
+
+  const anchors = getDirectChildVisualRects(element);
+  const anchor = pseudo === "::before" ? anchors[0] : anchors[anchors.length - 1];
+  if (!anchor) return null;
+
+  const marginLeft = parsePx(computed.marginLeft, 0);
+  const marginRight = parsePx(computed.marginRight, 0);
+  const marginTop = parsePx(computed.marginTop, 0);
+  const x = pseudo === "::before"
+    ? anchor.x - width - marginRight + marginLeft
+    : anchor.right + marginLeft;
+  const y = anchor.y + Math.max(0, (anchor.height - height) / 2) + marginTop;
+
+  return new DOMRect(x, y, width, height);
+}
+
+function getDirectChildVisualRects(element: Element): DOMRect[] {
+  const rects: DOMRect[] = [];
+
+  for (const child of Array.from(element.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      const text = child.textContent || "";
+      if (!text.trim()) continue;
+      const rect = getTextRect(child);
+      if (rect.width > 0 || rect.height > 0) rects.push(new DOMRect(rect.x, rect.y, rect.width, rect.height));
+    } else if (child.nodeType === Node.ELEMENT_NODE) {
+      const childElement = child as Element;
+      if (!isNodeVisible(childElement)) continue;
+      const rect = childElement.getBoundingClientRect();
+      if (rect.width > 0 || rect.height > 0) rects.push(rect);
+    }
+  }
+
+  return rects;
 }
 
 function getPseudoTextStyles(computed: CSSStyleDeclaration, fontSize: number, lineHeight: number): Record<string, string> {

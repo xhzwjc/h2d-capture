@@ -98,6 +98,8 @@ export function bakeSvgStyles(svgElement: SVGElement): string {
   const clone = svgElement.cloneNode(true) as SVGElement;
 
   copySvgComputedStyles(svgElement, clone);
+  inlineSvgUseReferences(svgElement, clone);
+  replaceCurrentColorReferences(clone);
 
   const { width, height } = getComputedStyleFor(svgElement);
   if (width.endsWith("px") && height.endsWith("px")) {
@@ -111,6 +113,114 @@ export function bakeSvgStyles(svgElement: SVGElement): string {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const HREF_ATTRS = new Set(["href", "xlink:href"]);
+const CURRENT_COLOR_ATTRS = ["fill", "stroke", "stop-color", "flood-color", "lighting-color"];
+
+function replaceCurrentColorReferences(element: Element, inheritedColor?: string): void {
+  const color = getInlineSvgColor(element) || inheritedColor;
+
+  for (const attr of CURRENT_COLOR_ATTRS) {
+    if (element.getAttribute(attr)?.trim().toLowerCase() === "currentcolor" && color) {
+      element.setAttribute(attr, color);
+    }
+  }
+
+  const style = element.getAttribute("style");
+  if (style && /currentColor/i.test(style) && color) {
+    element.setAttribute("style", style.replace(/currentColor/gi, color));
+  }
+
+  for (const child of Array.from(element.children)) {
+    replaceCurrentColorReferences(child, color);
+  }
+}
+
+function getInlineSvgColor(element: Element): string | undefined {
+  const colorAttr = element.getAttribute("color");
+  if (colorAttr && colorAttr.trim().toLowerCase() !== "currentcolor") {
+    return colorAttr.trim();
+  }
+
+  const styleColor = (element as HTMLElement | SVGElement).style?.color;
+  if (styleColor && styleColor.trim().toLowerCase() !== "currentcolor") {
+    return styleColor.trim();
+  }
+
+  return undefined;
+}
+
+function inlineSvgUseReferences(sourceSvg: SVGElement, cloneSvg: SVGElement): void {
+  const sourceUses = Array.from(sourceSvg.querySelectorAll("use"));
+  const cloneUses = Array.from(cloneSvg.querySelectorAll("use"));
+
+  for (let index = 0; index < sourceUses.length; index += 1) {
+    const sourceUse = sourceUses[index];
+    const cloneUse = cloneUses[index];
+    if (!sourceUse || !cloneUse) continue;
+
+    inlineSingleUseReference(sourceUse, cloneUse, cloneSvg);
+  }
+}
+
+function inlineSingleUseReference(sourceUse: SVGUseElement, cloneUse: SVGUseElement, cloneSvg: SVGElement): void {
+  const href = getUseHref(sourceUse);
+  if (!href?.startsWith("#")) return;
+
+  const referenced = sourceUse.ownerDocument.getElementById(href.slice(1));
+  if (!referenced || !isElementNode(referenced)) return;
+
+  const group = cloneUse.ownerDocument.createElementNS(SVG_NS, "g");
+  copyUseAttributes(cloneUse, group);
+  applyUseTranslation(sourceUse, group);
+  copyReferencedContent(referenced, group);
+
+  if (!cloneSvg.hasAttribute("viewBox")) {
+    const viewBox = referenced.getAttribute("viewBox");
+    if (viewBox) cloneSvg.setAttribute("viewBox", viewBox);
+  }
+
+  cloneUse.replaceWith(group);
+}
+
+function getUseHref(use: SVGUseElement): string | null {
+  return (
+    use.getAttribute("href") ||
+    use.getAttribute("xlink:href") ||
+    use.href?.baseVal ||
+    null
+  );
+}
+
+function copyUseAttributes(source: SVGUseElement, target: SVGElement): void {
+  for (const attr of Array.from(source.attributes)) {
+    if (HREF_ATTRS.has(attr.name)) continue;
+    if (attr.name === "x" || attr.name === "y" || attr.name === "width" || attr.name === "height") continue;
+    target.setAttribute(attr.name, attr.value);
+  }
+}
+
+function applyUseTranslation(sourceUse: SVGUseElement, group: SVGElement): void {
+  const x = parseFloat(sourceUse.getAttribute("x") || "0");
+  const y = parseFloat(sourceUse.getAttribute("y") || "0");
+  if ((!Number.isFinite(x) || x === 0) && (!Number.isFinite(y) || y === 0)) return;
+
+  const existing = group.getAttribute("transform");
+  const translate = `translate(${Number.isFinite(x) ? x : 0} ${Number.isFinite(y) ? y : 0})`;
+  group.setAttribute("transform", existing ? `${translate} ${existing}` : translate);
+}
+
+function copyReferencedContent(referenced: Element, group: SVGElement): void {
+  const tag = referenced.tagName.toLowerCase();
+  const sourceNodes = tag === "symbol" || tag === "svg" || tag === "g"
+    ? Array.from(referenced.childNodes)
+    : [referenced];
+
+  for (const node of sourceNodes) {
+    group.appendChild(node.cloneNode(true));
+  }
+}
 
 /**
  * Recursively copy non-default computed style values from `source` to

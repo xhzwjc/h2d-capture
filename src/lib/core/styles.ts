@@ -79,7 +79,7 @@ export function diffStyles(element: Element, pseudo?: string): Record<string, st
 /** Properties that must always be present on flex containers for Figma. */
 export const FLEX_CONTAINER_PROPS = [
   "flexDirection", "flexWrap", "justifyContent", "alignItems",
-  "alignContent", "columnGap", "rowGap",
+  "alignContent", "columnGap", "rowGap", "gap",
 ] as const;
 
 /** Properties that must always be present on flex/grid children for Figma. */
@@ -91,7 +91,7 @@ export const FLEX_ITEM_PROPS = [
 export const GRID_CONTAINER_PROPS = [
   "gridTemplateColumns", "gridTemplateRows", "gridAutoFlow",
   "gridAutoColumns", "gridAutoRows", "gridTemplateAreas",
-  "columnGap", "rowGap",
+  "columnGap", "rowGap", "gap",
 ] as const;
 
 /**

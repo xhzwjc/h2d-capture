@@ -30,6 +30,87 @@
         font-weight: 600;
       }
 
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 24px;
+      }
+
+      .topbar .section-title {
+        margin: 0;
+      }
+
+      .header-icon-line {
+        display: inline-flex;
+        align-items: center;
+        height: 60px;
+        gap: 4px;
+        color: #1d2129;
+        line-height: 60px;
+      }
+
+      .header-icon-line img {
+        width: 16px;
+        height: 60px;
+      }
+
+      .user-dropdown {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        height: 40px;
+        color: #1d2129;
+        font-size: 14px;
+        line-height: 40px;
+      }
+
+      .user-dropdown img {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+      }
+
+      .user-dropdown span {
+        color: rgba(0, 0, 0, 0.45);
+      }
+
+      .user-dropdown .caret {
+        width: 12px;
+        height: 12px;
+        color: #86888f;
+      }
+
+      .top-search-fixture {
+        position: relative;
+        flex: none;
+        width: 274px;
+        height: 32px;
+      }
+
+      .top-search-fixture .search-prefix-icon {
+        position: absolute;
+        z-index: 1;
+        left: 8px;
+        top: 7px;
+        width: 18px;
+        height: 18px;
+        color: rgb(176, 178, 184);
+      }
+
+      .top-search-fixture input {
+        width: 274px;
+        height: 32px;
+        border: 1px solid rgb(220, 223, 230);
+        border-radius: 6px;
+        padding: 0 12px 0 34px;
+        background: #fff;
+        color: #1d2129;
+        line-height: 30px;
+        box-sizing: border-box;
+      }
+
       .grid {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -218,12 +299,427 @@
         color: #86888f;
         pointer-events: none;
       }
+
+      .segmented {
+        position: relative;
+        display: inline-flex;
+        grid-column: 1 / -1;
+        width: max-content;
+        padding: 2px;
+        border-radius: 2px;
+        background: #f5f7fa;
+        color: #1d2129;
+        font-size: 14px;
+      }
+
+      .segmented-active-bg {
+        position: absolute;
+        left: 2px;
+        top: 2px;
+        width: 50px;
+        height: 28px;
+        background: rgb(250, 115, 5);
+      }
+
+      .segmented label {
+        position: relative;
+        z-index: 1;
+        flex: none;
+        width: auto;
+        height: 28px;
+        margin: 0;
+        padding: 0 11px;
+        color: #1d2129;
+        line-height: 28px;
+      }
+
+      .segmented label.active {
+        color: #fff;
+      }
+
+      .filter-row {
+        display: flex;
+        grid-column: 1 / -1;
+        column-gap: 40px;
+      }
+
+      .filter-row label {
+        flex: none;
+        width: auto;
+        margin: 0;
+        text-align: start;
+      }
+
+      .sprite-button {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: 32px;
+        padding: 0 12px;
+        border-radius: 4px;
+        background: #008f50;
+        color: #fff;
+        line-height: 32px;
+      }
+
+      .sprite-button svg {
+        width: 16px;
+        height: 16px;
+        fill: currentColor;
+      }
+
+      .ant-range-like {
+        display: inline-flex;
+        align-items: center;
+        width: 300px;
+        height: 32px;
+        border: 1px solid rgb(217, 217, 217);
+        border-radius: 4px;
+        background: #fff;
+        color: rgba(0, 0, 0, 0.25);
+        font-size: 14px;
+        line-height: 14px;
+      }
+
+      .ant-range-like .ant-picker-input {
+        position: relative;
+        width: 113px;
+        height: 22px;
+        margin-left: 12px;
+      }
+
+      .ant-range-like input {
+        width: 100%;
+        height: 22px;
+        border: 0;
+        padding: 0;
+        color: rgba(0, 0, 0, 0.88);
+        line-height: 22px;
+      }
+
+      .ant-range-like .swap {
+        width: 32px;
+        text-align: center;
+      }
+
+      .ant-range-like .calendar {
+        width: 14px;
+        height: 14px;
+        margin-left: auto;
+        margin-right: 10px;
+      }
+
+      .page-size-select {
+        position: relative;
+        width: 94px;
+        height: 32px;
+        border: 1px solid rgb(217, 217, 217);
+        border-radius: 4px;
+        background: #fff;
+        color: rgba(0, 0, 0, 0.88);
+        font-size: 14px;
+        line-height: 22px;
+      }
+
+      .page-size-select .page-size-text {
+        width: 100%;
+        height: 32px;
+        line-height: 32px;
+      }
+
+      .page-size-select .page-size-arrow {
+        position: absolute;
+        right: 10px;
+        top: 9px;
+        width: 14px;
+        height: 14px;
+      }
+
+      .empty-select-popper {
+        position: absolute;
+        left: 650px;
+        top: 326px;
+        width: 160px;
+        height: 32px;
+        border: 1px solid rgb(217, 217, 217);
+        border-radius: 4px;
+        background: #fff;
+        color: rgba(0, 0, 0, 0.45);
+        font-size: 14px;
+        line-height: 32px;
+        padding-left: 12px;
+      }
+
+      .tooltip-trigger-select {
+        position: relative;
+        display: flex;
+        align-items: center;
+        width: 200px;
+        height: 32px;
+        border-radius: 2px;
+        background: #fff;
+        box-shadow: rgb(220, 223, 230) 0 0 0 1px inset;
+        box-sizing: border-box;
+      }
+
+      .tooltip-trigger-select input {
+        width: 100%;
+        height: 30px;
+        border: 0;
+        padding: 0 28px 0 11px;
+        background: transparent;
+        color: #1d2129;
+        line-height: 30px;
+        box-sizing: border-box;
+      }
+
+      .tooltip-trigger-select .el-input__suffix {
+        position: absolute;
+        right: 8px;
+        top: 9px;
+        width: 14px;
+        height: 14px;
+        color: #86909c;
+      }
+
+      .tooltip-trigger-select .el-select__caret {
+        width: 14px;
+        height: 14px;
+      }
+
+      .ant-form-label {
+        display: inline-flex;
+        align-items: center;
+        height: 32px;
+        white-space: nowrap;
+      }
+
+      .ant-form-label::after {
+        content: ":";
+        position: relative;
+        left: 0;
+        margin-left: 2px;
+        line-height: 22px;
+      }
+
+      .el-like-wrapper {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 200px;
+        height: 32px;
+        padding: 1px 11px;
+        border-radius: 2px;
+        background: #fff;
+        box-shadow: rgb(220, 223, 230) 0 0 0 1px inset;
+      }
+
+      .el-like-wrapper input {
+        width: 178px;
+        height: 30px;
+        border: 0;
+        padding: 0;
+        line-height: 30px;
+      }
+
+      .date-range-picker {
+        display: flex;
+        align-items: center;
+        width: 260px;
+        height: 32px;
+        border: 1px solid rgb(230, 231, 235);
+        border-radius: 2px;
+        background: #fff;
+        color: #4e5969;
+        font-size: 14px;
+      }
+
+      .date-range-picker svg {
+        width: 14px;
+        height: 14px;
+        margin: 0 8px;
+        color: #86909c;
+      }
+
+      .date-range-picker input {
+        width: 88px;
+        height: 30px;
+        border: 0;
+        padding: 0;
+        color: #1d2129;
+        line-height: 30px;
+      }
+
+      .date-range-separator {
+        width: 20px;
+        text-align: center;
+      }
+
+      .menu-fixture {
+        grid-column: 1 / -1;
+        width: 240px;
+        padding: 4px 0;
+        background: #fff;
+        color: rgba(0, 0, 0, 0.65);
+      }
+
+      .menu-row {
+        position: relative;
+        display: flex;
+        align-items: center;
+        height: 40px;
+        padding: 0 34px 0 12px;
+        overflow: hidden;
+        font-size: 14px;
+        line-height: 40px;
+      }
+
+      .ant-menu-item-icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+        margin-right: 8px;
+        color: rgba(0, 0, 0, 0.65);
+      }
+
+      .ant-menu-item-icon [role="img"],
+      .ant-menu-item-icon svg {
+        display: block;
+        width: 14px;
+        height: 14px;
+      }
+
+      .menu-arrow {
+        position: absolute;
+        top: 20px;
+        right: 16px;
+        width: 10px;
+        height: 0;
+        color: rgba(0, 0, 0, 0.65);
+      }
+
+      .menu-arrow::before,
+      .menu-arrow::after {
+        content: "";
+        position: absolute;
+        top: 0;
+        width: 6px;
+        height: 1.5px;
+        border-radius: 6px;
+        background: rgba(0, 0, 0, 0.65);
+      }
+
+      .menu-arrow-down::before {
+        left: 0;
+        transform: rotate(45deg);
+        transform-origin: 5px 0;
+      }
+
+      .menu-arrow-down::after {
+        right: 0;
+        transform: rotate(-45deg);
+        transform-origin: 1px 0;
+      }
+
+      .menu-arrow-up::before {
+        left: 0;
+        transform: rotate(-45deg);
+        transform-origin: 5px 0;
+      }
+
+      .menu-arrow-up::after {
+        right: 0;
+        transform: rotate(45deg);
+        transform-origin: 1px 0;
+      }
+
+      .menu-child {
+        height: 32px;
+        padding-left: 40px;
+        color: rgba(0, 0, 0, 0.65);
+        font-size: 14px;
+        line-height: 32px;
+      }
     </style>
   </head>
   <body>
+    <svg width="0" height="0" style="position:absolute;left:-9999px;top:-9999px" aria-hidden="true">
+      <symbol id="fixture-export" viewBox="0 0 16 16">
+        <path d="M8 2v7m0 0 3-3M8 9 5 6M3 12h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
+      </symbol>
+    </svg>
     <main class="page">
-      <h1 class="section-title">表单控件还原 Fixture</h1>
+      <header class="topbar">
+        <div class="header-icon-line">
+          <img alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M2 13h12M4 11V5h3v6M9 11V2h3v9' stroke='%23008f50' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+          <span class="brand-name-fixture">趋势科技有限公司</span>
+          <h1 class="section-title">表单控件还原 Fixture</h1>
+        </div>
+        <div class="top-search-fixture">
+          <span class="search-prefix-icon">
+            <svg class="Header-AppItemIcon" width="18px" height="18px" viewBox="0 0 18 18" aria-hidden="true">
+              <path d="M8.25 3a5.25 5.25 0 1 0 0 10.5A5.25 5.25 0 0 0 8.25 3Zm0 1.5a3.75 3.75 0 1 1 0 7.5 3.75 3.75 0 0 1 0-7.5Z" fill="currentColor"></path>
+              <path d="m12.1 12.1 2.65 2.65" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path>
+            </svg>
+          </span>
+          <input placeholder="搜索菜单/同事" />
+        </div>
+        <div class="user-dropdown ant-dropdown-trigger">
+          <img alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%23ff8a3d'/%3E%3Ccircle cx='16' cy='12' r='5' fill='%23fff0df'/%3E%3Cpath d='M7 28c1.8-6.2 15.2-6.2 18 0' fill='%23fff0df'/%3E%3C/svg%3E" />
+          <span>Serati Ma</span>
+          <svg class="caret" viewBox="0 0 12 12" aria-hidden="true">
+            <path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+        </div>
+      </header>
       <section class="grid">
+        <nav class="menu-fixture" aria-label="菜单箭头 fixture">
+          <div class="menu-row" role="menuitem" aria-haspopup="true" aria-expanded="false">
+            <span class="ant-menu-item-icon">
+              <span role="img" aria-label="team">
+                <svg viewBox="64 64 896 896" data-icon="team" aria-hidden="true">
+                  <path d="M824 700a302 302 0 0 0-86-60c45-37 74-93 74-156 0-111-92-202-203-200-109 2-197 91-197 200 0 63 29 119 74 156a301 301 0 0 0-86 60c-55 55-86 127-88 204a8 8 0 0 0 8 8h56c4 0 8-3 8-8 2-58 25-112 67-153a227 227 0 0 1 322 0c41 41 65 95 67 153 0 5 4 8 8 8h56a8 8 0 0 0 8-8c-2-77-33-149-88-204zM612 612a128 128 0 1 1 0-256 128 128 0 0 1 0 256z" fill="currentColor"></path>
+                </svg>
+              </span>
+            </span>
+            <span>工程师管理</span>
+            <i class="menu-arrow menu-arrow-down"></i>
+          </div>
+          <div class="menu-row" role="menuitem" aria-haspopup="true" aria-expanded="true">
+            系统管理
+            <i class="menu-arrow menu-arrow-up"></i>
+          </div>
+          <div class="menu-child">技能标签配置</div>
+        </nav>
+
+        <div class="segmented">
+          <div class="segmented-active-bg"></div>
+          <label class="active">全部</label>
+          <label>待立项</label>
+          <label>已立项</label>
+        </div>
+
+        <div class="filter-row">
+          <label class="ant-form-label" title="企业">企业</label>
+          <label class="ant-form-label" title="联系人">联系人</label>
+          <button class="sprite-button">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><use href="#fixture-export"></use></svg>
+            数据导出
+          </button>
+          <label class="ant-form-label" title="地区">地区</label>
+          <div class="tooltip-trigger-select el-tooltip__trigger el-tooltip__trigger el-input__wrapper" role="combobox" aria-haspopup="listbox">
+            <input readonly placeholder="请选择地区" />
+            <span class="el-input__suffix">
+              <svg class="el-select__caret" viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </span>
+          </div>
+          <div class="el-select-dropdown empty-select-popper" role="listbox">请选择地区</div>
+        </div>
+
         <div class="field">
           <label class="required">职位名称</label>
           <input placeholder="请输入" />
@@ -280,6 +776,58 @@
           <input placeholder="请输入" />
         </div>
 
+        <div class="field">
+          <label>订单编号</label>
+          <div class="el-like-wrapper">
+            <input placeholder="请输入订单编号" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>创建时间</label>
+          <div class="date-range-picker">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3 2.5h10a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1Zm0 4h10M5 1.5v3M11 1.5v3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"></path>
+            </svg>
+            <input placeholder="开始日期" />
+            <span class="date-range-separator">-</span>
+            <input placeholder="结束日期" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>推送时间</label>
+          <div class="ant-range-like">
+            <div class="ant-picker-input">
+              <input readonly placeholder="推送开始时间" />
+            </div>
+            <span class="swap">→</span>
+            <div class="ant-picker-input">
+              <input readonly placeholder="结束时间" />
+            </div>
+            <svg class="calendar" data-icon="calendar" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3 2.5h10a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1Zm0 4h10M5 1.5v3M11 1.5v3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"></path>
+            </svg>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>前往</label>
+          <div class="el-like-wrapper">
+            <input id="fixture-page-jump" type="number" aria-label="页" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>分页条数</label>
+          <div class="page-size-select" role="combobox" aria-haspopup="listbox">
+            <span class="page-size-text">10 条/页</span>
+            <svg class="page-size-arrow" viewBox="0 0 12 12" aria-hidden="true">
+              <path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          </div>
+        </div>
+
         <div class="field italent-like-field">
           <label>iTalent 下拉</label>
           <div class="italent-select-shell">
@@ -305,5 +853,8 @@
         </div>
       </section>
     </main>
+    <script>
+      document.getElementById("fixture-page-jump").value = "3";
+    </script>
   </body>
 </html>
