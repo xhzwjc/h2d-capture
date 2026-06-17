@@ -532,6 +532,7 @@ function snapshotElement(
   ensureTopChromeTextStacking(element, computedStyles);
   ensureTextOnlyLineHeight(element, computedStyles);
   relaxVirtualScrollClipping(element, computedStyles);
+  stabilizePopupLayerStacking(element, computedStyles);
 
   // Browser propagates body background to the viewport when html has no background.
   // Replicate this so Figma shows the correct background on the root frame.
@@ -634,22 +635,28 @@ function snapshotElement(
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
   unclipZeroSizeVisibleWrapper(computedStyles, rect, childNodes);
+  const popupActionOverflowRelaxed = relaxPopupActionClipping(element, computedStyles, rect, childNodes);
   const verticalScrollViewportStabilized = stabilizeVerticalOverlayScrollViewport(element, computedStyles, childNodes, rect);
   stabilizeHorizontalScrolledTableViewport(element, computedStyles, childNodes, rect);
 
   // Prune invisible nodes (zero-size without children, offscreen, etc.)
-  if (shouldPruneNode(element, rect, childNodes)) {
+  if (shouldPruneNode(element, rect, childNodes) && !shouldKeepClippedPopupAction(element, rect, childNodes)) {
     return null;
   }
 
   // Infer layout sizing hints for Figma Auto Layout.
   const sizing = inferLayoutSizing(element, computedStyles, element.parentElement);
 
+  const attributes = getSnapshotElementAttributes(element, verticalScrollViewportStabilized);
+  if (popupActionOverflowRelaxed) {
+    attributes["data-h2d-popup-action-overflow"] = "true";
+  }
+
   const node: ElementSnapshot = {
     nodeType: Node.ELEMENT_NODE as 1,
     id: generateNodeId(element),
     tag: expandedIframe ? "DIV" : tag,
-    attributes: getSnapshotElementAttributes(element, verticalScrollViewportStabilized),
+    attributes,
     styles: computedStyles,
     rect,
     childNodes,
@@ -789,6 +796,208 @@ function ensurePositionForZIndex(styles: Record<string, string>): void {
   if (styles.position == null || styles.position === "static") {
     styles.position = "relative";
   }
+}
+
+function stabilizePopupLayerStacking(element: Element, styles: Record<string, string>): void {
+  const computed = getComputedStyleFor(element);
+  if (isPopupLayerCandidate(element, computed)) {
+    const maskZIndex = getMaxSiblingBackdropZIndex(element);
+    if (maskZIndex != null) {
+      elevateLayerZIndex(styles, computed, maskZIndex + 1);
+      return;
+    }
+
+    const framePopupInfo = getOwnerFramePopupLayerInfo(element);
+    if (framePopupInfo) {
+      elevateLayerZIndex(styles, computed, framePopupInfo.maskZIndex + 2);
+      return;
+    }
+  }
+
+  const popupInfo = getAncestorPopupLayerInfo(element);
+  const framePopupInfo = popupInfo ?? getOwnerFramePopupLayerInfo(element);
+  if (!framePopupInfo) return;
+  if (!isPopupSurfaceCandidate(element, computed, framePopupInfo.layer)) return;
+
+  elevateLayerZIndex(styles, computed, framePopupInfo.maskZIndex + 2);
+}
+
+function isPopupLayerCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (tag === "HTML" || tag === "BODY") return false;
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+  if (computed.position !== "fixed" && computed.position !== "absolute") return false;
+  if (isBackdropLayer(element, computed)) return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 240 || rect.height < 120) return false;
+
+  const identity = getElementIdentity(element);
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  const dataType = element.getAttribute("data-type")?.toLowerCase() || "";
+  const looksLikePopup =
+    dataType === "popup" ||
+    role === "dialog" ||
+    role === "alertdialog" ||
+    /(^|[-_\s])(popup|pop-up|modal|dialog|drawer)([-_\s]|$)/i.test(identity);
+  if (!looksLikePopup) return false;
+
+  return hasDirectVisibleText(element) || hasVisibleTextDescendant(element) || hasReadableIframeVisibleText(element);
+}
+
+function isPopupSurfaceCandidate(element: Element, computed: CSSStyleDeclaration, popupLayer: Element): boolean {
+  if (element === popupLayer) return false;
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+  if (isBackdropLayer(element, computed)) return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 240 || rect.height < 120) return false;
+  if (getNodeDocument(element) === getNodeDocument(popupLayer)) {
+    const popupRect = popupLayer.getBoundingClientRect();
+    if (rect.right <= popupRect.left || rect.left >= popupRect.right) return false;
+    if (rect.bottom <= popupRect.top || rect.top >= popupRect.bottom) return false;
+  }
+
+  const identity = getElementIdentity(element);
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  const looksLikeSurface =
+    role === "dialog" ||
+    role === "alertdialog" ||
+    /(^|[-_\s])(modal|dialog|drawer|panel|content|container|wrapper)([-_\s]|$)/i.test(identity);
+  const hasSurfacePaint =
+    isVisiblePaint(computed.backgroundColor) ||
+    hasVisibleBorderStyles(computed) ||
+    Boolean(computed.boxShadow && computed.boxShadow !== "none");
+  if (!looksLikeSurface && !hasSurfacePaint) return false;
+
+  return hasDirectVisibleText(element) || hasVisibleTextDescendant(element);
+}
+
+function hasReadableIframeVisibleText(element: Element): boolean {
+  const frameDocument = getReadableIframeDocument(element);
+  if (!frameDocument?.body) return false;
+  return Boolean((frameDocument.body.innerText || frameDocument.body.textContent || "").trim());
+}
+
+function isInsidePopupCaptureLayer(element: Element): boolean {
+  return Boolean(getAncestorPopupLayerInfo(element) ?? getOwnerFramePopupLayerInfo(element));
+}
+
+function shouldKeepClippedPopupAction(
+  element: Element,
+  rect: { width: number; height: number },
+  childNodes: SnapshotNode[],
+): boolean {
+  if (rect.width <= 0.5 || rect.height <= 0.5) return false;
+  if (!isInsidePopupCaptureLayer(element)) return false;
+
+  return isPopupActionElement(element) || hasPopupActionSnapshotDescendant(childNodes);
+}
+
+function isPopupActionElement(element: Element): boolean {
+  const tag = element.tagName.toUpperCase();
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  if (tag !== "BUTTON" && role !== "button") return false;
+
+  const label = ((element as HTMLElement).innerText || element.textContent || "").replace(/\s+/g, "");
+  return isPopupActionText(label);
+}
+
+function hasPopupActionSnapshotDescendant(childNodes: SnapshotNode[]): boolean {
+  for (const child of childNodes) {
+    if (child.nodeType === NODE_TYPES.TEXT_NODE && isPopupActionText((child as TextSnapshot).text.replace(/\s+/g, ""))) {
+      return true;
+    }
+    if (child.nodeType === NODE_TYPES.ELEMENT_NODE && hasPopupActionSnapshotDescendant((child as ElementSnapshot).childNodes)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isPopupActionText(text: string): boolean {
+  if (!text || text.length > 20) return false;
+  return /^(取消|保存|确定|提交|关闭|发布|保存并发起审批|发起审批|保存并发布广告)$/.test(text);
+}
+
+function getAncestorPopupLayerInfo(element: Element): { layer: Element; maskZIndex: number } | null {
+  let ancestor = element.parentElement;
+  let depth = 0;
+  while (ancestor && depth < 12) {
+    const ancestorComputed = getComputedStyleFor(ancestor);
+    if (isPopupLayerCandidate(ancestor, ancestorComputed)) {
+      const maskZIndex = getMaxSiblingBackdropZIndex(ancestor);
+      if (maskZIndex != null) {
+        return { layer: ancestor, maskZIndex };
+      }
+    }
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+
+  return null;
+}
+
+function getOwnerFramePopupLayerInfo(element: Element): { layer: Element; maskZIndex: number } | null {
+  const frameElement = getNodeWindow(element).frameElement;
+  if (!frameElement) return null;
+
+  const frameComputed = getComputedStyleFor(frameElement);
+  if (!isPopupLayerCandidate(frameElement, frameComputed)) return null;
+
+  const maskZIndex = getMaxSiblingBackdropZIndex(frameElement);
+  if (maskZIndex == null) return null;
+
+  return { layer: frameElement, maskZIndex };
+}
+
+function getMaxSiblingBackdropZIndex(element: Element): number | null {
+  const parent = element.parentElement;
+  if (!parent) return null;
+
+  let maxZIndex: number | null = null;
+  for (const sibling of Array.from(parent.children)) {
+    if (sibling === element) continue;
+
+    const siblingComputed = getComputedStyleFor(sibling);
+    if (!isBackdropLayer(sibling, siblingComputed)) continue;
+
+    const zIndex = parseZIndex(siblingComputed.zIndex);
+    if (zIndex == null) continue;
+    maxZIndex = maxZIndex == null ? zIndex : Math.max(maxZIndex, zIndex);
+  }
+
+  return maxZIndex;
+}
+
+function isBackdropLayer(element: Element, computed: CSSStyleDeclaration): boolean {
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+  if (computed.position !== "fixed" && computed.position !== "absolute") return false;
+
+  const identity = getElementIdentity(element);
+  if (!/(^|[-_\s])(mask|backdrop|overlay)([-_\s]|$)/i.test(identity)) return false;
+
+  const rect = element.getBoundingClientRect();
+  const view = getNodeWindow(element);
+  if (rect.width < view.innerWidth * 0.5 || rect.height < view.innerHeight * 0.5) return false;
+
+  return isVisiblePaint(computed.backgroundColor) || (computed.backgroundImage !== "" && computed.backgroundImage !== "none");
+}
+
+function elevateLayerZIndex(styles: Record<string, string>, computed: CSSStyleDeclaration, minZIndex: number): void {
+  const currentZIndex = parseZIndex(computed.zIndex);
+  if (currentZIndex != null && currentZIndex >= minZIndex) return;
+
+  styles.zIndex = String(minZIndex);
+  if (styles.position == null || styles.position === "static") {
+    styles.position = computed.position === "static" ? "relative" : computed.position;
+  }
+}
+
+function parseZIndex(value: string): number | null {
+  const parsed = parseInt(value || "", 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function normalizeTreeTextNegativeZIndex(element: Element, styles: Record<string, string>): void {
@@ -2626,8 +2835,11 @@ function copyPaintPseudoRadiusStyles(computed: CSSStyleDeclaration, styles: Reco
 
 function snapshotTextPseudoElement(element: Element, pseudo: "::before" | "::after"): ElementSnapshot | null {
   const computed = getComputedStyleFor(element, pseudo);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return null;
+
   const text = parseCssTextContent(computed.content);
   if (!text || !isPlainPseudoText(text)) return null;
+  if (isLayoutOnlyDotPseudoText(text, pseudo, computed)) return null;
 
   const hostRect = element.getBoundingClientRect();
   if (hostRect.width <= 0 && hostRect.height <= 0) return null;
@@ -2687,6 +2899,25 @@ function isPlainPseudoText(text: string): boolean {
   if (!trimmed) return false;
   if (trimmed.startsWith("<svg") || trimmed.startsWith("<")) return false;
   return trimmed.length <= 8;
+}
+
+function isLayoutOnlyDotPseudoText(
+  text: string,
+  pseudo: "::before" | "::after",
+  computed: CSSStyleDeclaration,
+): boolean {
+  if (pseudo !== "::after" || text.trim() !== ".") return false;
+
+  const clear = computed.clear || "";
+  if (clear && clear !== "none") return true;
+
+  const hasPaint =
+    isVisiblePaint(computed.backgroundColor) ||
+    hasVisibleBorderStyles(computed) ||
+    (computed.backgroundImage && computed.backgroundImage !== "none");
+  if (hasPaint) return false;
+
+  return computed.display === "block" || parsePx(computed.height, 0) <= 1;
 }
 
 function computePseudoTextRect(
@@ -2917,7 +3148,8 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
   node.styles.boxSizing = "border-box";
   const overflowAxes = getSnapshotChildOverflowAxes(node);
   const isVerticalOverlayScrollViewport = node.attributes["data-h2d-vertical-scroll-viewport"] === "true";
-  if (isZeroSizeVisibleWrapper(node)) {
+  const shouldPreservePopupActionOverflow = node.attributes["data-h2d-popup-action-overflow"] === "true";
+  if (isZeroSizeVisibleWrapper(node) || shouldPreservePopupActionOverflow) {
     node.styles.overflow = "visible";
     node.styles.overflowX = "visible";
     node.styles.overflowY = "visible";
@@ -2998,7 +3230,7 @@ function unclipZeroSizeVisibleWrapper(
   rect: { width: number; height: number },
   childNodes: SnapshotNode[],
 ): void {
-  if (rect.width > 0.5 || rect.height > 0.5) return;
+  if (rect.width > 0.5 && rect.height > 0.5) return;
   if (!hasNonZeroSnapshotDescendant(childNodes)) return;
 
   styles.overflow = "visible";
@@ -3006,10 +3238,78 @@ function unclipZeroSizeVisibleWrapper(
   styles.overflowY = "visible";
 }
 
+function relaxPopupActionClipping(
+  element: Element,
+  styles: Record<string, string>,
+  rect: { x: number; y: number; width: number; height: number },
+  childNodes: SnapshotNode[],
+): boolean {
+  if (!isInsidePopupCaptureLayer(element)) return false;
+  if (!hasPopupActionSnapshotDescendant(childNodes)) return false;
+  if (!isPopupActionOverflowRegion(element, rect)) return false;
+  if (!hasSnapshotChildOutsideRect(childNodes, rect)) return false;
+
+  if (/^(hidden|clip)$/i.test(styles.overflow || "")) {
+    styles.overflow = "visible";
+  }
+  if (/^(hidden|clip)$/i.test(styles.overflowX || "")) {
+    styles.overflowX = "visible";
+  }
+  if (/^(hidden|clip)$/i.test(styles.overflowY || "")) {
+    styles.overflowY = "visible";
+  }
+
+  return true;
+}
+
+function isPopupActionOverflowRegion(
+  element: Element,
+  rect: { width: number; height: number },
+): boolean {
+  if (rect.width <= 0.5 || rect.height <= 0.5 || rect.height > 160) return false;
+
+  const identity = getElementIdentity(element);
+  if (/(^|[-_\s])(footer|actions?|button-group|buttonbar|operation|toolbar)([-_\s]|$)/i.test(identity)) {
+    return true;
+  }
+
+  const computed = getComputedStyleFor(element);
+  return (
+    rect.height <= 96 &&
+    (computed.display === "flex" ||
+      computed.display === "inline-flex" ||
+      computed.textAlign === "right" ||
+      /^(fixed|absolute|sticky)$/i.test(computed.position))
+  );
+}
+
+function hasSnapshotChildOutsideRect(
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  for (const child of childNodes) {
+    if (child.rect.width > 0.5 && child.rect.height > 0.5) {
+      if (
+        child.rect.x < rect.x - 0.5 ||
+        child.rect.y < rect.y - 0.5 ||
+        child.rect.x + child.rect.width > rect.x + rect.width + 0.5 ||
+        child.rect.y + child.rect.height > rect.y + rect.height + 0.5
+      ) {
+        return true;
+      }
+    }
+
+    if (child.nodeType === NODE_TYPES.ELEMENT_NODE && hasSnapshotChildOutsideRect((child as ElementSnapshot).childNodes, rect)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function isZeroSizeVisibleWrapper(node: ElementSnapshot): boolean {
   return (
-    node.rect.width <= 0.5 &&
-    node.rect.height <= 0.5 &&
+    (node.rect.width <= 0.5 || node.rect.height <= 0.5) &&
     hasNonZeroSnapshotDescendant(node.childNodes)
   );
 }
