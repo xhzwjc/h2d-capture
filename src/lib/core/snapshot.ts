@@ -2246,6 +2246,142 @@ function roundPx(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
+function getTextNodeParentElement(nodeOrNodes: Node | Node[]): Element | null {
+  const nodes = Array.isArray(nodeOrNodes) ? nodeOrNodes : [nodeOrNodes];
+  if (nodes.length === 0) return null;
+
+  const parent = nodes[0].parentElement;
+  if (!parent) return null;
+
+  return nodes.every((node) => node.parentElement === parent) ? parent : null;
+}
+
+function getEllipsizedTextSnapshotData(
+  nodeOrNodes: Node | Node[],
+  text: string,
+  rect: { x: number; y: number; width: number; height: number },
+  lineCount: number,
+): { text: string; rect: { x: number; y: number; width: number; height: number }; lineCount: number } {
+  if (lineCount !== 1 || !text.trim()) {
+    return { text, rect, lineCount };
+  }
+
+  const parent = getTextNodeParentElement(nodeOrNodes);
+  if (!parent || !isEllipsisTextContainer(parent)) {
+    return { text, rect, lineCount };
+  }
+
+  const computed = getComputedStyleFor(parent);
+  const availableWidth = getEllipsisVisibleTextWidth(parent, computed, rect);
+  if (availableWidth <= 0) {
+    return { text, rect, lineCount };
+  }
+
+  const fullTextWidth = measureSingleLineText(parent, computed, text);
+  if (fullTextWidth <= availableWidth + 0.5) {
+    return { text, rect, lineCount };
+  }
+
+  const visibleText = fitTextWithEllipsis(parent, computed, text, availableWidth);
+  return {
+    text: visibleText,
+    rect: {
+      ...rect,
+      width: Math.min(rect.width, availableWidth),
+    },
+    lineCount: 1,
+  };
+}
+
+function isEllipsisTextContainer(element: Element): boolean {
+  if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return false;
+
+  const tag = element.tagName.toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") return false;
+
+  const computed = getComputedStyleFor(element);
+  if (!/\bellipsis\b/i.test(computed.textOverflow)) return false;
+  if (!/^(hidden|clip)$/i.test(computed.overflowX) && !/^(hidden|clip)$/i.test(computed.overflow)) return false;
+  if (!/^(nowrap|pre)$/i.test(computed.whiteSpace)) return false;
+
+  return element.scrollWidth > element.clientWidth + 1;
+}
+
+function getEllipsisVisibleTextWidth(
+  element: Element,
+  computed: CSSStyleDeclaration,
+  textRect: { x: number; width: number },
+): number {
+  const rect = element.getBoundingClientRect();
+  const borderLeft = parsePx(computed.borderLeftWidth, 0);
+  const borderRight = parsePx(computed.borderRightWidth, 0);
+  const paddingLeft = parsePx(computed.paddingLeft, 0);
+  const paddingRight = parsePx(computed.paddingRight, 0);
+
+  const contentLeft = rect.left + borderLeft + paddingLeft;
+  const contentRight = rect.right - borderRight - paddingRight;
+  const textLeft = Math.max(textRect.x, contentLeft);
+
+  return Math.max(0, contentRight - textLeft);
+}
+
+function fitTextWithEllipsis(
+  element: Element,
+  computed: CSSStyleDeclaration,
+  text: string,
+  maxWidth: number,
+): string {
+  const ellipsis = "...";
+  if (measureSingleLineText(element, computed, ellipsis) > maxWidth) {
+    return ellipsis;
+  }
+
+  let low = 0;
+  let high = text.length;
+  let best = "";
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = `${text.slice(0, mid).trimEnd()}${ellipsis}`;
+    const width = measureSingleLineText(element, computed, candidate);
+
+    if (width <= maxWidth + 0.5) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return best || ellipsis;
+}
+
+function measureSingleLineText(element: Element, computed: CSSStyleDeclaration, text: string): number {
+  const doc = getNodeDocument(element);
+  const body = doc.body;
+  if (!body) return 0;
+
+  const probe = doc.createElement("span");
+  probe.textContent = text;
+  probe.style.position = "fixed";
+  probe.style.left = "-10000px";
+  probe.style.top = "-10000px";
+  probe.style.visibility = "hidden";
+  probe.style.whiteSpace = "nowrap";
+  probe.style.fontFamily = computed.fontFamily;
+  probe.style.fontSize = computed.fontSize;
+  probe.style.fontStyle = computed.fontStyle;
+  probe.style.fontWeight = computed.fontWeight;
+  probe.style.fontStretch = computed.fontStretch;
+  probe.style.letterSpacing = computed.letterSpacing;
+  probe.style.textTransform = computed.textTransform;
+
+  body.appendChild(probe);
+  const width = probe.getBoundingClientRect().width;
+  probe.remove();
+  return width;
+}
+
 // ---------------------------------------------------------------------------
 // Text node serializer
 // ---------------------------------------------------------------------------
@@ -2260,6 +2396,13 @@ function snapshotTextNode(nodeOrNodes: Node | Node[]): TextSnapshot {
     ? nodeOrNodes.map((n) => n.textContent || "").join("")
     : nodeOrNodes.textContent || "";
 
+  const ellipsized = getEllipsizedTextSnapshotData(
+    nodeOrNodes,
+    text,
+    rectWithoutLineCount,
+    lineCount,
+  );
+
   const identityNode = Array.isArray(nodeOrNodes)
     ? nodeOrNodes.length === 1
       ? nodeOrNodes[0]
@@ -2269,8 +2412,8 @@ function snapshotTextNode(nodeOrNodes: Node | Node[]): TextSnapshot {
   return {
     nodeType: Node.TEXT_NODE as 3,
     id: generateNodeId(identityNode),
-    text,
-    rect: rectWithoutLineCount,
-    lineCount,
+    text: ellipsized.text,
+    rect: ellipsized.rect,
+    lineCount: ellipsized.lineCount,
   };
 }
