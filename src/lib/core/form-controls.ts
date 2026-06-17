@@ -21,6 +21,7 @@ interface SelectControl {
   arrow?: Element;
   arrowRect: DOMRect;
   arrowInside: boolean;
+  hideArrow?: boolean;
 }
 
 interface RadioControl {
@@ -52,6 +53,11 @@ export function resetFormControlDebugState(): void {
 }
 
 export function snapshotSelectControl(element: Element, createId: IdFactory): ElementSnapshot | null {
+  const nativeControl = detectNativeSelectControl(element);
+  if (nativeControl) {
+    return createSelectSnapshot(nativeControl, createId);
+  }
+
   const control = detectSelectControl(element);
   if (!control) return null;
 
@@ -92,6 +98,39 @@ export function detectSelectControl(element: Element): SelectControl | null {
     arrowRect,
     arrowInside: arrow ? isRectInside(arrow.getBoundingClientRect(), visualRect) : false,
   };
+}
+
+function detectNativeSelectControl(element: Element): SelectControl | null {
+  if (element.tagName.toUpperCase() !== "SELECT") return null;
+  if (!isNodeVisible(element)) return null;
+
+  const select = element as HTMLSelectElement;
+  const visualRect = select.getBoundingClientRect();
+  if (!isReasonableControlRect(visualRect)) return null;
+
+  const text = getNativeSelectDisplayText(select);
+  if (!text) return null;
+
+  return {
+    root: select,
+    visualBox: select,
+    displayText: {
+      text,
+      source: "visible text",
+      sourceElement: select,
+      isPlaceholder: false,
+    },
+    arrowRect: new DOMRect(visualRect.right, visualRect.y, 0, visualRect.height),
+    arrowInside: false,
+    hideArrow: true,
+  };
+}
+
+function getNativeSelectDisplayText(select: HTMLSelectElement): string {
+  const selectedOption = select.selectedOptions?.[0] || select.options.item(select.selectedIndex);
+  const selectedText = (selectedOption?.textContent || "").replace(/\s+/g, " ").trim();
+  if (selectedText) return selectedText;
+  return (select.value || "").replace(/\s+/g, " ").trim();
 }
 
 function detectRadioControl(element: Element): RadioControl | null {
@@ -557,6 +596,7 @@ function createSelectSnapshot(control: SelectControl, createId: IdFactory): Elem
   const textRect = computeTextRect(control, visualComputed, textComputed);
   const arrowRect = clampArrowRect(control.arrowRect, visualRect);
   const border = getBorderStyles(control.visualBox, visualComputed);
+  const childNodes: SnapshotNode[] = [];
 
   const textNode: TextSnapshot = {
     nodeType: NODE_TYPES.TEXT_NODE,
@@ -597,29 +637,33 @@ function createSelectSnapshot(control: SelectControl, createId: IdFactory): Elem
     layoutSizingHorizontal: "FIXED",
     layoutSizingVertical: "FIXED",
   };
+  childNodes.push(textLayer);
 
-  const arrowLayer: ElementSnapshot = {
-    nodeType: NODE_TYPES.ELEMENT_NODE,
-    id: createId(null),
-    tag: "SVG",
-    attributes: { "data-h2d-select-arrow": control.arrow ? "source" : "generated" },
-    styles: {
-      display: "block",
-      position: "absolute",
-      left: `${roundPx(arrowRect.x - visualRect.x)}px`,
-      top: `${roundPx(arrowRect.y - visualRect.y)}px`,
-      width: `${roundPx(arrowRect.width)}px`,
-      height: `${roundPx(arrowRect.height)}px`,
-      color: control.arrow ? getComputedStyleFor(control.arrow).color : firstVisibleColor(visualComputed.color, "rgb(134, 136, 143)"),
-      overflow: "visible",
-      boxSizing: "border-box",
-    },
-    rect: toElementRect(arrowRect),
-    childNodes: [],
-    content: createChevronSvg(control.arrow ? getComputedStyleFor(control.arrow).color : firstVisibleColor(visualComputed.color, "rgb(134, 136, 143)")),
-    layoutSizingHorizontal: "FIXED",
-    layoutSizingVertical: "FIXED",
-  };
+  if (!control.hideArrow) {
+    const arrowLayer: ElementSnapshot = {
+      nodeType: NODE_TYPES.ELEMENT_NODE,
+      id: createId(null),
+      tag: "SVG",
+      attributes: { "data-h2d-select-arrow": control.arrow ? "source" : "generated" },
+      styles: {
+        display: "block",
+        position: "absolute",
+        left: `${roundPx(arrowRect.x - visualRect.x)}px`,
+        top: `${roundPx(arrowRect.y - visualRect.y)}px`,
+        width: `${roundPx(arrowRect.width)}px`,
+        height: `${roundPx(arrowRect.height)}px`,
+        color: control.arrow ? getComputedStyleFor(control.arrow).color : firstVisibleColor(visualComputed.color, "rgb(134, 136, 143)"),
+        overflow: "visible",
+        boxSizing: "border-box",
+      },
+      rect: toElementRect(arrowRect),
+      childNodes: [],
+      content: createChevronSvg(control.arrow ? getComputedStyleFor(control.arrow).color : firstVisibleColor(visualComputed.color, "rgb(134, 136, 143)")),
+      layoutSizingHorizontal: "FIXED",
+      layoutSizingVertical: "FIXED",
+    };
+    childNodes.push(arrowLayer);
+  }
 
   return {
     nodeType: NODE_TYPES.ELEMENT_NODE,
@@ -649,7 +693,7 @@ function createSelectSnapshot(control: SelectControl, createId: IdFactory): Elem
       color: visualComputed.color,
     },
     rect: rootRect,
-    childNodes: [textLayer, arrowLayer],
+    childNodes,
     layoutSizingHorizontal: "FIXED",
     layoutSizingVertical: "FIXED",
   };

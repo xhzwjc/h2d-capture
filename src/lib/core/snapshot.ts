@@ -391,6 +391,11 @@ function snapshotElement(
     return selectControlSnapshot;
   }
 
+  const circularProgressSnapshot = snapshotCircularProgressSvg(element);
+  if (circularProgressSnapshot) {
+    return circularProgressSnapshot;
+  }
+
   // Source annotations from React/Figma instrumentation.
   const sources = getSourceAnnotations(element);
   if (sources && sources.length > 0) {
@@ -2082,6 +2087,194 @@ function createPseudoChevronSvg(direction: "up" | "down", color: string): string
 
 function escapeSvgAttribute(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function snapshotCircularProgressSvg(element: Element): ElementSnapshot | null {
+  if (!isInstanceOfOwner<SVGElement>(element, element, "SVGElement")) return null;
+
+  const svg = element as SVGElement;
+  const circles = Array.from(svg.querySelectorAll("circle")) as SVGCircleElement[];
+  if (circles.length < 2) return null;
+
+  const rect = svg.getBoundingClientRect();
+  if (rect.width < 16 || rect.height < 16 || rect.width > 120 || rect.height > 120) return null;
+
+  const progressCircle = circles[circles.length - 1];
+  const trackCircle = circles[0];
+  const radius = getSvgAnimatedLength(progressCircle.r, parseFloat(progressCircle.getAttribute("r") || ""));
+  if (!Number.isFinite(radius) || radius <= 0) return null;
+
+  const percent = getCircularProgressPercent(svg, progressCircle, radius);
+  if (percent == null) return null;
+
+  const svgComputed = getComputedStyleFor(svg);
+  const progressComputed = getComputedStyleFor(progressCircle);
+  const trackComputed = getComputedStyleFor(trackCircle);
+  const viewBox = getSvgViewBox(svg, rect);
+  const cx = getSvgAnimatedLength(progressCircle.cx, viewBox.x + viewBox.width / 2);
+  const cy = getSvgAnimatedLength(progressCircle.cy, viewBox.y + viewBox.height / 2);
+  const strokeWidth = Math.max(1, parsePx(progressComputed.strokeWidth, parseFloat(progressCircle.getAttribute("stroke-width") || "1")));
+  const trackColor = getSvgStrokeColor(trackCircle, trackComputed, "rgb(240, 242, 245)");
+  const progressColor = getSvgStrokeColor(progressCircle, progressComputed, "rgb(22, 119, 255)");
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: generateNodeId(svg),
+    tag: "SVG",
+    attributes: { "data-h2d-circular-progress": "true" },
+    styles: {
+      display: "block",
+      width: `${roundPx(rect.width)}px`,
+      height: `${roundPx(rect.height)}px`,
+      color: svgComputed.color,
+      overflow: "visible",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(rect),
+    childNodes: [],
+    content: createCircularProgressSvg({
+      viewBox,
+      cx,
+      cy,
+      radius,
+      strokeWidth,
+      trackColor,
+      progressColor,
+      percent,
+    }),
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function getSvgAnimatedLength(length: SVGAnimatedLength | undefined, fallback: number): number {
+  const value = length?.baseVal?.value;
+  return Number.isFinite(value) ? value as number : fallback;
+}
+
+function getSvgViewBox(svg: SVGElement, rect: DOMRect): { x: number; y: number; width: number; height: number } {
+  const viewBox = svg.getAttribute("viewBox")?.trim().split(/[\s,]+/).map((value) => parseFloat(value)) || [];
+  if (viewBox.length === 4 && viewBox.every(Number.isFinite)) {
+    return { x: viewBox[0], y: viewBox[1], width: viewBox[2], height: viewBox[3] };
+  }
+
+  const width = parsePx(getComputedStyleFor(svg).width, rect.width);
+  const height = parsePx(getComputedStyleFor(svg).height, rect.height);
+  return { x: 0, y: 0, width, height };
+}
+
+function getCircularProgressPercent(svg: SVGElement, progressCircle: SVGCircleElement, radius: number): number | null {
+  const textPercent = getNearbyPercentText(svg);
+  if (textPercent != null) return textPercent;
+
+  const computed = getComputedStyleFor(progressCircle);
+  const circumference = 2 * Math.PI * radius;
+  const pathLength = parseFloat(progressCircle.getAttribute("pathLength") || "");
+  const dashArray = parseSvgNumberList(
+    computed.getPropertyValue("stroke-dasharray") ||
+    computed.strokeDasharray ||
+    progressCircle.getAttribute("stroke-dasharray") ||
+    "",
+  );
+
+  if (dashArray.length > 0 && dashArray[0] > 0) {
+    const dash = dashArray[0];
+    if (Number.isFinite(pathLength) && pathLength > 0) return clampPercent((dash / pathLength) * 100);
+    if (dash <= 100 && dashArray.some((value) => value >= 90 && value <= 110)) return clampPercent(dash);
+    return clampPercent((dash / circumference) * 100);
+  }
+
+  const dashOffset = parseFloat(
+    computed.getPropertyValue("stroke-dashoffset") ||
+    computed.strokeDashoffset ||
+    progressCircle.getAttribute("stroke-dashoffset") ||
+    "",
+  );
+  if (Number.isFinite(dashOffset) && circumference > 0) {
+    return clampPercent(((circumference - dashOffset) / circumference) * 100);
+  }
+
+  return null;
+}
+
+function getNearbyPercentText(svg: SVGElement): number | null {
+  let current: Element | null = svg.parentElement;
+  let depth = 0;
+  while (current && depth < 4) {
+    const match = (current.textContent || "").match(/(\d+(?:\.\d+)?)\s*%/);
+    if (match) return clampPercent(parseFloat(match[1]));
+    current = current.parentElement;
+    depth += 1;
+  }
+  return null;
+}
+
+function parseSvgNumberList(value: string): number[] {
+  if (!value || value === "none") return [];
+  return value
+    .split(/[\s,]+/)
+    .map((part) => parseFloat(part))
+    .filter(Number.isFinite);
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function getSvgStrokeColor(circle: SVGCircleElement, computed: CSSStyleDeclaration, fallback: string): string {
+  return firstVisiblePaint(
+    computed.getPropertyValue("stroke"),
+    computed.stroke,
+    circle.getAttribute("stroke") || "",
+    fallback,
+  );
+}
+
+function createCircularProgressSvg(options: {
+  viewBox: { x: number; y: number; width: number; height: number };
+  cx: number;
+  cy: number;
+  radius: number;
+  strokeWidth: number;
+  trackColor: string;
+  progressColor: string;
+  percent: number;
+}): string {
+  const viewBox = `${roundPx(options.viewBox.x)} ${roundPx(options.viewBox.y)} ${roundPx(options.viewBox.width)} ${roundPx(options.viewBox.height)}`;
+  const cx = roundPx(options.cx);
+  const cy = roundPx(options.cy);
+  const radius = roundPx(options.radius);
+  const strokeWidth = roundPx(options.strokeWidth);
+  const track = escapeSvgAttribute(options.trackColor);
+  const progress = escapeSvgAttribute(options.progressColor);
+  const trackCircle = `<circle cx="${cx}" cy="${cy}" r="${radius}" fill="none" stroke="${track}" stroke-width="${strokeWidth}"/>`;
+
+  if (options.percent <= 0) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" overflow="visible">${trackCircle}</svg>`;
+  }
+
+  if (options.percent >= 99.9) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" overflow="visible">${trackCircle}<circle cx="${cx}" cy="${cy}" r="${radius}" fill="none" stroke="${progress}" stroke-width="${strokeWidth}" stroke-linecap="round"/></svg>`;
+  }
+
+  const arcPath = describeArc(options.cx, options.cy, options.radius, -90, -90 + (options.percent / 100) * 360);
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" overflow="visible">${trackCircle}<path d="${arcPath}" fill="none" stroke="${progress}" stroke-width="${strokeWidth}" stroke-linecap="round"/></svg>`;
+}
+
+function describeArc(cx: number, cy: number, radius: number, startAngle: number, endAngle: number): string {
+  const start = polarToCartesian(cx, cy, radius, startAngle);
+  const end = polarToCartesian(cx, cy, radius, endAngle);
+  const largeArcFlag = endAngle - startAngle <= 180 ? "0" : "1";
+  return `M ${roundPx(start.x)} ${roundPx(start.y)} A ${roundPx(radius)} ${roundPx(radius)} 0 ${largeArcFlag} 1 ${roundPx(end.x)} ${roundPx(end.y)}`;
+}
+
+function polarToCartesian(cx: number, cy: number, radius: number, angleInDegrees: number): { x: number; y: number } {
+  const angleInRadians = angleInDegrees * Math.PI / 180;
+  return {
+    x: cx + radius * Math.cos(angleInRadians),
+    y: cy + radius * Math.sin(angleInRadians),
+  };
 }
 
 function snapshotPaintPseudoElement(element: Element, pseudo: "::before" | "::after"): ElementSnapshot | null {

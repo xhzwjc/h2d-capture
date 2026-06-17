@@ -234,9 +234,13 @@ function copySvgComputedStyles(source: Node, target: Node): void {
   const computedStyle = getComputedStyleFor(source);
 
   for (const [property, defaultValue] of Object.entries(SVG_STYLE_DEFAULTS)) {
-    const value = computedStyle.getPropertyValue(property);
+    const cssProperty = kebabNames[property];
+    const value =
+      computedStyle.getPropertyValue(cssProperty) ||
+      computedStyle.getPropertyValue(property) ||
+      String((computedStyle as unknown as Record<string, string>)[property] || "");
     if (value && value.toLowerCase() !== defaultValue.toLowerCase()) {
-      target.setAttribute(kebabNames[property], value);
+      target.setAttribute(cssProperty, value);
     }
   }
 
