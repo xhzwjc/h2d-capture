@@ -7,6 +7,7 @@
 
 import type { AssetEntry, AssetCollectorOptions } from '../types.js';
 import { getNodeDocument, isInstanceOfOwner } from '../core/dom.js';
+import type { Rect } from '../types.js';
 
 /** Image MIME types that browsers may decode but Figma cannot consume directly. */
 const UNSUPPORTED_IMAGE_TYPES = new Set(["image/avif", "image/heif", "image/heic"]);
@@ -100,6 +101,20 @@ export class ResourceResolver {
   addCanvas(canvas: HTMLCanvasElement): string {
     const url = this.getRasterizedImageUrl();
     const promise = canvasToBlob(canvas).then((blob) => ({ url, blob }));
+    this.addPromise(url, promise);
+    return url;
+  }
+
+  /**
+   * Capture and crop the currently visible browser viewport.
+   *
+   * This is a last-resort fallback for large iframe/document preview regions
+   * whose DOM is empty or inaccessible even though the browser visibly renders
+   * them. The crop rect is expressed in top-level viewport CSS pixels.
+   */
+  addViewportCrop(rect: Rect): string {
+    const url = this.getRasterizedImageUrl();
+    const promise = captureViewportCrop(rect).then((blob) => ({ url, blob }));
     this.addPromise(url, promise);
     return url;
   }
@@ -395,6 +410,96 @@ function fetchViaExtensionBridge(url: string): Promise<Blob | null> {
       }),
     );
   });
+}
+
+function captureVisibleTabViaExtensionBridge(): Promise<Blob | null> {
+  return new Promise<Blob | null>((resolve, reject) => {
+    const callbackId = `figma-visible-tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve(null);
+    }, 2_000);
+
+    function onResult(event: Event): void {
+      const detail = (event as CustomEvent).detail;
+      if (detail?.callbackId !== callbackId) return;
+
+      cleanup();
+
+      if (detail.result?.error) {
+        reject(new Error(detail.result.error));
+        return;
+      }
+
+      if (detail.result?.dataUrl) {
+        fetch(detail.result.dataUrl)
+          .then((r) => r.blob())
+          .then(resolve)
+          .catch(reject);
+      } else {
+        resolve(null);
+      }
+    }
+
+    function cleanup(): void {
+      clearTimeout(timeout);
+      window.removeEventListener("figma-capture-visible-tab-result", onResult);
+    }
+
+    window.addEventListener("figma-capture-visible-tab-result", onResult);
+
+    window.dispatchEvent(
+      new CustomEvent("figma-capture-visible-tab", {
+        detail: { callbackId },
+      }),
+    );
+  });
+}
+
+async function captureViewportCrop(rect: Rect): Promise<Blob> {
+  const screenshot = await captureVisibleTabViaExtensionBridge();
+  if (!screenshot) {
+    throw new Error("Visible tab screenshot bridge is unavailable");
+  }
+
+  const objectUrl = URL.createObjectURL(screenshot);
+  try {
+    const image = new Image();
+    image.src = objectUrl;
+    await image.decode();
+
+    const scaleX = image.naturalWidth / window.innerWidth;
+    const scaleY = image.naturalHeight / window.innerHeight;
+    const sourceX = Math.max(0, Math.round(rect.x * scaleX));
+    const sourceY = Math.max(0, Math.round(rect.y * scaleY));
+    const sourceWidth = Math.max(1, Math.round(rect.width * scaleX));
+    const sourceHeight = Math.max(1, Math.round(rect.height * scaleY));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = sourceWidth;
+    canvas.height = sourceHeight;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("Failed to get canvas context for viewport crop");
+    }
+
+    ctx.drawImage(
+      image,
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+      0,
+      0,
+      sourceWidth,
+      sourceHeight,
+    );
+
+    return await canvasToBlob(canvas);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }
 
 /**

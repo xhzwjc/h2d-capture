@@ -23,6 +23,7 @@ import type {
   TextSnapshot,
   CaptureOptions,
   CaptureContext,
+  Rect,
   SimpleMatrix,
   SourceAnnotation,
 } from '../types.js';
@@ -180,6 +181,8 @@ async function captureDOMInner(
     const rootSnapshot = serialized as ElementSnapshot;
     normalizeElementCaptureOrigin(rootSnapshot, elementRect);
     appendStatusDistributionOverlays(rootSnapshot, element);
+    appendCompactToolbarActionOverlays(rootSnapshot, element);
+    appendContentHeaderTabOverlays(rootSnapshot, element);
     extendLeftSidebarBackgrounds(rootSnapshot, element, getCaptureScrollHeight(element, rootSnapshot));
     removeStackedSelectClones(rootSnapshot);
 
@@ -230,6 +233,8 @@ async function captureDOMInner(
     }
     const rootSnapshot = serialized as ElementSnapshot;
     appendStatusDistributionOverlays(rootSnapshot, doc.documentElement);
+    appendCompactToolbarActionOverlays(rootSnapshot, doc.documentElement);
+    appendContentHeaderTabOverlays(rootSnapshot, doc.documentElement);
     extendLeftSidebarBackgrounds(rootSnapshot, doc.documentElement, getCaptureScrollHeight(doc.documentElement, rootSnapshot));
     removeStackedSelectClones(rootSnapshot);
 
@@ -464,6 +469,7 @@ function snapshotElement(
   let placeholderUrl: string | undefined;
   let selectionSourceId: string | undefined;
   let expandedIframe = false;
+  let tagOverride: string | undefined;
 
   const tag = element.tagName.toUpperCase();
 
@@ -638,6 +644,17 @@ function snapshotElement(
   const popupActionOverflowRelaxed = relaxPopupActionClipping(element, computedStyles, rect, childNodes);
   const verticalScrollViewportStabilized = stabilizeVerticalOverlayScrollViewport(element, computedStyles, childNodes, rect);
   stabilizeHorizontalScrolledTableViewport(element, computedStyles, childNodes, rect);
+  const iframeCropRect = getEmptyIframeViewportCropRect(element, rect, childNodes);
+  if (iframeCropRect) {
+    rect = iframeCropRect;
+    placeholderUrl = assetCollector.addViewportCrop(iframeCropRect);
+    tagOverride = "CANVAS";
+    computedStyles.overflow = "hidden";
+    computedStyles.overflowX = "hidden";
+    computedStyles.overflowY = "hidden";
+    computedStyles.width = `${roundPx(iframeCropRect.width)}px`;
+    computedStyles.height = `${roundPx(iframeCropRect.height)}px`;
+  }
 
   // Prune invisible nodes (zero-size without children, offscreen, etc.)
   if (shouldPruneNode(element, rect, childNodes) && !shouldKeepClippedPopupAction(element, rect, childNodes)) {
@@ -655,7 +672,7 @@ function snapshotElement(
   const node: ElementSnapshot = {
     nodeType: Node.ELEMENT_NODE as 1,
     id: generateNodeId(element),
-    tag: expandedIframe ? "DIV" : tag,
+    tag: tagOverride ?? (expandedIframe ? "DIV" : tag),
     attributes,
     styles: computedStyles,
     rect,
@@ -1577,6 +1594,642 @@ function appendStatusDistributionOverlays(rootSnapshot: ElementSnapshot, rootEle
     anchorSnapshotToParent(overlay, rootSnapshot.rect);
     rootSnapshot.childNodes.push(overlay);
   }
+}
+
+interface CompactToolbarAction {
+  element: Element;
+  text: string;
+}
+
+interface StructuralTabGroup {
+  tabList: Element;
+  tabs: Element[];
+  rect: DOMRect;
+}
+
+function appendCompactToolbarActionOverlays(rootSnapshot: ElementSnapshot, rootElement: Element): void {
+  const actions = collectCompactToolbarActions(rootElement);
+  if (actions.length === 0) return;
+
+  const rootRect = rootElement.getBoundingClientRect();
+  const offsetX = rootSnapshot.rect.x - rootRect.x;
+  const offsetY = rootSnapshot.rect.y - rootRect.y;
+  const actionIds = new Set(actions.map(({ element }) => generateNodeId(element)));
+  actionIds.delete(rootSnapshot.id);
+  pruneSnapshotsByIds(rootSnapshot, actionIds);
+
+  for (const action of actions) {
+    const overlay = createCompactToolbarActionOverlay(action.element, action.text);
+    if (!overlay) continue;
+
+    offsetSnapshotNode(overlay, offsetX, offsetY);
+    anchorSnapshotToParent(overlay, rootSnapshot.rect);
+    rootSnapshot.childNodes.push(overlay);
+  }
+}
+
+function collectCompactToolbarActions(rootElement: Element): CompactToolbarAction[] {
+  const roots = [rootElement, ...Array.from(rootElement.querySelectorAll("*"))];
+  const collected: CompactToolbarAction[] = [];
+  const seen = new Set<Element>();
+
+  for (const root of roots) {
+    if (!isElementVisibleInDocument(root)) continue;
+
+    const rootRect = root.getBoundingClientRect();
+    const actions = getDirectCompactToolbarActions(root, rootRect);
+    if (!isCompactToolbarRoot(root, rootRect, actions)) continue;
+
+    for (const action of actions) {
+      if (seen.has(action.element)) continue;
+      seen.add(action.element);
+      collected.push(action);
+    }
+  }
+
+  return collected;
+}
+
+function getDirectCompactToolbarActions(root: Element, rootRect: DOMRect): CompactToolbarAction[] {
+  const actions: CompactToolbarAction[] = [];
+
+  for (const child of Array.from(root.children)) {
+    const action = getCompactToolbarAction(child, rootRect);
+    if (action) actions.push(action);
+  }
+
+  return actions;
+}
+
+function getCompactToolbarAction(element: Element, rootRect: DOMRect): CompactToolbarAction | null {
+  if (!isElementVisibleInDocument(element)) return null;
+
+  const tag = element.tagName.toUpperCase();
+  if (["INPUT", "SELECT", "TEXTAREA", "OPTION"].includes(tag)) return null;
+  const role = element.getAttribute("role") || "";
+  if (/^(tab|tablist|option|listbox|combobox)$/i.test(role)) return null;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 16 || rect.width > 220 || rect.height < 12 || rect.height > 36) return null;
+  if (Math.abs(getRectCenterY(rect) - getRectCenterY(rootRect)) > 12) return null;
+
+  const text = normalizeToolbarActionText(getElementVisibleText(element));
+  if (!text || text.length > 32) return null;
+  if (!findToolbarActionSvg(element)) return null;
+
+  return { element, text };
+}
+
+function isCompactToolbarRoot(root: Element, rootRect: DOMRect, actions: CompactToolbarAction[]): boolean {
+  if (actions.length < 2 || actions.length > 12) return false;
+  if (rootRect.width < 40 || rootRect.width > 900 || rootRect.height < 12 || rootRect.height > 48) return false;
+
+  const centers = actions.map(({ element }) => getRectCenterY(element.getBoundingClientRect()));
+  if (Math.max(...centers) - Math.min(...centers) > 8) return false;
+
+  const bounds = unionDOMRects(actions.map(({ element }) => element.getBoundingClientRect()));
+  if (!bounds) return false;
+  if (bounds.left < rootRect.left - 4 || bounds.right > rootRect.right + 4) return false;
+  if (bounds.top < rootRect.top - 4 || bounds.bottom > rootRect.bottom + 4) return false;
+
+  const rootText = normalizeToolbarActionText(getElementVisibleText(root));
+  const actionText = actions.map((action) => action.text).join("");
+  return rootText.includes(actionText);
+}
+
+function normalizeToolbarActionText(value: string): string {
+  return value.replace(/[\u200b-\u200f\ufeff]/g, "").replace(/\s+/g, "").trim();
+}
+
+function getRectCenterY(rect: DOMRect): number {
+  return rect.top + rect.height / 2;
+}
+
+function unionDOMRects(rects: DOMRect[]): DOMRect | null {
+  if (rects.length === 0) return null;
+
+  let left = Number.POSITIVE_INFINITY;
+  let top = Number.POSITIVE_INFINITY;
+  let right = Number.NEGATIVE_INFINITY;
+  let bottom = Number.NEGATIVE_INFINITY;
+
+  for (const rect of rects) {
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+
+  return new DOMRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
+}
+
+function appendContentHeaderTabOverlays(rootSnapshot: ElementSnapshot, rootElement: Element): void {
+  const primaryGroup = findPrimaryContentTabGroup(rootElement);
+  if (!primaryGroup) return;
+
+  const secondaryGroup = findSecondaryContentTabGroup(rootElement, primaryGroup);
+  const primaryTabs = collectTabGroupOverlays(primaryGroup, "primary");
+  if (primaryTabs.length < Math.min(4, primaryGroup.tabs.length)) return;
+
+  const secondaryTabs = secondaryGroup ? collectTabGroupOverlays(secondaryGroup, "secondary") : [];
+  const topSurfaceRect = findConnectedTopSurfaceRect(rootElement, primaryGroup.rect);
+  const rootRect = rootElement.getBoundingClientRect();
+  const offsetX = rootSnapshot.rect.x - rootRect.x;
+  const offsetY = rootSnapshot.rect.y - rootRect.y;
+
+  if (secondaryGroup && secondaryTabs.length > 0) {
+    const pruneIds = new Set([generateNodeId(secondaryGroup.tabList)]);
+    pruneIds.delete(rootSnapshot.id);
+    pruneSnapshotsByIds(rootSnapshot, pruneIds);
+  }
+
+  const band = createConnectedTabSurfaceBackground(
+    primaryGroup.rect,
+    secondaryTabs,
+    rootRect,
+    topSurfaceRect,
+  );
+  if (band) {
+    offsetSnapshotNode(band, offsetX, offsetY);
+    anchorSnapshotToParent(band, rootSnapshot.rect);
+    rootSnapshot.childNodes.unshift(band);
+  }
+
+  for (const overlay of [...primaryTabs, ...secondaryTabs]) {
+    offsetSnapshotNode(overlay, offsetX, offsetY);
+    anchorSnapshotToParent(overlay, rootSnapshot.rect);
+    rootSnapshot.childNodes.push(overlay);
+  }
+}
+
+function findPrimaryContentTabGroup(rootElement: Element): StructuralTabGroup | null {
+  const candidates = Array.from(rootElement.querySelectorAll('[role="tablist"]'));
+  let best: StructuralTabGroup | null = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const candidate of candidates) {
+    const group = getStructuralTabGroup(candidate);
+    if (!group || !isPrimaryContentTabGroup(group)) continue;
+
+    const score = group.tabs.length * 100 + group.rect.width - group.rect.top * 0.05;
+    if (score > bestScore) {
+      best = group;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
+
+function findSecondaryContentTabGroup(rootElement: Element, primaryGroup: StructuralTabGroup): StructuralTabGroup | null {
+  const candidates = Array.from(rootElement.querySelectorAll('[role="tablist"]'));
+  let best: StructuralTabGroup | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const candidate of candidates) {
+    if (candidate === primaryGroup.tabList) continue;
+
+    const group = getStructuralTabGroup(candidate);
+    if (!group || !isSecondaryContentTabGroup(group, primaryGroup.rect)) continue;
+
+    const score = Math.abs(group.rect.top - primaryGroup.rect.bottom) + group.rect.width * 0.001;
+    if (score < bestScore) {
+      best = group;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
+
+function getStructuralTabGroup(tabList: Element): StructuralTabGroup | null {
+  if (!isElementVisibleInDocument(tabList)) return null;
+
+  const rect = tabList.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+
+  const tabs = Array.from(tabList.querySelectorAll('[role="tab"]'))
+    .filter((tab) => isVisibleStructuralTab(tab, rect))
+    .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+  if (tabs.length < 2) return null;
+
+  return { tabList, tabs, rect };
+}
+
+function isVisibleStructuralTab(tab: Element, tabListRect: DOMRect): boolean {
+  if (!isElementVisibleInDocument(tab)) return false;
+
+  const rect = tab.getBoundingClientRect();
+  if (rect.width < 12 || rect.height < 12 || rect.height > 64) return false;
+  if (rect.right < tabListRect.left - 2 || rect.left > tabListRect.right + 2) return false;
+  if (rect.bottom < tabListRect.top - 2 || rect.top > tabListRect.bottom + 2) return false;
+
+  return normalizeTabText(getElementVisibleText(tab)).length > 0;
+}
+
+function isPrimaryContentTabGroup(group: StructuralTabGroup): boolean {
+  if (group.tabs.length < 4 || group.tabs.length > 24) return false;
+  if (group.rect.width < 480 || group.rect.height < 24 || group.rect.height > 72) return false;
+  if (!isHorizontalTabRow(group)) return false;
+
+  const selectedCount = group.tabs.filter(isSelectedTab).length;
+  return selectedCount <= 1;
+}
+
+function isSecondaryContentTabGroup(group: StructuralTabGroup, primaryRect: DOMRect): boolean {
+  if (group.tabs.length < 2 || group.tabs.length > 8) return false;
+  if (group.rect.height < 16 || group.rect.height > 44) return false;
+  if (group.rect.width > Math.min(560, primaryRect.width * 0.65)) return false;
+  if (group.rect.top < primaryRect.bottom - 8 || group.rect.top > primaryRect.bottom + 96) return false;
+  if (group.rect.left < primaryRect.left - 32 || group.rect.right > primaryRect.right + 32) return false;
+  if (!isHorizontalTabRow(group)) return false;
+
+  return group.tabs.some((tab) => {
+    const computed = getComputedStyleFor(tab);
+    return isSelectedTab(tab) || isVisiblePaint(computed.backgroundColor) || hasRoundedCorners(computed, 8);
+  });
+}
+
+function isHorizontalTabRow(group: StructuralTabGroup): boolean {
+  const centers = group.tabs.map((tab) => getRectCenterY(tab.getBoundingClientRect()));
+  if (Math.max(...centers) - Math.min(...centers) > Math.max(10, group.rect.height * 0.35)) return false;
+
+  let previousRight = Number.NEGATIVE_INFINITY;
+  for (const tab of group.tabs) {
+    const rect = tab.getBoundingClientRect();
+    if (rect.left < previousRight - 4) return false;
+    previousRight = Math.max(previousRight, rect.right);
+  }
+
+  return true;
+}
+
+function isSelectedTab(tab: Element): boolean {
+  const selected = tab.getAttribute("aria-selected");
+  return selected === "true" || tab.classList.contains("active") || tab.classList.contains("selected");
+}
+
+function hasRoundedCorners(computed: CSSStyleDeclaration, minRadius: number): boolean {
+  return parsePx(computed.borderTopLeftRadius, 0) >= minRadius
+    || parsePx(computed.borderTopRightRadius, 0) >= minRadius
+    || parsePx(computed.borderBottomRightRadius, 0) >= minRadius
+    || parsePx(computed.borderBottomLeftRadius, 0) >= minRadius;
+}
+
+function collectTabGroupOverlays(
+  group: StructuralTabGroup,
+  kind: "primary" | "secondary",
+): ElementSnapshot[] {
+  const overlays: ElementSnapshot[] = [];
+
+  for (const tab of group.tabs) {
+    const text = formatTabOverlayText(normalizeTabText(getElementVisibleText(tab)));
+    if (!text) continue;
+
+    const overlay = createTabTextOverlay(tab, text, kind);
+    if (overlay) overlays.push(overlay);
+  }
+
+  return overlays;
+}
+
+function normalizeTabText(value: string): string {
+  return value.replace(/[\u200b-\u200f\ufeff]/g, "").replace(/\s+/g, "").trim();
+}
+
+function formatTabOverlayText(value: string): string {
+  return value.replace(/^(.+?)(\d+)$/, "$1 $2");
+}
+
+function findConnectedTopSurfaceRect(rootElement: Element, mainTabRect: DOMRect): DOMRect | null {
+  let best: DOMRect | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const candidate of Array.from(rootElement.querySelectorAll("*"))) {
+    if (!isElementVisibleInDocument(candidate)) continue;
+    const tag = candidate.tagName.toUpperCase();
+    if (tag === "HTML" || tag === "BODY") continue;
+
+    const rect = candidate.getBoundingClientRect();
+    if (!isConnectedTopSurfaceCandidate(candidate, rect, mainTabRect)) continue;
+
+    const verticalGap = Math.abs(rect.bottom - mainTabRect.top);
+    const leftPad = Math.max(0, mainTabRect.left - rect.left);
+    const rightPad = Math.max(0, rect.right - mainTabRect.right);
+    const padBalance = Math.abs(leftPad - rightPad);
+    const widthExcess = Math.max(0, rect.width - mainTabRect.width);
+    const score = verticalGap * 20 + padBalance + Math.abs(widthExcess - 32) * 0.4 + rect.top * 0.02;
+
+    if (score < bestScore) {
+      best = rect;
+      bestScore = score;
+    }
+  }
+
+  return best;
+}
+
+function isConnectedTopSurfaceCandidate(element: Element, rect: DOMRect, mainTabRect: DOMRect): boolean {
+  if (rect.width < mainTabRect.width || rect.height < 72 || rect.height > 320) return false;
+  if (rect.left > mainTabRect.left + 2 || rect.right < mainTabRect.right - 2) return false;
+  if (rect.top > mainTabRect.top || rect.bottom < mainTabRect.top - 32 || rect.bottom > mainTabRect.top + 32) {
+    return false;
+  }
+
+  const overlap = Math.min(rect.right, mainTabRect.right) - Math.max(rect.left, mainTabRect.left);
+  if (overlap < mainTabRect.width * 0.96) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (!isNearWhitePaint(computed.backgroundColor)) return false;
+
+  const opacity = Number.parseFloat(computed.opacity || "1");
+  return !Number.isFinite(opacity) || opacity > 0.01;
+}
+
+function createConnectedTabSurfaceBackground(
+  mainTabRect: DOMRect,
+  overlays: ElementSnapshot[],
+  rootRect: DOMRect,
+  topSurfaceRect: DOMRect | null,
+): ElementSnapshot | null {
+  if (mainTabRect.width <= 0 || mainTabRect.height <= 0) return null;
+
+  const rootRight = rootRect.right;
+  const rootBottom = rootRect.bottom;
+  const left = Math.max(rootRect.left, topSurfaceRect ? topSurfaceRect.left : mainTabRect.left - 16);
+  const right = Math.min(rootRight, topSurfaceRect ? topSurfaceRect.right : mainTabRect.right + 16);
+  const top = Math.max(rootRect.top, topSurfaceRect ? topSurfaceRect.top : mainTabRect.top - 8);
+  let bottom = topSurfaceRect ? rootBottom : mainTabRect.bottom + 88;
+
+  for (const overlay of overlays) {
+    bottom = Math.max(bottom, overlay.rect.y + overlay.rect.height + 8);
+  }
+  bottom = Math.min(rootBottom, bottom);
+
+  const height = Math.max(1, bottom - top);
+  const rect = new DOMRect(left, top, Math.max(1, right - left), height);
+  const node: ElementSnapshot = {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: generateNodeId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-connected-tab-surface": "true" },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: "0px",
+      top: "0px",
+      width: `${roundPx(rect.width)}px`,
+      height: `${roundPx(rect.height)}px`,
+      backgroundColor: "rgb(255, 255, 255)",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(rect),
+    childNodes: [],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+  return node;
+}
+
+function pruneSnapshotsByIds(rootSnapshot: ElementSnapshot, ids: Set<string>): void {
+  if (ids.size === 0) return;
+
+  rootSnapshot.childNodes = rootSnapshot.childNodes.filter((child) => {
+    if (!isElementNodeSnapshot(child)) return true;
+    if (ids.has(child.id)) return false;
+
+    pruneSnapshotsByIds(child, ids);
+    return true;
+  });
+}
+
+function createCompactToolbarActionOverlay(source: Element, text: string): ElementSnapshot | null {
+  const computed = getComputedStyleFor(source);
+  const sourceRect = source.getBoundingClientRect();
+  const svg = findToolbarActionSvg(source);
+  const textRect = getElementTextRangeRect(source) ?? getFallbackTextRect(sourceRect, computed, text);
+  if (textRect.width <= 0 || textRect.height <= 0) return null;
+
+  const svgRect = svg?.getBoundingClientRect() ?? null;
+  const fontSize = parsePx(computed.fontSize, 12);
+  const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
+  const left = Math.min(sourceRect.left, textRect.x, svgRect?.left ?? sourceRect.left);
+  const top = Math.min(sourceRect.top, textRect.y, svgRect?.top ?? sourceRect.top);
+  const right = Math.max(sourceRect.right, textRect.x + textRect.width, svgRect?.right ?? sourceRect.right);
+  const bottom = Math.max(sourceRect.bottom, textRect.y + textRect.height, svgRect?.bottom ?? sourceRect.bottom);
+  const rect = new DOMRect(left, top, Math.max(1, right - left), Math.max(sourceRect.height, bottom - top));
+  const childNodes: SnapshotNode[] = [];
+
+  if (svg && svgRect && svgRect.width > 0 && svgRect.height > 0) {
+    childNodes.push({
+      nodeType: NODE_TYPES.ELEMENT_NODE,
+      id: generateNodeId(null),
+      tag: "SVG",
+      attributes: { "data-h2d-toolbar-icon": "true" },
+      styles: {
+        display: "block",
+        position: "absolute",
+        left: "0px",
+        top: "0px",
+        width: `${roundPx(svgRect.width)}px`,
+        height: `${roundPx(svgRect.height)}px`,
+        color: getComputedStyleFor(svg).color || computed.color,
+        overflow: "visible",
+        boxSizing: "border-box",
+      },
+      rect: toElementRect(svgRect),
+      childNodes: [],
+      content: serializeToolbarActionSvg(svg),
+      layoutSizingHorizontal: "FIXED",
+      layoutSizingVertical: "FIXED",
+    });
+  }
+
+  childNodes.push({
+    nodeType: NODE_TYPES.TEXT_NODE,
+    id: generateNodeId(null),
+    text,
+    rect: {
+      x: textRect.x,
+      y: textRect.y,
+      width: Math.max(textRect.width, estimateTextWidth(text, fontSize)),
+      height: textRect.height,
+    },
+    lineCount: 1,
+  });
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: generateNodeId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-toolbar-action": "true" },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: "0px",
+      top: "0px",
+      width: `${roundPx(rect.width)}px`,
+      height: `${roundPx(rect.height)}px`,
+      overflow: "visible",
+      color: computed.color,
+      fontFamily: computed.fontFamily,
+      fontSize: computed.fontSize || `${roundPx(fontSize)}px`,
+      fontWeight: computed.fontWeight,
+      lineHeight: Number.isFinite(lineHeight) ? `${roundPx(lineHeight)}px` : computed.lineHeight,
+      whiteSpace: "nowrap",
+      textAlign: computed.textAlign,
+      boxSizing: "border-box",
+      zIndex: "120",
+    },
+    rect: toElementRect(rect),
+    childNodes,
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function findToolbarActionSvg(source: Element): SVGElement | null {
+  for (const svg of Array.from(source.querySelectorAll("svg"))) {
+    if (!isInstanceOfOwner<SVGElement>(svg, svg, "SVGElement")) continue;
+    if (!isElementVisibleInDocument(svg)) continue;
+
+    const rect = svg.getBoundingClientRect();
+    if (rect.width < 6 || rect.width > 32 || rect.height < 6 || rect.height > 32) continue;
+    return svg;
+  }
+
+  return null;
+}
+
+function serializeToolbarActionSvg(svg: SVGElement): string {
+  let content = new XMLSerializer().serializeToString(svg);
+  if (!/\sxmlns=/.test(content)) {
+    content = content.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
+  }
+  return content;
+}
+
+function createTabTextOverlay(
+  source: Element,
+  text: string,
+  kind: "primary" | "secondary",
+): ElementSnapshot | null {
+  const rect = source.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+
+  const computed = getComputedStyleFor(source);
+  const textRect = getElementTextRangeRect(source) ?? getFallbackTextRect(rect, computed, text);
+  const fontSize = parsePx(computed.fontSize, 12);
+  const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
+
+  const textNode: TextSnapshot = {
+    nodeType: NODE_TYPES.TEXT_NODE,
+    id: generateNodeId(null),
+    text,
+    rect: {
+      x: textRect.x,
+      y: textRect.y,
+      width: Math.max(textRect.width, estimateTextWidth(text, fontSize)),
+      height: textRect.height,
+    },
+    lineCount: 1,
+  };
+
+  const styles: Record<string, string> = {
+    display: "block",
+    position: "absolute",
+    left: "0px",
+    top: "0px",
+    width: `${roundPx(rect.width)}px`,
+    height: `${roundPx(rect.height)}px`,
+    overflow: "visible",
+    color: computed.color,
+    fontFamily: computed.fontFamily,
+    fontSize: computed.fontSize || `${roundPx(fontSize)}px`,
+    fontWeight: computed.fontWeight,
+    lineHeight: Number.isFinite(lineHeight) ? `${roundPx(lineHeight)}px` : computed.lineHeight,
+    whiteSpace: "nowrap",
+    textAlign: computed.textAlign,
+    boxSizing: "border-box",
+    zIndex: "120",
+  };
+
+  copyTabOverlayPaint(computed, styles);
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: generateNodeId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-tab-overlay": kind },
+    styles,
+    rect: toElementRect(rect),
+    childNodes: [textNode],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function getElementTextRangeRect(element: Element): Rect | null {
+  const textNodes: Node[] = [];
+  const walker = getNodeDocument(element).createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  let current = walker.nextNode();
+
+  while (current) {
+    if ((current.textContent || "").trim()) {
+      const rect = getTextRect(current);
+      if (rect.width > 0 && rect.height > 0) {
+        textNodes.push(current);
+      }
+    }
+    current = walker.nextNode();
+  }
+
+  if (textNodes.length === 0) return null;
+
+  const rect = getTextRect(textNodes.length === 1 ? textNodes[0] : textNodes);
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  return rect;
+}
+
+function getFallbackTextRect(rect: DOMRect, computed: CSSStyleDeclaration, text: string): Rect {
+  const fontSize = parsePx(computed.fontSize, 12);
+  const height = Math.max(fontSize * 1.2, Math.min(rect.height, fontSize * 1.6));
+  const width = Math.min(rect.width, estimateTextWidth(text, fontSize));
+  return {
+    x: rect.x + Math.max(0, (rect.width - width) / 2),
+    y: rect.y + Math.max(0, (rect.height - height) / 2),
+    width,
+    height,
+  };
+}
+
+function copyTabOverlayPaint(computed: CSSStyleDeclaration, styles: Record<string, string>): void {
+  if (isVisiblePaint(computed.backgroundColor)) {
+    styles.backgroundColor = computed.backgroundColor;
+  }
+
+  for (const corner of ["TopLeft", "TopRight", "BottomRight", "BottomLeft"] as const) {
+    const key = `border${corner}Radius` as keyof CSSStyleDeclaration;
+    const value = computed[key] as string;
+    if (parsePx(value, 0) > 0) {
+      styles[`border${corner}Radius`] = value;
+    }
+  }
+
+  for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
+    const width = computed[`border${side}Width` as keyof CSSStyleDeclaration] as string;
+    const style = computed[`border${side}Style` as keyof CSSStyleDeclaration] as string;
+    const color = computed[`border${side}Color` as keyof CSSStyleDeclaration] as string;
+    if (parsePx(width, 0) <= 0 || style === "none" || style === "hidden") continue;
+
+    styles[`border${side}Width`] = width;
+    styles[`border${side}Style`] = style;
+    styles[`border${side}Color`] = color;
+  }
+}
+
+function estimateTextWidth(text: string, fontSize: number): number {
+  return Math.max(1, text.length * fontSize * 0.62);
 }
 
 function getStatusDistributionOverlayZIndex(root: Element): string {
@@ -3097,9 +3750,69 @@ function snapshotIframeDocument(
     height: frameElement.clientHeight || rect.height,
   };
   offsetSnapshotNode(serialized, frameRect.x, frameRect.y);
+  rasterizeEmptyIframeShells(serialized, assetCollector);
   lockSnapshotGeometry(serialized, frameRect);
   childNodes.push(serialized);
   return true;
+}
+
+function getEmptyIframeViewportCropRect(
+  element: Element,
+  rect: ElementRect,
+  childNodes: SnapshotNode[],
+): ElementRect | null {
+  if (element.tagName.toUpperCase() !== "IFRAME") return null;
+  if (childNodes.length > 0) return null;
+  if (element.ownerDocument !== document) return null;
+  return getLargeVisibleViewportIntersectionRect(rect);
+}
+
+function rasterizeEmptyIframeShells(node: SnapshotNode, assetCollector: ResourceResolver): void {
+  if (!isElementNodeSnapshot(node)) return;
+
+  if (node.tag === "IFRAME" && node.childNodes.length === 0) {
+    const cropRect = getLargeVisibleViewportIntersectionRect(node.rect);
+    if (cropRect) {
+      node.tag = "CANVAS";
+      node.rect = cropRect;
+      node.rect.cssWidth = Math.round(cropRect.width);
+      node.rect.cssHeight = Math.round(cropRect.height);
+      node.placeholderUrl = assetCollector.addViewportCrop(cropRect);
+      node.attributes["data-h2d-rasterized-frame"] = "true";
+      node.styles.overflow = "hidden";
+      node.styles.overflowX = "hidden";
+      node.styles.overflowY = "hidden";
+      node.styles.width = `${roundPx(cropRect.width)}px`;
+      node.styles.height = `${roundPx(cropRect.height)}px`;
+    }
+    return;
+  }
+
+  for (const child of node.childNodes) {
+    rasterizeEmptyIframeShells(child, assetCollector);
+  }
+}
+
+function getLargeVisibleViewportIntersectionRect(rect: Rect): ElementRect | null {
+  if (rect.width < 120 || rect.height < 120) return null;
+
+  const left = Math.max(0, rect.x);
+  const top = Math.max(0, rect.y);
+  const right = Math.min(window.innerWidth, rect.x + rect.width);
+  const bottom = Math.min(window.innerHeight, rect.y + rect.height);
+  const width = right - left;
+  const height = bottom - top;
+
+  if (width < 80 || height < 80) return null;
+
+  return {
+    x: left,
+    y: top,
+    width,
+    height,
+    cssWidth: Math.round(width),
+    cssHeight: Math.round(height),
+  };
 }
 
 function offsetSnapshotNode(node: SnapshotNode, dx: number, dy: number): void {

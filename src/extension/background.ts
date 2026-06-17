@@ -160,6 +160,13 @@ api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "figma-capture-visible-tab") {
+    captureVisibleTabAsBase64(_sender.tab?.windowId)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ error: String(err) }));
+    return true;
+  }
+
   return false;
 });
 
@@ -187,6 +194,30 @@ async function fetchImageAsBase64(url: string): Promise<{ dataUrl: string } | { 
   } catch (err) {
     return { error: String(err) };
   }
+}
+
+async function captureVisibleTabAsBase64(windowId?: number): Promise<{ dataUrl: string } | { error: string }> {
+  if (isFirefox || typeof chrome === "undefined" || !chrome.tabs?.captureVisibleTab) {
+    return { error: "captureVisibleTab is only available in Chrome extension context" };
+  }
+
+  return new Promise((resolve) => {
+    chrome.tabs.captureVisibleTab(windowId ?? chrome.windows.WINDOW_ID_CURRENT, { format: "png" }, (dataUrl) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        resolve({ error: lastError.message ?? "captureVisibleTab failed" });
+        return;
+      }
+
+      const capturedDataUrl = dataUrl ?? "";
+      if (!capturedDataUrl) {
+        resolve({ error: "captureVisibleTab returned an empty image" });
+        return;
+      }
+
+      resolve({ dataUrl: capturedDataUrl });
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +257,32 @@ function installCorsBridge(): void {
     } catch (err) {
       window.dispatchEvent(
         new CustomEvent("figma-capture-fetch-result", {
+          detail: {
+            callbackId: detail.callbackId,
+            result: { error: String(err) },
+          },
+        }),
+      );
+    }
+  });
+
+  window.addEventListener("figma-capture-visible-tab", async (event) => {
+    const detail = (event as CustomEvent).detail;
+    if (!detail?.callbackId) return;
+
+    try {
+      const result = await rt.sendMessage({
+        type: "figma-capture-visible-tab",
+      });
+
+      window.dispatchEvent(
+        new CustomEvent("figma-capture-visible-tab-result", {
+          detail: { callbackId: detail.callbackId, result },
+        }),
+      );
+    } catch (err) {
+      window.dispatchEvent(
+        new CustomEvent("figma-capture-visible-tab-result", {
           detail: {
             callbackId: detail.callbackId,
             result: { error: String(err) },
