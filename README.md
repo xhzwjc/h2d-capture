@@ -13,6 +13,8 @@ Browser extension that captures any webpage and lets you paste it directly into 
 
 The extension walks the DOM tree, computes a style diff against browser defaults, resolves images (including cross-origin), infers Auto Layout sizing hints, and serializes everything into Figma's clipboard format.
 
+Chrome builds request broad host access so the background CORS bridge can inline visible images from arbitrary page, iframe, OSS, and CDN origins. Without this permission, cross-origin avatars or icons may be captured as DOM nodes but pasted into Figma as empty image layers.
+
 ## Features
 
 - **Full-page capture** — captures the entire scrollable page, not just the viewport
@@ -83,7 +85,7 @@ Framework-agnostic DOM processing engine. No browser extension APIs, no UI. Hand
 
 Browser-specific integration layer:
 
-- **Manifest V3** — minimal permissions (`activeTab`, `scripting`)
+- **Manifest V3** — `activeTab`, `scripting`, context menus, and host access for frame injection plus cross-origin image inlining
 - **Service worker** — script injection, CORS bridge for cross-origin image fetch
 - **Toolbar** — Shadow DOM UI with element picker, status messages, drag support
 - **Firefox support** — `injector.ts` bridges the MAIN world injection gap via `<script>` tags

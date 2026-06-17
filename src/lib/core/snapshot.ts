@@ -237,6 +237,24 @@ async function captureDOMInner(
       ? { reactFiberTree: extractComponentTree(doc.documentElement, getNodeId) }
       : undefined;
 
+    const documentScrollX = ownerWindow.scrollX || doc.documentElement.scrollLeft || doc.body?.scrollLeft || 0;
+    const documentScrollY = ownerWindow.scrollY || doc.documentElement.scrollTop || doc.body?.scrollTop || 0;
+    const viewportWidth = ownerWindow.innerWidth;
+    const viewportHeight = ownerWindow.innerHeight;
+    const documentWidth = doc.documentElement.scrollWidth;
+    const documentHeight = doc.documentElement.scrollHeight;
+    const shouldUseViewportRect = shouldNormalizeDocumentToViewport(
+      doc.documentElement,
+      rootSnapshot,
+      ownerWindow,
+      documentScrollY,
+      documentHeight,
+    );
+
+    if (shouldUseViewportRect) {
+      normalizeDocumentViewportSnapshot(rootSnapshot, ownerWindow);
+    }
+
     return {
       documentTitle: doc.title || undefined,
       root: rootSnapshot,
@@ -244,14 +262,14 @@ async function captureDOMInner(
       documentRect: {
         x: 0,
         y: 0,
-        width: doc.documentElement.scrollWidth,
-        height: doc.documentElement.scrollHeight,
+        width: shouldUseViewportRect ? viewportWidth : documentWidth,
+        height: shouldUseViewportRect ? viewportHeight : documentHeight,
       },
       viewportRect: {
-        x: ownerWindow.scrollX || doc.documentElement.scrollLeft || doc.body?.scrollLeft || 0,
-        y: ownerWindow.scrollY || doc.documentElement.scrollTop || doc.body?.scrollTop || 0,
-        width: ownerWindow.innerWidth,
-        height: ownerWindow.innerHeight,
+        x: shouldUseViewportRect ? 0 : documentScrollX,
+        y: shouldUseViewportRect ? 0 : documentScrollY,
+        width: viewportWidth,
+        height: viewportHeight,
       },
       devicePixelRatio: ownerWindow.devicePixelRatio,
       assets: blobMap,
@@ -265,6 +283,104 @@ async function captureDOMInner(
 function normalizeElementCaptureOrigin(rootSnapshot: ElementSnapshot, elementRect: DOMRect): void {
   if (elementRect.x === 0 && elementRect.y === 0) return;
   offsetSnapshotNode(rootSnapshot, -elementRect.x, -elementRect.y);
+}
+
+function shouldNormalizeDocumentToViewport(
+  rootElement: Element,
+  rootSnapshot: ElementSnapshot,
+  ownerWindow: Window,
+  documentScrollY: number,
+  documentHeight: number,
+): boolean {
+  const viewportHeight = ownerWindow.innerHeight;
+  if (viewportHeight <= 0) return false;
+  if (documentScrollY > 1) return true;
+
+  const fullHeight = Math.max(documentHeight, rootSnapshot.rect.height, rootElement.scrollHeight);
+  const extraHeight = fullHeight - viewportHeight;
+  if (extraHeight <= 0) return true;
+
+  const meaningfulLongPageExtra = Math.max(360, viewportHeight * 0.5);
+  return extraHeight < meaningfulLongPageExtra;
+}
+
+function normalizeDocumentViewportSnapshot(rootSnapshot: ElementSnapshot, ownerWindow: Window): void {
+  const viewportWidth = ownerWindow.innerWidth;
+  const viewportHeight = ownerWindow.innerHeight;
+  if (viewportWidth <= 0 || viewportHeight <= 0) return;
+
+  const viewportRect = {
+    x: 0,
+    y: 0,
+    width: viewportWidth,
+    height: viewportHeight,
+  };
+
+  normalizeViewportRootRect(rootSnapshot, viewportRect);
+  normalizeScrolledViewportShells(rootSnapshot, viewportRect);
+}
+
+function normalizeViewportRootRect(
+  rootSnapshot: ElementSnapshot,
+  viewportRect: { x: number; y: number; width: number; height: number },
+): void {
+  rootSnapshot.rect.x = viewportRect.x;
+  rootSnapshot.rect.y = viewportRect.y;
+  rootSnapshot.rect.width = viewportRect.width;
+  rootSnapshot.rect.height = viewportRect.height;
+  rootSnapshot.rect.cssWidth = Math.round(viewportRect.width);
+  rootSnapshot.rect.cssHeight = Math.round(viewportRect.height);
+  rootSnapshot.styles.width = `${roundPx(viewportRect.width)}px`;
+  rootSnapshot.styles.height = `${roundPx(viewportRect.height)}px`;
+  rootSnapshot.styles.overflow = "hidden";
+  rootSnapshot.styles.overflowX = "hidden";
+  rootSnapshot.styles.overflowY = "hidden";
+}
+
+function normalizeScrolledViewportShells(
+  node: ElementSnapshot,
+  viewportRect: { x: number; y: number; width: number; height: number },
+): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (isScrolledViewportShell(child, viewportRect)) {
+      child.rect.y = viewportRect.y;
+      child.rect.height = viewportRect.height;
+      child.rect.cssHeight = Math.round(viewportRect.height);
+      child.styles.height = `${roundPx(viewportRect.height)}px`;
+
+      if (child.rect.x <= viewportRect.x + 1 && child.rect.width >= viewportRect.width - 2) {
+        child.rect.x = viewportRect.x;
+        child.rect.width = viewportRect.width;
+        child.rect.cssWidth = Math.round(viewportRect.width);
+        child.styles.width = `${roundPx(viewportRect.width)}px`;
+      }
+
+      const maxHeight = parsePx(child.styles.maxHeight || "", NaN);
+      if (Number.isFinite(maxHeight) && maxHeight < viewportRect.height) {
+        delete child.styles.maxHeight;
+      }
+    }
+
+    normalizeScrolledViewportShells(child, viewportRect);
+  }
+}
+
+function isScrolledViewportShell(
+  node: ElementSnapshot,
+  viewportRect: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (node.rect.y >= viewportRect.y - 1) return false;
+  if (node.rect.y + node.rect.height < viewportRect.height * 0.55) return false;
+  if (node.rect.width < viewportRect.width * 0.55) return false;
+  if (!hasSnapshotDescendantInsideRect(node.childNodes, viewportRect)) return false;
+
+  const identity = `${node.tag} ${node.attributes.id || ""} ${node.attributes.class || ""}`;
+  if (/(^|\s)(HTML|BODY)(\s|$)/i.test(identity)) return true;
+  if (/(^|[-_\s])(root|app|layout|container|page|screen)([-_\s]|$)/i.test(identity)) return true;
+
+  return node.rect.width >= viewportRect.width - 2 && node.rect.height >= viewportRect.height - 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -2290,9 +2406,10 @@ function snapshotPaintPseudoElement(element: Element, pseudo: "::before" | "::af
   const hostRect = element.getBoundingClientRect();
   if (hostRect.width <= 0 && hostRect.height <= 0) return null;
 
-  const rect = computePaintPseudoRect(pseudo, hostRect, computed, width, height);
+  const inlineMarkerRect = computeInlinePaintPseudoMarkerRect(element, pseudo, hostRect, computed, width, height);
+  const rect = inlineMarkerRect ?? computePaintPseudoRect(pseudo, hostRect, computed, width, height);
   const styles = getPaintPseudoStyles(computed, width, height);
-  const transform = resolveTransform(computed);
+  const transform = inlineMarkerRect ? undefined : resolveTransform(computed);
 
   return {
     nodeType: Node.ELEMENT_NODE as 1,
@@ -2385,6 +2502,70 @@ function computePaintPseudoRect(
   }
 
   return new DOMRect(x, y, width, height);
+}
+
+function computeInlinePaintPseudoMarkerRect(
+  element: Element,
+  pseudo: "::before" | "::after",
+  hostRect: DOMRect,
+  computed: CSSStyleDeclaration,
+  width: number,
+  height: number,
+): DOMRect | null {
+  if (!isInlineTabMarkerPseudoCandidate(element, pseudo, computed, width, height)) return null;
+
+  const textRect = getFirstDirectTextRect(element);
+  if (!textRect) return null;
+
+  const marginLeft = parsePx(computed.marginLeft, 0);
+  const marginRight = parsePx(computed.marginRight, 0);
+  const textGap = pseudo === "::before" ? Math.max(0, marginRight) : Math.max(0, marginLeft);
+  const x =
+    pseudo === "::before"
+      ? textRect.x - width - textGap
+      : textRect.x + textRect.width + textGap;
+  const y = hostRect.y + Math.max(0, (hostRect.height - height) / 2);
+
+  return new DOMRect(x, y, width, height);
+}
+
+function isInlineTabMarkerPseudoCandidate(
+  element: Element,
+  pseudo: "::before" | "::after",
+  computed: CSSStyleDeclaration,
+  width: number,
+  height: number,
+): boolean {
+  if (pseudo !== "::before") return false;
+  if (computed.position === "absolute" || computed.position === "fixed") return false;
+  if (width <= 0 || height <= 0 || width > 12 || height > 12) return false;
+  if (!isVisiblePaint(computed.backgroundColor)) return false;
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 || hostRect.height <= 0 || hostRect.height > 40) return false;
+
+  const identity = `${getElementIdentity(element)} ${element.getAttribute("href") || ""} ${element.getAttribute("data-path") || ""}`;
+  const hasTabSignal =
+    element.getAttribute("aria-current") === "page" ||
+    /(^|[-_\s])(tab|tabs|tag|tags|router-link-active|tags-view-item)([-_\s]|$)/i.test(identity);
+  if (!hasTabSignal) return false;
+
+  const directText = getFirstDirectTextRect(element);
+  return Boolean(directText);
+}
+
+function getFirstDirectTextRect(element: Element): { x: number; y: number; width: number; height: number } | null {
+  for (const child of Array.from(element.childNodes)) {
+    if (child.nodeType !== Node.TEXT_NODE) continue;
+    if (!(child.textContent || "").trim()) continue;
+
+    const textRect = getTextRect(child);
+    if (textRect.width > 0 && textRect.height > 0) {
+      return textRect;
+    }
+  }
+
+  return null;
 }
 
 function getPaintPseudoStyles(computed: CSSStyleDeclaration, width: number, height: number): Record<string, string> {
