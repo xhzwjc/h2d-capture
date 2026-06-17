@@ -511,6 +511,7 @@ function snapshotElement(
   let rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
+  unclipZeroSizeVisibleWrapper(computedStyles, rect, childNodes);
   const verticalScrollViewportStabilized = stabilizeVerticalOverlayScrollViewport(element, computedStyles, childNodes, rect);
   stabilizeHorizontalScrolledTableViewport(element, computedStyles, childNodes, rect);
 
@@ -2511,7 +2512,11 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
   node.styles.boxSizing = "border-box";
   const overflowAxes = getSnapshotChildOverflowAxes(node);
   const isVerticalOverlayScrollViewport = node.attributes["data-h2d-vertical-scroll-viewport"] === "true";
-  if (isVerticalOverlayScrollViewport) {
+  if (isZeroSizeVisibleWrapper(node)) {
+    node.styles.overflow = "visible";
+    node.styles.overflowX = "visible";
+    node.styles.overflowY = "visible";
+  } else if (isVerticalOverlayScrollViewport) {
     node.styles.overflow = "hidden";
     node.styles.overflowX = "hidden";
     node.styles.overflowY = "hidden";
@@ -2575,6 +2580,41 @@ function hasSnapshotDescendantInsideRect(
     if (
       child.nodeType === NODE_TYPES.ELEMENT_NODE &&
       hasSnapshotDescendantInsideRect(child.childNodes, rect)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function unclipZeroSizeVisibleWrapper(
+  styles: Record<string, string>,
+  rect: { width: number; height: number },
+  childNodes: SnapshotNode[],
+): void {
+  if (rect.width > 0.5 || rect.height > 0.5) return;
+  if (!hasNonZeroSnapshotDescendant(childNodes)) return;
+
+  styles.overflow = "visible";
+  styles.overflowX = "visible";
+  styles.overflowY = "visible";
+}
+
+function isZeroSizeVisibleWrapper(node: ElementSnapshot): boolean {
+  return (
+    node.rect.width <= 0.5 &&
+    node.rect.height <= 0.5 &&
+    hasNonZeroSnapshotDescendant(node.childNodes)
+  );
+}
+
+function hasNonZeroSnapshotDescendant(childNodes: SnapshotNode[]): boolean {
+  for (const child of childNodes) {
+    if (child.rect.width > 0.5 && child.rect.height > 0.5) return true;
+    if (
+      child.nodeType === NODE_TYPES.ELEMENT_NODE &&
+      hasNonZeroSnapshotDescendant(child.childNodes)
     ) {
       return true;
     }

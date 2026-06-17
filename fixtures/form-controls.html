@@ -709,6 +709,65 @@
         white-space: nowrap;
       }
 
+      .zero-wrapper-fixture {
+        position: relative;
+        grid-column: 1 / -1;
+        height: 236px;
+        border-top: 1px dashed #dde2ea;
+      }
+
+      .zero-wrapper-clipping-host {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 0;
+        height: 0;
+        overflow: hidden;
+      }
+
+      .zero-wrapper-list {
+        position: absolute;
+        left: 0;
+        top: 18px;
+        width: 680px;
+        height: 196px;
+      }
+
+      .zero-wrapper-card {
+        position: absolute;
+        left: 0;
+        width: 660px;
+        height: 84px;
+        border: 1px solid #e5e8ef;
+        border-radius: 4px;
+        background: #fff;
+        color: #1d2129;
+        font-size: 14px;
+      }
+
+      .zero-wrapper-card:nth-child(1) {
+        top: 0;
+      }
+
+      .zero-wrapper-card:nth-child(2) {
+        top: 96px;
+      }
+
+      .zero-wrapper-card strong {
+        position: absolute;
+        left: 24px;
+        top: 14px;
+        color: #1f2329;
+        font-size: 18px;
+      }
+
+      .zero-wrapper-card span {
+        position: absolute;
+        left: 24px;
+        top: 46px;
+        color: #4e5969;
+      }
+
       .fixture-drawer {
         position: fixed;
         z-index: 1100;
@@ -986,6 +1045,21 @@
             </span>
             <span class="ant-radio-label">个人薪金所得个税计算规则</span>
           </label>
+        </div>
+
+        <div class="zero-wrapper-fixture">
+          <div class="zero-wrapper-clipping-host">
+            <div class="zero-wrapper-list">
+              <div class="zero-wrapper-card">
+                <strong>朱凯杰</strong>
+                <span>兰州理工大学 · 安全工程师 · 2026-06-15</span>
+              </div>
+              <div class="zero-wrapper-card">
+                <strong>王嘉星</strong>
+                <span>甘肃国家开放大学 · 安全工程师 · 10年经验</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="field italent-like-field">
