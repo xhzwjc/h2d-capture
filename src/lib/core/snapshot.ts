@@ -407,6 +407,7 @@ function snapshotElement(
   const computedStyles = diffStyles(element);
   ensureInsetShadowBorder(element, computedStyles);
   ensurePositionForZIndex(computedStyles);
+  normalizeTreeTextNegativeZIndex(element, computedStyles);
   ensureTopChromeTextStacking(element, computedStyles);
   ensureTextOnlyLineHeight(element, computedStyles);
   relaxVirtualScrollClipping(element, computedStyles);
@@ -669,6 +670,32 @@ function ensurePositionForZIndex(styles: Record<string, string>): void {
   }
 }
 
+function normalizeTreeTextNegativeZIndex(element: Element, styles: Record<string, string>): void {
+  const zIndex = parseInt(styles.zIndex || "", 10);
+  if (!Number.isFinite(zIndex) || zIndex >= 0) return;
+  if (!isInsideAriaTree(element)) return;
+  if (!hasDirectVisibleText(element) && !hasVisibleTextDescendant(element)) return;
+
+  styles.zIndex = "0";
+}
+
+function isInsideAriaTree(element: Element): boolean {
+  if (isTreeRole(element)) return true;
+  let ancestor = element.parentElement;
+  let depth = 0;
+  while (ancestor && depth < 8) {
+    if (isTreeRole(ancestor)) return true;
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+  return false;
+}
+
+function isTreeRole(element: Element): boolean {
+  const role = element.getAttribute("role")?.toLowerCase();
+  return role === "tree" || role === "treeitem" || role === "group";
+}
+
 function ensureTopChromeTextStacking(element: Element, styles: Record<string, string>): void {
   const rect = element.getBoundingClientRect();
   if (rect.y > 96 || rect.height <= 0 || rect.height > 96 || rect.width <= 0 || rect.width > 480) return;
@@ -779,6 +806,10 @@ function hasDirectVisibleText(element: Element): boolean {
     Boolean((child.textContent || "").trim()) &&
     getTextRect(child).width > 0
   ));
+}
+
+function hasVisibleTextDescendant(element: Element): boolean {
+  return Array.from(element.querySelectorAll("*")).some((descendant) => hasDirectVisibleText(descendant));
 }
 
 function hasTopChromeTextDescendant(element: Element): boolean {
