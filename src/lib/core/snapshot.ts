@@ -179,6 +179,7 @@ async function captureDOMInner(
     }
     const rootSnapshot = serialized as ElementSnapshot;
     normalizeElementCaptureOrigin(rootSnapshot, elementRect);
+    appendStatusDistributionOverlays(rootSnapshot, element);
     removeStackedSelectClones(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
@@ -227,6 +228,7 @@ async function captureDOMInner(
       throw new Error("Container node must have a body element");
     }
     const rootSnapshot = serialized as ElementSnapshot;
+    appendStatusDistributionOverlays(rootSnapshot, doc.documentElement);
     removeStackedSelectClones(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
@@ -244,8 +246,8 @@ async function captureDOMInner(
         height: doc.documentElement.scrollHeight,
       },
       viewportRect: {
-        x: 0,
-        y: 0,
+        x: ownerWindow.scrollX || doc.documentElement.scrollLeft || doc.body?.scrollLeft || 0,
+        y: ownerWindow.scrollY || doc.documentElement.scrollTop || doc.body?.scrollTop || 0,
         width: ownerWindow.innerWidth,
         height: ownerWindow.innerHeight,
       },
@@ -366,6 +368,16 @@ function snapshotElement(
   }
 
   if (!isNodeVisible(element)) return null;
+
+  const statusDistributionCellSnapshot = snapshotStatusDistributionCell(element, generateNodeId);
+  if (statusDistributionCellSnapshot) {
+    return statusDistributionCellSnapshot;
+  }
+
+  const statusDistributionSnapshot = snapshotStatusDistributionBar(element, generateNodeId);
+  if (statusDistributionSnapshot) {
+    return statusDistributionSnapshot;
+  }
 
   const selectControlSnapshot = snapshotSelectControl(element, generateNodeId);
   if (selectControlSnapshot) {
@@ -636,6 +648,463 @@ function hasTopChromeTextDescendant(element: Element): boolean {
 
 function isVisiblePaint(color: string): boolean {
   return Boolean(color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)");
+}
+
+interface StatusDistributionSegment {
+  element: Element;
+  rect: DOMRect;
+  text: string;
+  computed: CSSStyleDeclaration;
+}
+
+interface StatusDistributionBar {
+  root: Element;
+  rect: DOMRect;
+  segments: StatusDistributionSegment[];
+}
+
+interface StatusDistributionCell extends StatusDistributionBar {
+  barRect: DOMRect;
+  labelText: string;
+  labelRect: { x: number; y: number; width: number; height: number; lineCount: number };
+  labelComputed: CSSStyleDeclaration;
+}
+
+function snapshotStatusDistributionCell(
+  element: Element,
+  createId: (node: Node | null) => string,
+): ElementSnapshot | null {
+  const cell = detectStatusDistributionCell(element);
+  if (!cell) return null;
+
+  const childNodes: SnapshotNode[] = [];
+  const labelRect = new DOMRect(cell.labelRect.x, cell.labelRect.y, cell.labelRect.width, cell.labelRect.height);
+  const labelTextNode: TextSnapshot = {
+    nodeType: NODE_TYPES.TEXT_NODE,
+    id: createId(null),
+    text: cell.labelText,
+    rect: {
+      x: cell.labelRect.x,
+      y: cell.labelRect.y,
+      width: cell.labelRect.width,
+      height: cell.labelRect.height,
+    },
+    lineCount: Math.max(1, cell.labelRect.lineCount),
+  };
+  const fontSize = parsePx(cell.labelComputed.fontSize, Math.max(12, cell.labelRect.height));
+  const labelLayer: ElementSnapshot = {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-status-label": "true" },
+    styles: {
+      display: "block",
+      width: `${roundPx(cell.labelRect.width)}px`,
+      height: `${roundPx(cell.labelRect.height)}px`,
+      flexShrink: "0",
+      color: firstVisiblePaint(cell.labelComputed.color, "rgb(31, 35, 41)"),
+      fontFamily: cell.labelComputed.fontFamily,
+      fontSize: cell.labelComputed.fontSize || `${roundPx(fontSize)}px`,
+      fontWeight: cell.labelComputed.fontWeight,
+      lineHeight: `${roundPx(cell.labelRect.height)}px`,
+      whiteSpace: "nowrap",
+      boxSizing: "border-box",
+      overflow: "visible",
+    },
+    rect: toElementRect(labelRect),
+    childNodes: [labelTextNode],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+  childNodes.push(labelLayer);
+
+  const spacerWidth = Math.max(0, cell.barRect.x - (cell.labelRect.x + cell.labelRect.width));
+  if (spacerWidth > 0.5) {
+    childNodes.push(createStatusSpacerSnapshot(cell, spacerWidth, createId));
+  }
+
+  childNodes.push(createStatusBarSnapshot({
+    root: cell.root,
+    rect: cell.barRect,
+    segments: cell.segments,
+  }, createId));
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(cell.root),
+    tag: "DIV",
+    attributes: { "data-h2d-status-cell": "true" },
+    styles: {
+      display: "flex",
+      alignItems: "center",
+      width: `${roundPx(cell.rect.width)}px`,
+      height: `${roundPx(cell.rect.height)}px`,
+      overflow: "visible",
+      whiteSpace: "nowrap",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(cell.rect),
+    childNodes,
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function snapshotStatusDistributionBar(
+  element: Element,
+  createId: (node: Node | null) => string,
+): ElementSnapshot | null {
+  const bar = detectStatusDistributionBar(element);
+  if (!bar) return null;
+
+  return createStatusBarSnapshot(bar, createId);
+}
+
+function createStatusBarSnapshot(
+  bar: StatusDistributionBar,
+  createId: (node: Node | null) => string,
+): ElementSnapshot {
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(bar.root),
+    tag: "DIV",
+    attributes: { "data-h2d-status-distribution": "true" },
+    styles: {
+      display: "flex",
+      width: `${roundPx(bar.rect.width)}px`,
+      height: `${roundPx(bar.rect.height)}px`,
+      alignItems: "center",
+      overflow: "visible",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(bar.rect),
+    childNodes: bar.segments.map((segment, index) => (
+      createStatusSegmentSnapshot(segment, index, bar.segments.length, createId)
+    )),
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function createStatusSegmentSnapshot(
+  segment: StatusDistributionSegment,
+  segmentIndex: number,
+  segmentCount: number,
+  createId: (node: Node | null) => string,
+): ElementSnapshot {
+  const segmentWidth = roundPx(segment.rect.width);
+  const segmentHeight = roundPx(segment.rect.height);
+  const radius = getStatusBarRadius(segment.computed);
+  const isSingle = segmentCount <= 1;
+  const isFirst = segmentIndex === 0;
+  const isLast = segmentIndex === segmentCount - 1;
+  const fontSize = parsePx(segment.computed.fontSize, Math.max(10, segment.rect.height * 0.68));
+  const textSnapshot: TextSnapshot = {
+    nodeType: NODE_TYPES.TEXT_NODE,
+    id: createId(null),
+    text: segment.text,
+    rect: {
+      x: segment.rect.x,
+      y: segment.rect.y,
+      width: segment.rect.width,
+      height: segment.rect.height,
+    },
+    lineCount: 1,
+  };
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(segment.element),
+    tag: "DIV",
+    attributes: { "data-h2d-status-segment": "true" },
+    styles: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      width: `${segmentWidth}px`,
+      height: `${segmentHeight}px`,
+      flexShrink: "0",
+      backgroundColor: firstVisiblePaint(segment.computed.backgroundColor, "rgb(134, 144, 156)"),
+      color: firstVisiblePaint(segment.computed.color, "rgb(255, 255, 255)"),
+      fontFamily: segment.computed.fontFamily,
+      fontSize: segment.computed.fontSize || `${roundPx(fontSize)}px`,
+      fontWeight: segment.computed.fontWeight,
+      lineHeight: `${segmentHeight}px`,
+      textAlign: "center",
+      whiteSpace: "nowrap",
+      borderTopLeftRadius: isSingle || isFirst ? radius : "0px",
+      borderTopRightRadius: isSingle || isLast ? radius : "0px",
+      borderBottomRightRadius: isSingle || isLast ? radius : "0px",
+      borderBottomLeftRadius: isSingle || isFirst ? radius : "0px",
+      boxSizing: "border-box",
+      overflow: "hidden",
+    },
+    rect: toElementRect(segment.rect),
+    childNodes: [textSnapshot],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function createStatusSpacerSnapshot(
+  cell: StatusDistributionCell,
+  width: number,
+  createId: (node: Node | null) => string,
+): ElementSnapshot {
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-status-spacer": "true" },
+    styles: {
+      display: "block",
+      width: `${roundPx(width)}px`,
+      height: `${roundPx(cell.rect.height)}px`,
+      flexShrink: "0",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(new DOMRect(cell.labelRect.x + cell.labelRect.width, cell.rect.y, width, cell.rect.height)),
+    childNodes: [],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function detectStatusDistributionCell(element: Element): StatusDistributionCell | null {
+  const tag = element.tagName.toUpperCase();
+  if (tag !== "SPAN" && tag !== "DIV") return null;
+  if (!hasTableCellAncestor(element)) return null;
+
+  const rootRect = element.getBoundingClientRect();
+  if (rootRect.width < 40 || rootRect.width > 260 || rootRect.height < 12 || rootRect.height > 40) return null;
+
+  const flex = findStatusDistributionFlex(element);
+  if (!flex || flex === element) return null;
+
+  const segments = Array.from(flex.children)
+    .map(getStatusDistributionSegment)
+    .filter((segment): segment is StatusDistributionSegment => segment !== null);
+  if (segments.length === 0 || segments.length !== flex.children.length) return null;
+
+  const labelNodes = getStatusCellLabelTextNodes(element, flex);
+  if (labelNodes.length === 0) return null;
+
+  const labelText = labelNodes.map((node) => node.textContent || "").join("").replace(/\s+/g, " ").trim();
+  if (!labelText || /^\d+(?:\s+\d+)*$/.test(labelText)) return null;
+
+  const labelRect = getTextRect(labelNodes.length === 1 ? labelNodes[0] : labelNodes);
+  if (labelRect.width <= 0 || labelRect.height <= 0) return null;
+
+  return {
+    root: element,
+    rect: rootRect,
+    barRect: flex.getBoundingClientRect(),
+    segments,
+    labelText,
+    labelRect,
+    labelComputed: getComputedStyleFor(element),
+  };
+}
+
+function detectStatusDistributionBar(element: Element): StatusDistributionBar | null {
+  const tag = element.tagName.toUpperCase();
+  if (tag !== "DIV" && tag !== "SPAN") return null;
+  if (hasStatusDistributionAncestor(element)) return null;
+
+  const rootRect = element.getBoundingClientRect();
+  if (!isStatusDistributionContainerRect(rootRect)) return null;
+
+  const flex = findStatusDistributionFlex(element);
+  if (!flex) return null;
+
+  const segments = Array.from(flex.children)
+    .map(getStatusDistributionSegment)
+    .filter((segment): segment is StatusDistributionSegment => segment !== null);
+  if (segments.length === 0 || segments.length !== flex.children.length) return null;
+
+  const text = segments.map((segment) => segment.text).join(" ").trim();
+  if (!/^\d+(?:\s+\d+)*$/.test(text)) return null;
+
+  return {
+    root: element,
+    rect: rootRect,
+    segments,
+  };
+}
+
+function hasStatusDistributionAncestor(element: Element): boolean {
+  let ancestor = element.parentElement;
+  let depth = 0;
+  while (ancestor && depth < 4) {
+    const rect = ancestor.getBoundingClientRect();
+    if (isStatusDistributionContainerRect(rect) && findStatusDistributionFlex(ancestor)) {
+      return true;
+    }
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+
+  return false;
+}
+
+function findStatusDistributionFlex(element: Element): Element | null {
+  const computed = getComputedStyleFor(element);
+  if (isFlexDisplay(computed.display) && hasStatusDistributionSegments(element)) return element;
+
+  for (const child of Array.from(element.children)) {
+    const childComputed = getComputedStyleFor(child);
+    if (!isFlexDisplay(childComputed.display)) continue;
+    if (hasStatusDistributionSegments(child)) return child;
+  }
+
+  return null;
+}
+
+function hasStatusDistributionSegments(element: Element): boolean {
+  if (element.children.length === 0 || element.children.length > 6) return false;
+  return Array.from(element.children).every((child) => getStatusDistributionSegment(child) !== null);
+}
+
+function getStatusDistributionSegment(element: Element): StatusDistributionSegment | null {
+  if (element.tagName.toUpperCase() !== "DIV") return null;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 8 || rect.width > 140 || rect.height < 8 || rect.height > 24) return null;
+
+  const computed = getComputedStyleFor(element);
+  if (!isVisiblePaint(computed.backgroundColor)) return null;
+  if (isNearWhitePaint(computed.backgroundColor)) return null;
+  if (parsePx(computed.borderTopLeftRadius, 0) < 4 && parsePx(computed.borderTopRightRadius, 0) < 4) return null;
+
+  const text = getElementVisibleText(element);
+  if (!/^\d+$/.test(text)) return null;
+
+  return {
+    element,
+    rect,
+    text,
+    computed,
+  };
+}
+
+function isStatusDistributionContainerRect(rect: DOMRect): boolean {
+  return rect.width >= 20 && rect.width <= 160 && rect.height >= 12 && rect.height <= 32;
+}
+
+function getStatusBarRadius(computed: CSSStyleDeclaration): string {
+  return computed.borderTopLeftRadius && computed.borderTopLeftRadius !== "0px"
+    ? computed.borderTopLeftRadius
+    : "10px";
+}
+
+function getElementVisibleText(element: Element): string {
+  return (element.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function getStatusCellLabelTextNodes(element: Element, barElement: Element): Node[] {
+  const textNodes: Node[] = [];
+  const walker = getNodeDocument(element).createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  let current = walker.nextNode();
+
+  while (current) {
+    if (barElement.contains(current)) break;
+    if ((current.textContent || "").trim() && getTextRect(current).width > 0) {
+      textNodes.push(current);
+    }
+    current = walker.nextNode();
+  }
+
+  if (textNodes.length > 0) return textNodes;
+
+  for (const child of Array.from(element.childNodes)) {
+    if (child.nodeType === Node.ELEMENT_NODE) break;
+    if (child.nodeType !== Node.TEXT_NODE) continue;
+    if (!(child.textContent || "").trim()) continue;
+    textNodes.push(child);
+  }
+
+  return textNodes;
+}
+
+function isFlexDisplay(display: string): boolean {
+  return display === "flex" || display === "inline-flex";
+}
+
+function hasTableCellAncestor(element: Element): boolean {
+  let ancestor = element.parentElement;
+  let depth = 0;
+  while (ancestor && depth < 3) {
+    const tag = ancestor.tagName.toUpperCase();
+    if (tag === "TD" || tag === "TH") return true;
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+
+  return false;
+}
+
+function firstVisiblePaint(...colors: string[]): string {
+  return colors.find(isVisiblePaint) || "rgb(134, 144, 156)";
+}
+
+function isNearWhitePaint(color: string): boolean {
+  const match = color.match(/rgba?\(([^)]+)\)/i);
+  if (!match) return false;
+  const [red, green, blue] = match[1].split(",").map((part) => Number.parseFloat(part.trim()));
+  if (![red, green, blue].every(Number.isFinite)) return false;
+  return red >= 245 && green >= 245 && blue >= 245;
+}
+
+function appendStatusDistributionOverlays(rootSnapshot: ElementSnapshot, rootElement: Element): void {
+  const bars = collectStatusDistributionBars(rootElement);
+  if (bars.length === 0) return;
+
+  pruneStatusDistributionSnapshots(rootSnapshot);
+
+  const rootRect = rootElement.getBoundingClientRect();
+  const offsetX = rootSnapshot.rect.x - rootRect.x;
+  const offsetY = rootSnapshot.rect.y - rootRect.y;
+
+  for (const bar of bars) {
+    const overlay = createStatusBarSnapshot(bar, generateNodeId);
+    overlay.attributes["data-h2d-status-overlay"] = "true";
+    overlay.styles.zIndex = "2147483646";
+    offsetSnapshotNode(overlay, offsetX, offsetY);
+    anchorSnapshotToParent(overlay, rootSnapshot.rect);
+    rootSnapshot.childNodes.push(overlay);
+  }
+}
+
+function collectStatusDistributionBars(rootElement: Element): StatusDistributionBar[] {
+  const bars: StatusDistributionBar[] = [];
+  const seen = new Set<Element>();
+  const candidates = [rootElement, ...Array.from(rootElement.querySelectorAll("*"))];
+
+  for (const candidate of candidates) {
+    const bar = detectStatusDistributionBar(candidate);
+    if (!bar || seen.has(bar.root)) continue;
+    if (!isElementVisibleInDocument(bar.root)) continue;
+    seen.add(bar.root);
+    bars.push(bar);
+  }
+
+  return bars;
+}
+
+function isElementVisibleInDocument(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  const computed = getComputedStyleFor(element);
+  return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
+}
+
+function pruneStatusDistributionSnapshots(root: ElementSnapshot): void {
+  root.childNodes = root.childNodes.filter((child) => {
+    if (!isElementNodeSnapshot(child)) return true;
+    if (child.attributes["data-h2d-status-distribution"] === "true") return false;
+    pruneStatusDistributionSnapshots(child);
+    return true;
+  });
 }
 
 function ensureInsetShadowBorder(element: Element, styles: Record<string, string>): void {

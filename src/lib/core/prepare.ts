@@ -160,25 +160,31 @@ function setElementScroll(container: Element, left: number, top: number): void {
   container.scrollTop = top;
 }
 
-async function waitForScrollRestore(container: Element, isRoot: boolean): Promise<void> {
+function getScrollPosition(container: Element, isRoot: boolean): { left: number; top: number } {
+  return {
+    left: isRoot
+      ? window.scrollX || document.documentElement.scrollLeft || document.body.scrollLeft
+      : container.scrollLeft,
+    top: isRoot
+      ? window.scrollY || document.documentElement.scrollTop || document.body.scrollTop
+      : container.scrollTop,
+  };
+}
+
+async function waitForScrollPosition(container: Element, isRoot: boolean, left: number, top: number): Promise<void> {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 
-    const currentLeft = isRoot
-      ? window.scrollX || document.documentElement.scrollLeft || document.body.scrollLeft
-      : container.scrollLeft;
-    const currentTop = isRoot
-      ? window.scrollY || document.documentElement.scrollTop || document.body.scrollTop
-      : container.scrollTop;
+    const { left: currentLeft, top: currentTop } = getScrollPosition(container, isRoot);
 
-    if (Math.abs(currentLeft) <= 1 && Math.abs(currentTop) <= 1) {
+    if (Math.abs(currentLeft - left) <= 1 && Math.abs(currentTop - top) <= 1) {
       return;
     }
 
     if (isRoot) {
-      setRootScroll(0, 0);
+      setRootScroll(left, top);
     } else {
-      setElementScroll(container, 0, 0);
+      setElementScroll(container, left, top);
     }
   }
 }
@@ -258,11 +264,12 @@ function forceLazyImages(container: Element): void {
  * 1. Force lazy images via data-src attribute rewriting.
  * 2. Scroll through the entire page to trigger IntersectionObserver-based
  *    lazy loaders (common on Apple, etc.) that don't use data-src.
- * 3. Scroll back to top so all rects are measured from a consistent origin.
+ * 3. Restore the user's current scroll position before measuring layout.
  */
 export async function prepareForCapture(container: Element): Promise<void> {
   const isRoot =
     container === document.documentElement || container === document.body;
+  const originalScroll = getScrollPosition(container, isRoot);
 
   // Install before any scrolling so pages with `scroll-behavior: smooth` do
   // not leave sticky headers mid-transition when snapshotting starts.
@@ -274,13 +281,15 @@ export async function prepareForCapture(container: Element): Promise<void> {
   // Step 2: scroll through the page to trigger IntersectionObserver lazy loaders
   await scrollToTriggerLazyLoad(container);
 
-  // Step 3: scroll to top for consistent rect measurement
+  // Step 3: keep the current viewport stable. Capturing enterprise back-office
+  // pages must preserve the user's visible scrolled region instead of jumping
+  // to the top of the document.
   if (isRoot) {
-    setRootScroll(0, 0);
+    setRootScroll(originalScroll.left, originalScroll.top);
   } else {
-    setElementScroll(container, 0, 0);
+    setElementScroll(container, originalScroll.left, originalScroll.top);
   }
-  await waitForScrollRestore(container, isRoot);
+  await waitForScrollPosition(container, isRoot, originalScroll.left, originalScroll.top);
 
   // Wait for layout to settle
   await new Promise((r) => setTimeout(r, 100));
