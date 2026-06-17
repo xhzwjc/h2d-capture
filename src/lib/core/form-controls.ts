@@ -89,6 +89,8 @@ export function detectSelectControl(element: Element): SelectControl | null {
   if (isMultilineDisclosureSelectTrigger(root, visualBox, displayText, input)) return null;
 
   const arrow = findSelectArrow(root, visualBox);
+  if (isSplitActionPicker(root, visualBox, displayText, arrow)) return null;
+
   const arrowRect = computeArrowRect(arrow, visualBox);
 
   return {
@@ -794,6 +796,33 @@ function isMultilineDisclosureSelectTrigger(
   const textTop = Math.min(...insideRects.map((rect) => rect.top));
   const textBottom = Math.max(...insideRects.map((rect) => rect.bottom));
   return textBottom - textTop >= Math.min(visualRect.height - 12, 28);
+}
+
+function isSplitActionPicker(
+  root: Element,
+  visualBox: Element,
+  displayText: SelectDisplayText,
+  arrow: Element | undefined,
+): boolean {
+  if (arrow) return false;
+  if (displayText.source !== "visible text" || !displayText.sourceElement) return false;
+
+  const placeholderElement = findPlaceholderElement(root);
+  if (!placeholderElement) return false;
+
+  const visualRect = visualBox.getBoundingClientRect();
+  const placeholderRect = placeholderElement.getBoundingClientRect();
+  const actionRect = displayText.sourceElement.getBoundingClientRect();
+  if (!isRectMostlyInside(placeholderRect, visualRect) || !isRectMostlyInside(actionRect, visualRect)) return false;
+
+  const placeholderCenterX = placeholderRect.left + placeholderRect.width / 2;
+  const actionCenterX = actionRect.left + actionRect.width / 2;
+  const leftZoneRight = visualRect.left + visualRect.width * 0.55;
+  const rightZoneLeft = visualRect.left + visualRect.width * 0.55;
+  const horizontallySeparated = placeholderCenterX < leftZoneRight && actionCenterX > rightZoneLeft;
+  const actionIsCompact = actionRect.width <= Math.max(96, visualRect.width * 0.35);
+
+  return horizontallySeparated && actionIsCompact;
 }
 
 function hasExpandedCompositeSelectContent(root: Element, visualBox: Element): boolean {

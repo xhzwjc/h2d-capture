@@ -691,6 +691,7 @@ function snapshotElement(
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
   unclipZeroSizeVisibleWrapper(computedStyles, rect, childNodes);
+  const externalPseudoOverflowRelaxed = relaxExternalPseudoElementClipping(computedStyles, rect, childNodes);
   const popupActionOverflowRelaxed = relaxPopupActionClipping(element, computedStyles, rect, childNodes);
   const verticalScrollViewportStabilized = stabilizeVerticalOverlayScrollViewport(element, computedStyles, childNodes, rect);
   stabilizeHorizontalScrolledTableViewport(element, computedStyles, childNodes, rect);
@@ -718,6 +719,9 @@ function snapshotElement(
   const attributes = getSnapshotElementAttributes(element, verticalScrollViewportStabilized);
   if (popupActionOverflowRelaxed) {
     attributes["data-h2d-popup-action-overflow"] = "true";
+  }
+  if (externalPseudoOverflowRelaxed) {
+    attributes["data-h2d-external-pseudo-overflow"] = "true";
   }
   if (rasterizedFrame) {
     attributes["data-h2d-rasterized-frame"] = "true";
@@ -4548,7 +4552,8 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
   const overflowAxes = getSnapshotChildOverflowAxes(node);
   const isVerticalOverlayScrollViewport = node.attributes["data-h2d-vertical-scroll-viewport"] === "true";
   const shouldPreservePopupActionOverflow = node.attributes["data-h2d-popup-action-overflow"] === "true";
-  if (isZeroSizeVisibleWrapper(node) || shouldPreservePopupActionOverflow) {
+  const shouldPreserveExternalPseudoOverflow = node.attributes["data-h2d-external-pseudo-overflow"] === "true";
+  if (isZeroSizeVisibleWrapper(node) || shouldPreservePopupActionOverflow || shouldPreserveExternalPseudoOverflow) {
     node.styles.overflow = "visible";
     node.styles.overflowX = "visible";
     node.styles.overflowY = "visible";
@@ -4637,6 +4642,19 @@ function unclipZeroSizeVisibleWrapper(
   styles.overflowY = "visible";
 }
 
+function relaxExternalPseudoElementClipping(
+  styles: Record<string, string>,
+  rect: { x: number; y: number; width: number; height: number },
+  childNodes: SnapshotNode[],
+): boolean {
+  if (!hasExternalMaterializedPseudoChild(childNodes, rect)) return false;
+
+  styles.overflow = "visible";
+  styles.overflowX = "visible";
+  styles.overflowY = "visible";
+  return true;
+}
+
 function relaxPopupActionClipping(
   element: Element,
   styles: Record<string, string>,
@@ -4704,6 +4722,52 @@ function hasSnapshotChildOutsideRect(
   }
 
   return false;
+}
+
+function hasExternalMaterializedPseudoChild(
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  for (const child of childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (!child.attributes["data-h2d-pseudo"]) continue;
+    if (!isSnapshotRectOutsideRect(child.rect, rect)) continue;
+    if (!isCloseExternalPseudoRect(child.rect, rect)) continue;
+
+    const pseudoText = getSnapshotText(child);
+    const pseudoKind = child.attributes["data-h2d-pseudo-kind"] || "text";
+    if (pseudoKind === "text" && pseudoText.length <= 8) return true;
+    if (pseudoKind === "paint" && child.rect.width <= 48 && child.rect.height <= 48) return true;
+  }
+
+  return false;
+}
+
+function isCloseExternalPseudoRect(
+  child: { x: number; y: number; width: number; height: number },
+  parent: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (child.width <= 0 || child.height <= 0 || parent.width <= 0 || parent.height <= 0) return false;
+
+  const parentRight = parent.x + parent.width;
+  const parentBottom = parent.y + parent.height;
+  const childRight = child.x + child.width;
+  const childBottom = child.y + child.height;
+  const maxOvershoot = Math.max(
+    parent.x - child.x,
+    childRight - parentRight,
+    parent.y - child.y,
+    childBottom - parentBottom,
+    0,
+  );
+  if (maxOvershoot > 32) return false;
+
+  const closeEnough =
+    childRight > parent.x - 32 &&
+    child.x < parentRight + 32 &&
+    childBottom > parent.y - 32 &&
+    child.y < parentBottom + 32;
+  return closeEnough;
 }
 
 function isZeroSizeVisibleWrapper(node: ElementSnapshot): boolean {
