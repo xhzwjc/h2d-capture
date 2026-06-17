@@ -181,6 +181,7 @@ async function captureDOMInner(
     const rootSnapshot = serialized as ElementSnapshot;
     normalizeElementCaptureOrigin(rootSnapshot, elementRect);
     normalizeViewportCropCanvasGeometry(rootSnapshot);
+    promoteExternalActionToolbarSnapshots(rootSnapshot);
     appendStatusDistributionOverlays(rootSnapshot, element);
     appendCompactToolbarActionOverlays(rootSnapshot, element);
     appendContentHeaderTabOverlays(rootSnapshot, element);
@@ -261,6 +262,7 @@ async function captureDOMInner(
       normalizeDocumentViewportSnapshot(rootSnapshot, ownerWindow);
     }
     normalizeViewportCropCanvasGeometry(rootSnapshot);
+    promoteExternalActionToolbarSnapshots(rootSnapshot);
 
     return {
       documentTitle: doc.title || undefined,
@@ -302,6 +304,153 @@ function normalizeViewportCropCanvasGeometry(node: ElementSnapshot, parentRect?:
       normalizeViewportCropCanvasGeometry(child, node.rect);
     }
   }
+}
+
+interface ExternalActionToolbarPromotion {
+  parent: ElementSnapshot;
+  node: ElementSnapshot;
+}
+
+function promoteExternalActionToolbarSnapshots(root: ElementSnapshot): void {
+  const promotions: ExternalActionToolbarPromotion[] = [];
+  collectExternalActionToolbarPromotions(root, [], promotions);
+  if (promotions.length === 0) return;
+
+  const promoted = new Set<ElementSnapshot>();
+  for (const { parent, node } of promotions) {
+    if (promoted.has(node)) continue;
+    promoted.add(node);
+
+    parent.childNodes = parent.childNodes.filter((child) => child !== node);
+    node.attributes["data-h2d-promoted-action-toolbar"] = "true";
+    node.styles.zIndex = "160";
+    anchorSnapshotToParent(node, root.rect);
+    root.childNodes.push(node);
+  }
+}
+
+function collectExternalActionToolbarPromotions(
+  node: ElementSnapshot,
+  clippingAncestors: ElementSnapshot[],
+  promotions: ExternalActionToolbarPromotion[],
+): void {
+  const nextClippingAncestors = isSnapshotOverflowClipContainer(node.styles)
+    ? [...clippingAncestors, node]
+    : clippingAncestors;
+
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (isExternallyClippedActionToolbar(child, nextClippingAncestors)) {
+      promotions.push({ parent: node, node: child });
+      continue;
+    }
+
+    collectExternalActionToolbarPromotions(child, nextClippingAncestors, promotions);
+  }
+}
+
+function isExternallyClippedActionToolbar(node: ElementSnapshot, clippingAncestors: ElementSnapshot[]): boolean {
+  if (clippingAncestors.length === 0) return false;
+  if (!isActionToolbarSnapshot(node)) return false;
+
+  return clippingAncestors.some((ancestor) => isSnapshotRectOutsideRect(node.rect, ancestor.rect));
+}
+
+function isActionToolbarSnapshot(node: ElementSnapshot): boolean {
+  if (node.rect.width < 80 || node.rect.width > 1000) return false;
+  if (node.rect.height < 24 || node.rect.height > 96) return false;
+
+  const actions = node.childNodes.filter((child): child is ElementSnapshot => (
+    isElementNodeSnapshot(child) && isActionButtonSnapshot(child)
+  ));
+  if (actions.length < 2 || actions.length > 12) return false;
+
+  const centers = actions.map((action) => action.rect.y + action.rect.height / 2);
+  if (Math.max(...centers) - Math.min(...centers) > 12) return false;
+
+  const bounds = unionSnapshotRects(actions.map((action) => action.rect));
+  if (!bounds) return false;
+  if (bounds.x < node.rect.x - 8 || bounds.x + bounds.width > node.rect.x + node.rect.width + 8) return false;
+  if (bounds.y < node.rect.y - 8 || bounds.y + bounds.height > node.rect.y + node.rect.height + 8) return false;
+
+  const toolbarText = normalizeToolbarActionText(getSnapshotText(node));
+  const actionText = actions.map((action) => normalizeToolbarActionText(getSnapshotText(action))).join("");
+  return toolbarText.includes(actionText);
+}
+
+function isActionButtonSnapshot(node: ElementSnapshot): boolean {
+  const text = normalizeToolbarActionText(getSnapshotText(node));
+  if (!text || text.length > 32) return false;
+  if (node.rect.width < 32 || node.rect.width > 240) return false;
+  if (node.rect.height < 20 || node.rect.height > 56) return false;
+  return hasSnapshotButtonSurface(node);
+}
+
+function hasSnapshotButtonSurface(node: ElementSnapshot, depth = 0): boolean {
+  if (isSnapshotButtonSurface(node)) return true;
+  if (depth >= 4) return false;
+
+  return node.childNodes.some((child) => (
+    isElementNodeSnapshot(child) && hasSnapshotButtonSurface(child, depth + 1)
+  ));
+}
+
+function isSnapshotButtonSurface(node: ElementSnapshot): boolean {
+  if (node.rect.width < 24 || node.rect.height < 18 || node.rect.height > 56) return false;
+  if (!hasSnapshotRoundedCorners(node.styles, 2)) return false;
+  return hasSnapshotVisibleBorderStyles(node.styles) || hasSnapshotVisibleBackground(node.styles);
+}
+
+function hasSnapshotRoundedCorners(styles: Record<string, string>, minRadius: number): boolean {
+  return [
+    styles.borderTopLeftRadius,
+    styles.borderTopRightRadius,
+    styles.borderBottomRightRadius,
+    styles.borderBottomLeftRadius,
+  ].some((value) => parsePx(value || "", 0) >= minRadius);
+}
+
+function hasSnapshotVisibleBackground(styles: Record<string, string>): boolean {
+  const color = styles.backgroundColor || "";
+  return isVisiblePaint(color) && color !== "rgb(255, 255, 255)";
+}
+
+function hasSnapshotVisibleBorderStyles(styles: Record<string, string>): boolean {
+  return [
+    [styles.borderTopWidth, styles.borderTopStyle, styles.borderTopColor],
+    [styles.borderRightWidth, styles.borderRightStyle, styles.borderRightColor],
+    [styles.borderBottomWidth, styles.borderBottomStyle, styles.borderBottomColor],
+    [styles.borderLeftWidth, styles.borderLeftStyle, styles.borderLeftColor],
+  ].some(([width, style, color]) => (
+    parsePx(width || "", 0) > 0 &&
+    style !== "none" &&
+    style !== "hidden" &&
+    isVisiblePaint(color || "")
+  ));
+}
+
+function unionSnapshotRects(rects: Array<{ x: number; y: number; width: number; height: number }>): Rect | null {
+  if (rects.length === 0) return null;
+
+  let left = Number.POSITIVE_INFINITY;
+  let top = Number.POSITIVE_INFINITY;
+  let right = Number.NEGATIVE_INFINITY;
+  let bottom = Number.NEGATIVE_INFINITY;
+
+  for (const rect of rects) {
+    left = Math.min(left, rect.x);
+    top = Math.min(top, rect.y);
+    right = Math.max(right, rect.x + rect.width);
+    bottom = Math.max(bottom, rect.y + rect.height);
+  }
+
+  return {
+    x: left,
+    y: top,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top),
+  };
 }
 
 function isViewportCropCanvasSnapshot(node: ElementSnapshot): boolean {
@@ -692,6 +841,8 @@ function snapshotElement(
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
   unclipZeroSizeVisibleWrapper(computedStyles, rect, childNodes);
   const externalPseudoOverflowRelaxed = relaxExternalPseudoElementClipping(computedStyles, rect, childNodes);
+  const externalControlOverflowRelaxed = relaxExternalMaterializedControlClipping(computedStyles, rect, childNodes);
+  const externalRuleOverflowRelaxed = relaxExternalRuleElementClipping(computedStyles, rect, childNodes);
   const popupActionOverflowRelaxed = relaxPopupActionClipping(element, computedStyles, rect, childNodes);
   const verticalScrollViewportStabilized = stabilizeVerticalOverlayScrollViewport(element, computedStyles, childNodes, rect);
   stabilizeHorizontalScrolledTableViewport(element, computedStyles, childNodes, rect);
@@ -722,6 +873,12 @@ function snapshotElement(
   }
   if (externalPseudoOverflowRelaxed) {
     attributes["data-h2d-external-pseudo-overflow"] = "true";
+  }
+  if (externalControlOverflowRelaxed) {
+    attributes["data-h2d-external-control-overflow"] = "true";
+  }
+  if (externalRuleOverflowRelaxed) {
+    attributes["data-h2d-external-rule-overflow"] = "true";
   }
   if (rasterizedFrame) {
     attributes["data-h2d-rasterized-frame"] = "true";
@@ -4570,7 +4727,15 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
   const isVerticalOverlayScrollViewport = node.attributes["data-h2d-vertical-scroll-viewport"] === "true";
   const shouldPreservePopupActionOverflow = node.attributes["data-h2d-popup-action-overflow"] === "true";
   const shouldPreserveExternalPseudoOverflow = node.attributes["data-h2d-external-pseudo-overflow"] === "true";
-  if (isZeroSizeVisibleWrapper(node) || shouldPreservePopupActionOverflow || shouldPreserveExternalPseudoOverflow) {
+  const shouldPreserveExternalControlOverflow = node.attributes["data-h2d-external-control-overflow"] === "true";
+  const shouldPreserveExternalRuleOverflow = node.attributes["data-h2d-external-rule-overflow"] === "true";
+  if (
+    isZeroSizeVisibleWrapper(node) ||
+    shouldPreservePopupActionOverflow ||
+    shouldPreserveExternalPseudoOverflow ||
+    shouldPreserveExternalControlOverflow ||
+    shouldPreserveExternalRuleOverflow
+  ) {
     node.styles.overflow = "visible";
     node.styles.overflowX = "visible";
     node.styles.overflowY = "visible";
@@ -4672,6 +4837,32 @@ function relaxExternalPseudoElementClipping(
   return true;
 }
 
+function relaxExternalMaterializedControlClipping(
+  styles: Record<string, string>,
+  rect: { x: number; y: number; width: number; height: number },
+  childNodes: SnapshotNode[],
+): boolean {
+  if (!hasExternalMaterializedControlChild(childNodes, rect)) return false;
+
+  styles.overflow = "visible";
+  styles.overflowX = "visible";
+  styles.overflowY = "visible";
+  return true;
+}
+
+function relaxExternalRuleElementClipping(
+  styles: Record<string, string>,
+  rect: { x: number; y: number; width: number; height: number },
+  childNodes: SnapshotNode[],
+): boolean {
+  if (!hasExternalDecorativeRuleChild(childNodes, rect)) return false;
+
+  styles.overflow = "visible";
+  styles.overflowX = "visible";
+  styles.overflowY = "visible";
+  return true;
+}
+
 function relaxPopupActionClipping(
   element: Element,
   styles: Record<string, string>,
@@ -4741,6 +4932,87 @@ function hasSnapshotChildOutsideRect(
   return false;
 }
 
+function hasExternalDecorativeRuleChild(
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  let hasRule = false;
+
+  for (const child of childNodes) {
+    if (child.rect.width <= 0.5 || child.rect.height <= 0.5) continue;
+    if (!isSnapshotRectOutsideRect(child.rect, rect)) continue;
+
+    if (!isElementNodeSnapshot(child) || !isExternalDecorativeRuleSnapshot(child, rect)) {
+      return false;
+    }
+
+    hasRule = true;
+  }
+
+  return hasRule;
+}
+
+function isExternalDecorativeRuleSnapshot(
+  node: ElementSnapshot,
+  parentRect: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (getSnapshotText(node).trim().length > 0) return false;
+  if (!hasSnapshotVisibleBackground(node.styles) && !hasSnapshotVisibleBorderStyles(node.styles)) return false;
+
+  const parentRight = parentRect.x + parentRect.width;
+  const parentBottom = parentRect.y + parentRect.height;
+  const nodeRight = node.rect.x + node.rect.width;
+  const nodeBottom = node.rect.y + node.rect.height;
+
+  const overlapsParentX = nodeRight > parentRect.x && node.rect.x < parentRight;
+  const overlapsParentY = nodeBottom > parentRect.y && node.rect.y < parentBottom;
+  const spillsParentX = node.rect.x < parentRect.x - 0.5 || nodeRight > parentRight + 0.5;
+  const spillsParentY = node.rect.y < parentRect.y - 0.5 || nodeBottom > parentBottom + 0.5;
+
+  const horizontalRule =
+    node.rect.height <= 3 &&
+    node.rect.width >= Math.min(parentRect.width + 8, parentRect.width * 1.05) &&
+    overlapsParentX &&
+    overlapsParentY &&
+    spillsParentX;
+  if (horizontalRule) return true;
+
+  return (
+    node.rect.width <= 3 &&
+    node.rect.height >= Math.min(parentRect.height + 8, parentRect.height * 1.05) &&
+    overlapsParentX &&
+    overlapsParentY &&
+    spillsParentY
+  );
+}
+
+function hasExternalMaterializedControlChild(
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  for (const child of childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (!isSnapshotRectOutsideRect(child.rect, rect)) continue;
+    if (!isCloseExternalSnapshotRect(child.rect, rect)) continue;
+    if (hasMaterializedFormControlSnapshot(child)) return true;
+  }
+
+  return false;
+}
+
+function hasMaterializedFormControlSnapshot(node: ElementSnapshot): boolean {
+  if (
+    node.attributes["data-h2d-select-control"] === "true" ||
+    node.attributes["data-h2d-radio-control"] === "true"
+  ) {
+    return true;
+  }
+
+  return node.childNodes.some((child) => (
+    isElementNodeSnapshot(child) && hasMaterializedFormControlSnapshot(child)
+  ));
+}
+
 function hasExternalMaterializedPseudoChild(
   childNodes: SnapshotNode[],
   rect: { x: number; y: number; width: number; height: number },
@@ -4749,7 +5021,7 @@ function hasExternalMaterializedPseudoChild(
     if (!isElementNodeSnapshot(child)) continue;
     if (!child.attributes["data-h2d-pseudo"]) continue;
     if (!isSnapshotRectOutsideRect(child.rect, rect)) continue;
-    if (!isCloseExternalPseudoRect(child.rect, rect)) continue;
+    if (!isCloseExternalSnapshotRect(child.rect, rect)) continue;
 
     const pseudoText = getSnapshotText(child);
     const pseudoKind = child.attributes["data-h2d-pseudo-kind"] || "text";
@@ -4760,7 +5032,7 @@ function hasExternalMaterializedPseudoChild(
   return false;
 }
 
-function isCloseExternalPseudoRect(
+function isCloseExternalSnapshotRect(
   child: { x: number; y: number; width: number; height: number },
   parent: { x: number; y: number; width: number; height: number },
 ): boolean {
