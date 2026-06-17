@@ -18,6 +18,7 @@
   // --- Shadow DOM host ---
   const host = document.createElement("div");
   host.id = HOST_ID;
+  host.setAttribute("data-h2d-ignore", "true");
   host.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;";
   document.body.appendChild(host);
 
@@ -314,6 +315,40 @@
   const header = document.createElement("div");
   header.className = "header";
 
+  function consumeToolbarEvent(event: Event): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+  }
+
+  function wireToolbarButtonAction(button: HTMLButtonElement, onActivate: () => void): void {
+    let handledPointerActivation = false;
+
+    button.addEventListener("pointerdown", (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      handledPointerActivation = true;
+      consumeToolbarEvent(event);
+      onActivate();
+    });
+
+    button.addEventListener("click", (event: MouseEvent) => {
+      consumeToolbarEvent(event);
+      if (handledPointerActivation) {
+        handledPointerActivation = false;
+        return;
+      }
+      onActivate();
+    });
+
+    button.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      consumeToolbarEvent(event);
+      onActivate();
+    });
+  }
+
   const title = document.createElement("div");
   title.className = "title";
   title.textContent = isFrame ? "H2D Capture · Frame" : "H2D Capture";
@@ -321,7 +356,7 @@
   const closeBtn = document.createElement("button");
   closeBtn.className = "close-btn";
   closeBtn.appendChild(makeSvg(12, "0 0 16 16", iconPaths.close, "rgba(255,255,255,0.5)"));
-  closeBtn.addEventListener("click", destroy);
+  wireToolbarButtonAction(closeBtn, destroy);
 
   header.append(title, closeBtn);
 
@@ -336,7 +371,7 @@
     const span = document.createElement("span");
     span.textContent = label;
     btn.appendChild(span);
-    btn.addEventListener("click", onClick);
+    wireToolbarButtonAction(btn, onClick);
     return btn;
   }
 
@@ -365,7 +400,7 @@
   debugActions.hidden = true;
   debugActions.append(btnDebugScreen, btnDebugSelect);
 
-  debugToggle.addEventListener("click", () => {
+  wireToolbarButtonAction(debugToggle, () => {
     const expanded = debugActions.hidden;
     debugActions.hidden = !expanded;
     debugToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
@@ -461,7 +496,7 @@
     }, 5000);
 
     // Firefox: navigator.clipboard.write() requires user activation. Since the
-    // click event is still on the stack here (before any await), we create a
+    // toolbar activation event is still on the stack here (before any await), we create a
     // ClipboardItem with a pending Promise<Blob> now. Firefox holds the write
     // transaction open until the promise resolves.
     let ffClipboard: {

@@ -180,6 +180,7 @@ async function captureDOMInner(
     }
     const rootSnapshot = serialized as ElementSnapshot;
     normalizeElementCaptureOrigin(rootSnapshot, elementRect);
+    normalizeViewportCropCanvasGeometry(rootSnapshot);
     appendStatusDistributionOverlays(rootSnapshot, element);
     appendCompactToolbarActionOverlays(rootSnapshot, element);
     appendContentHeaderTabOverlays(rootSnapshot, element);
@@ -259,6 +260,7 @@ async function captureDOMInner(
     if (shouldUseViewportRect) {
       normalizeDocumentViewportSnapshot(rootSnapshot, ownerWindow);
     }
+    normalizeViewportCropCanvasGeometry(rootSnapshot);
 
     return {
       documentTitle: doc.title || undefined,
@@ -288,6 +290,42 @@ async function captureDOMInner(
 function normalizeElementCaptureOrigin(rootSnapshot: ElementSnapshot, elementRect: DOMRect): void {
   if (elementRect.x === 0 && elementRect.y === 0) return;
   offsetSnapshotNode(rootSnapshot, -elementRect.x, -elementRect.y);
+}
+
+function normalizeViewportCropCanvasGeometry(node: ElementSnapshot, parentRect?: Rect): void {
+  if (isViewportCropCanvasSnapshot(node)) {
+    alignSnapshotGeometryToParent(node, parentRect ?? node.rect);
+  }
+
+  for (const child of node.childNodes) {
+    if (isElementNodeSnapshot(child)) {
+      normalizeViewportCropCanvasGeometry(child, node.rect);
+    }
+  }
+}
+
+function isViewportCropCanvasSnapshot(node: ElementSnapshot): boolean {
+  return node.tag === "CANVAS" &&
+    node.attributes["data-h2d-rasterized-frame"] === "true" &&
+    Boolean(node.placeholderUrl?.startsWith("rasterized:"));
+}
+
+function alignSnapshotGeometryToParent(node: ElementSnapshot, parentRect: Rect): void {
+  node.rect.cssWidth = Math.round(node.rect.width);
+  node.rect.cssHeight = Math.round(node.rect.height);
+  node.styles.display = "block";
+  node.styles.position = "absolute";
+  node.styles.left = `${roundPx(node.rect.x - parentRect.x)}px`;
+  node.styles.top = `${roundPx(node.rect.y - parentRect.y)}px`;
+  node.styles.width = `${roundPx(node.rect.width)}px`;
+  node.styles.height = `${roundPx(node.rect.height)}px`;
+  node.styles.boxSizing = "border-box";
+  node.styles.overflow = "hidden";
+  node.styles.overflowX = "hidden";
+  node.styles.overflowY = "hidden";
+  delete node.styles.transform;
+  delete node.styles.transformOrigin;
+  delete node.relativeTransform;
 }
 
 function shouldNormalizeDocumentToViewport(
@@ -470,6 +508,7 @@ function snapshotElement(
   let selectionSourceId: string | undefined;
   let expandedIframe = false;
   let tagOverride: string | undefined;
+  let rasterizedFrame = false;
 
   const tag = element.tagName.toUpperCase();
 
@@ -492,6 +531,16 @@ function snapshotElement(
   }
 
   if (!isNodeVisible(element)) return null;
+
+  const clippedCornerMarkerSnapshot = snapshotClippedCornerMarkerElement(element);
+  if (clippedCornerMarkerSnapshot) {
+    return clippedCornerMarkerSnapshot;
+  }
+
+  const borderTriangleSnapshot = snapshotCssBorderTriangleElement(element);
+  if (borderTriangleSnapshot) {
+    return borderTriangleSnapshot;
+  }
 
   const statusDistributionCellSnapshot = snapshotStatusDistributionCell(element, generateNodeId);
   if (statusDistributionCellSnapshot) {
@@ -602,6 +651,7 @@ function snapshotElement(
     computedStyles.overflowY = "visible";
   }
 
+  materializeLinearGradientCornerMarker(element, computedStyles, childNodes);
   stabilizeTopChromeLayout(element, computedStyles, childNodes);
 
   // Pseudo-element styles (::before, ::after, ::placeholder).
@@ -649,6 +699,7 @@ function snapshotElement(
     rect = iframeCropRect;
     placeholderUrl = assetCollector.addViewportCrop(iframeCropRect);
     tagOverride = "CANVAS";
+    rasterizedFrame = true;
     computedStyles.overflow = "hidden";
     computedStyles.overflowX = "hidden";
     computedStyles.overflowY = "hidden";
@@ -667,6 +718,9 @@ function snapshotElement(
   const attributes = getSnapshotElementAttributes(element, verticalScrollViewportStabilized);
   if (popupActionOverflowRelaxed) {
     attributes["data-h2d-popup-action-overflow"] = "true";
+  }
+  if (rasterizedFrame) {
+    attributes["data-h2d-rasterized-frame"] = "true";
   }
 
   const node: ElementSnapshot = {
@@ -1608,10 +1662,11 @@ interface StructuralTabGroup {
 }
 
 function appendCompactToolbarActionOverlays(rootSnapshot: ElementSnapshot, rootElement: Element): void {
-  const actions = collectCompactToolbarActions(rootElement);
+  const rootRect = rootElement.getBoundingClientRect();
+  const captureRect = getVisibleCaptureRect(rootElement, rootRect);
+  const actions = collectCompactToolbarActions(rootElement, captureRect);
   if (actions.length === 0) return;
 
-  const rootRect = rootElement.getBoundingClientRect();
   const offsetX = rootSnapshot.rect.x - rootRect.x;
   const offsetY = rootSnapshot.rect.y - rootRect.y;
   const actionIds = new Set(actions.map(({ element }) => generateNodeId(element)));
@@ -1628,7 +1683,7 @@ function appendCompactToolbarActionOverlays(rootSnapshot: ElementSnapshot, rootE
   }
 }
 
-function collectCompactToolbarActions(rootElement: Element): CompactToolbarAction[] {
+function collectCompactToolbarActions(rootElement: Element, captureRect: DOMRect): CompactToolbarAction[] {
   const roots = [rootElement, ...Array.from(rootElement.querySelectorAll("*"))];
   const collected: CompactToolbarAction[] = [];
   const seen = new Set<Element>();
@@ -1637,7 +1692,9 @@ function collectCompactToolbarActions(rootElement: Element): CompactToolbarActio
     if (!isElementVisibleInDocument(root)) continue;
 
     const rootRect = root.getBoundingClientRect();
-    const actions = getDirectCompactToolbarActions(root, rootRect);
+    if (!isRectNearCaptureRect(rootRect, captureRect)) continue;
+
+    const actions = getDirectCompactToolbarActions(root, rootRect, captureRect);
     if (!isCompactToolbarRoot(root, rootRect, actions)) continue;
 
     for (const action of actions) {
@@ -1650,18 +1707,18 @@ function collectCompactToolbarActions(rootElement: Element): CompactToolbarActio
   return collected;
 }
 
-function getDirectCompactToolbarActions(root: Element, rootRect: DOMRect): CompactToolbarAction[] {
+function getDirectCompactToolbarActions(root: Element, rootRect: DOMRect, captureRect: DOMRect): CompactToolbarAction[] {
   const actions: CompactToolbarAction[] = [];
 
   for (const child of Array.from(root.children)) {
-    const action = getCompactToolbarAction(child, rootRect);
+    const action = getCompactToolbarAction(child, rootRect, captureRect);
     if (action) actions.push(action);
   }
 
   return actions;
 }
 
-function getCompactToolbarAction(element: Element, rootRect: DOMRect): CompactToolbarAction | null {
+function getCompactToolbarAction(element: Element, rootRect: DOMRect, captureRect: DOMRect): CompactToolbarAction | null {
   if (!isElementVisibleInDocument(element)) return null;
 
   const tag = element.tagName.toUpperCase();
@@ -1670,6 +1727,8 @@ function getCompactToolbarAction(element: Element, rootRect: DOMRect): CompactTo
   if (/^(tab|tablist|option|listbox|combobox)$/i.test(role)) return null;
 
   const rect = element.getBoundingClientRect();
+  if (!isRectNearCaptureRect(rect, captureRect)) return null;
+  if (!isElementTopVisibleAtCenter(element, rect)) return null;
   if (rect.width < 16 || rect.width > 220 || rect.height < 12 || rect.height > 36) return null;
   if (Math.abs(getRectCenterY(rect) - getRectCenterY(rootRect)) > 12) return null;
 
@@ -1723,8 +1782,43 @@ function unionDOMRects(rects: DOMRect[]): DOMRect | null {
   return new DOMRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
 }
 
+function getVisibleCaptureRect(rootElement: Element, rootRect = rootElement.getBoundingClientRect()): DOMRect {
+  const ownerWindow = getNodeWindow(rootElement);
+  const viewportRect = new DOMRect(0, 0, ownerWindow.innerWidth, ownerWindow.innerHeight);
+  const ownerDocument = getNodeDocument(rootElement);
+
+  if (rootElement === ownerDocument.documentElement || rootElement === ownerDocument.body) {
+    return viewportRect;
+  }
+
+  return intersectDOMRects(rootRect, viewportRect) ?? rootRect;
+}
+
+function intersectDOMRects(a: DOMRect, b: DOMRect): DOMRect | null {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.right, b.right);
+  const bottom = Math.min(a.bottom, b.bottom);
+
+  if (right <= left || bottom <= top) return null;
+  return new DOMRect(left, top, right - left, bottom - top);
+}
+
+function isRectNearCaptureRect(
+  rect: { left: number; top: number; right: number; bottom: number },
+  captureRect: { left: number; top: number; right: number; bottom: number },
+  margin = 128,
+): boolean {
+  return rect.right >= captureRect.left - margin &&
+    rect.left <= captureRect.right + margin &&
+    rect.bottom >= captureRect.top - margin &&
+    rect.top <= captureRect.bottom + margin;
+}
+
 function appendContentHeaderTabOverlays(rootSnapshot: ElementSnapshot, rootElement: Element): void {
-  const primaryGroup = findPrimaryContentTabGroup(rootElement);
+  const rootRect = rootElement.getBoundingClientRect();
+  const captureRect = getVisibleCaptureRect(rootElement, rootRect);
+  const primaryGroup = findPrimaryContentTabGroup(rootElement, captureRect);
   if (!primaryGroup) return;
 
   const secondaryGroup = findSecondaryContentTabGroup(rootElement, primaryGroup);
@@ -1733,10 +1827,9 @@ function appendContentHeaderTabOverlays(rootSnapshot: ElementSnapshot, rootEleme
 
   const secondaryTabs = secondaryGroup ? collectTabGroupOverlays(secondaryGroup, "secondary") : [];
   const topSurfaceRect = findConnectedTopSurfaceRect(rootElement, primaryGroup.rect);
-  const rootRect = rootElement.getBoundingClientRect();
   const offsetX = rootSnapshot.rect.x - rootRect.x;
   const offsetY = rootSnapshot.rect.y - rootRect.y;
-  const surfaceRect = getConnectedTabSurfaceBaseRect(primaryGroup.rect, rootRect, topSurfaceRect);
+  const surfaceRect = getConnectedTabSurfaceBaseRect(primaryGroup.rect, captureRect, topSurfaceRect);
   const snapshotSurfaceRect = offsetDOMRect(surfaceRect, offsetX, offsetY);
 
   normalizeConnectedTabSurfaceSnapshots(rootSnapshot, snapshotSurfaceRect);
@@ -1747,10 +1840,9 @@ function appendContentHeaderTabOverlays(rootSnapshot: ElementSnapshot, rootEleme
     pruneSnapshotsByIds(rootSnapshot, pruneIds);
   }
 
-  const band = createConnectedTabSurfaceBackground(
-    surfaceRect,
-    secondaryTabs,
-  );
+  const band = hasExistingConnectedTabSurfaceSnapshot(rootSnapshot, snapshotSurfaceRect)
+    ? null
+    : createConnectedTabSurfaceBackground(surfaceRect, secondaryTabs);
   if (band) {
     offsetSnapshotNode(band, offsetX, offsetY);
     anchorSnapshotToParent(band, rootSnapshot.rect);
@@ -1764,7 +1856,7 @@ function appendContentHeaderTabOverlays(rootSnapshot: ElementSnapshot, rootEleme
   }
 }
 
-function findPrimaryContentTabGroup(rootElement: Element): StructuralTabGroup | null {
+function findPrimaryContentTabGroup(rootElement: Element, captureRect: DOMRect): StructuralTabGroup | null {
   const candidates = Array.from(rootElement.querySelectorAll('[role="tablist"]'));
   let best: StructuralTabGroup | null = null;
   let bestScore = Number.NEGATIVE_INFINITY;
@@ -1772,6 +1864,7 @@ function findPrimaryContentTabGroup(rootElement: Element): StructuralTabGroup | 
   for (const candidate of candidates) {
     const group = getStructuralTabGroup(candidate);
     if (!group || !isPrimaryContentTabGroup(group)) continue;
+    if (!isRectNearCaptureRect(group.rect, captureRect)) continue;
 
     const score = group.tabs.length * 100 + group.rect.width - group.rect.top * 0.05;
     if (score > bestScore) {
@@ -1825,6 +1918,7 @@ function isVisibleStructuralTab(tab: Element, tabListRect: DOMRect): boolean {
   if (rect.width < 12 || rect.height < 12 || rect.height > 64) return false;
   if (rect.right < tabListRect.left - 2 || rect.left > tabListRect.right + 2) return false;
   if (rect.bottom < tabListRect.top - 2 || rect.top > tabListRect.bottom + 2) return false;
+  if (!isElementTopVisibleAtCenter(tab, rect)) return false;
 
   return normalizeTabText(getElementVisibleText(tab)).length > 0;
 }
@@ -2015,6 +2109,30 @@ function normalizeConnectedTabSurfaceSnapshots(rootSnapshot: ElementSnapshot, su
 
     normalizeConnectedTabSurfaceSnapshots(child, surfaceRect);
   }
+}
+
+function hasExistingConnectedTabSurfaceSnapshot(rootSnapshot: ElementSnapshot, surfaceRect: DOMRect): boolean {
+  for (const child of rootSnapshot.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (isExistingConnectedTabSurfaceSnapshot(child, surfaceRect)) return true;
+    if (hasExistingConnectedTabSurfaceSnapshot(child, surfaceRect)) return true;
+  }
+
+  return false;
+}
+
+function isExistingConnectedTabSurfaceSnapshot(node: ElementSnapshot, surfaceRect: DOMRect): boolean {
+  if (node.attributes["data-h2d-connected-tab-surface"] === "true") return false;
+
+  const rect = node.rect;
+  if (rect.width < surfaceRect.width - 8) return false;
+  if (rect.x > surfaceRect.x + 4) return false;
+  if (rect.x + rect.width < surfaceRect.x + surfaceRect.width - 4) return false;
+  if (rect.y > surfaceRect.y + 4) return false;
+  if (rect.y + rect.height < surfaceRect.y + surfaceRect.height - 32) return false;
+
+  return isNearWhitePaint(node.styles.backgroundColor || "") ||
+    isWhiteDominantLinearGradient(node.styles.backgroundImage || "");
 }
 
 function isConnectedTabSurfaceSnapshotCandidate(node: ElementSnapshot, surfaceRect: DOMRect): boolean {
@@ -2318,6 +2436,32 @@ function isElementVisibleInDocument(element: Element): boolean {
   if (isFullyClippedByVerticalOverlayScrollAncestor(element, rect)) return false;
   const computed = getComputedStyleFor(element);
   return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
+}
+
+function isElementTopVisibleAtCenter(element: Element, rect = element.getBoundingClientRect()): boolean {
+  if (rect.width <= 0 || rect.height <= 0) return false;
+
+  const doc = getNodeDocument(element);
+  const view = getNodeWindow(element);
+  const x = Math.max(0, Math.min(view.innerWidth - 1, rect.left + rect.width / 2));
+  const y = Math.max(0, Math.min(view.innerHeight - 1, rect.top + rect.height / 2));
+  if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) return false;
+
+  const hits = typeof doc.elementsFromPoint === "function"
+    ? doc.elementsFromPoint(x, y)
+    : [doc.elementFromPoint(x, y)].filter((hit): hit is Element => Boolean(hit));
+  const hit = hits.find((candidate) => !isTransparentHitTestOverlay(candidate));
+  if (!hit) return false;
+  return hit === element || element.contains(hit);
+}
+
+function isTransparentHitTestOverlay(element: Element): boolean {
+  const identity = getElementIdentity(element);
+  if (/watermark/i.test(identity)) return true;
+  if (element.getAttribute("data-name") === "__beisen_watermark__") return true;
+
+  const computed = getComputedStyleFor(element);
+  return computed.pointerEvents === "none";
 }
 
 function getCaptureScrollHeight(rootElement: Element, rootSnapshot: ElementSnapshot): number {
@@ -3302,6 +3446,12 @@ function polarToCartesian(cx: number, cy: number, radius: number, angleInDegrees
 
 function snapshotPaintPseudoElement(element: Element, pseudo: "::before" | "::after"): ElementSnapshot | null {
   const computed = getComputedStyleFor(element, pseudo);
+  const borderTriangle = snapshotCssBorderTrianglePseudo(element, pseudo, computed);
+  if (borderTriangle) return borderTriangle;
+
+  const clippedCornerMarker = snapshotClippedCornerMarkerPseudo(element, pseudo, computed);
+  if (clippedCornerMarker) return clippedCornerMarker;
+
   if (!isPaintPseudoCandidate(element, computed)) return null;
 
   const width = parsePx(computed.width, NaN);
@@ -3333,6 +3483,443 @@ function snapshotPaintPseudoElement(element: Element, pseudo: "::before" | "::af
     layoutSizingHorizontal: "FIXED",
     layoutSizingVertical: "FIXED",
   };
+}
+
+type BorderSide = "Top" | "Right" | "Bottom" | "Left";
+type CornerPosition = "top-left" | "top-right" | "bottom-left" | "bottom-right";
+
+interface CssBorderTriangle {
+  side: BorderSide;
+  color: string;
+  borderTop: number;
+  borderRight: number;
+  borderBottom: number;
+  borderLeft: number;
+}
+
+function materializeLinearGradientCornerMarker(
+  element: Element,
+  styles: Record<string, string>,
+  childNodes: SnapshotNode[],
+): void {
+  const marker = getLinearGradientCornerMarkerInfo(element, styles);
+  if (!marker) return;
+
+  const rect = element.getBoundingClientRect();
+  childNodes.unshift(createCornerMarkerSnapshot(rect, marker.corner, marker.color, generateNodeId(null), {
+    "data-h2d-css-gradient-corner": marker.corner,
+  }));
+
+  clearBackgroundImageStyles(styles);
+}
+
+function getLinearGradientCornerMarkerInfo(
+  element: Element,
+  styles: Record<string, string>,
+): { corner: CornerPosition; color: string } | null {
+  const backgroundImage = styles.backgroundImage || getComputedStyleFor(element).backgroundImage;
+  if (!backgroundImage || !/^linear-gradient\(/i.test(backgroundImage.trim())) return null;
+  if (hasDirectVisibleText(element) || hasVisibleTextDescendant(element)) return null;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 4 || rect.height < 4 || rect.width > 48 || rect.height > 48) return null;
+
+  const angle = getLinearGradientAngle(backgroundImage);
+  if (angle == null) return null;
+  if (!/50(?:\.0+)?%/.test(backgroundImage)) return null;
+
+  const stops = getLinearGradientColorStops(backgroundImage);
+  const transparentIndex = stops.findIndex((color) => !isVisibleGradientColor(color));
+  const visibleIndex = stops.findIndex((color) => isVisibleGradientColor(color));
+  if (transparentIndex < 0 || visibleIndex < 0 || transparentIndex === visibleIndex) return null;
+
+  return {
+    corner: getGradientCornerPosition(angle, visibleIndex > transparentIndex),
+    color: stops[visibleIndex],
+  };
+}
+
+function getLinearGradientAngle(backgroundImage: string): number | null {
+  const angleMatch = backgroundImage.match(/^linear-gradient\(\s*(-?\d+(?:\.\d+)?)deg\s*,/i);
+  if (angleMatch) {
+    return normalizeAngle(Number(angleMatch[1]));
+  }
+
+  const directionMatch = backgroundImage.match(/^linear-gradient\(\s*to\s+(top|bottom)(?:\s+(left|right))?\s*,/i) ||
+    backgroundImage.match(/^linear-gradient\(\s*to\s+(left|right)(?:\s+(top|bottom))?\s*,/i);
+  if (!directionMatch) return null;
+
+  const direction = directionMatch[0].toLowerCase();
+  if (direction.includes("top") && direction.includes("left")) return 315;
+  if (direction.includes("top") && direction.includes("right")) return 45;
+  if (direction.includes("bottom") && direction.includes("left")) return 225;
+  if (direction.includes("bottom") && direction.includes("right")) return 135;
+  if (direction.includes("top")) return 0;
+  if (direction.includes("right")) return 90;
+  if (direction.includes("bottom")) return 180;
+  if (direction.includes("left")) return 270;
+  return null;
+}
+
+function getLinearGradientColorStops(backgroundImage: string): string[] {
+  const matches = backgroundImage.match(/rgba?\([^)]+\)|#[0-9a-f]{3,8}\b|transparent\b/gi);
+  return matches ?? [];
+}
+
+function isVisibleGradientColor(color: string): boolean {
+  if (!isVisiblePaint(color)) return false;
+  const rgbaMatch = color.match(/^rgba\((.+)\)$/i);
+  if (!rgbaMatch) return true;
+
+  const parts = rgbaMatch[1].split(",").map((part) => part.trim());
+  const alpha = Number(parts[3]);
+  return !Number.isFinite(alpha) || alpha > 0;
+}
+
+function getGradientCornerPosition(angle: number, visibleAfterMidpoint: boolean): CornerPosition {
+  const radians = normalizeAngle(angle) * Math.PI / 180;
+  const directionX = Math.sin(radians);
+  const directionY = -Math.cos(radians);
+  const x = visibleAfterMidpoint ? directionX : -directionX;
+  const y = visibleAfterMidpoint ? directionY : -directionY;
+
+  if (x <= 0 && y <= 0) return "top-left";
+  if (x > 0 && y <= 0) return "top-right";
+  if (x <= 0 && y > 0) return "bottom-left";
+  return "bottom-right";
+}
+
+function normalizeAngle(angle: number): number {
+  return ((angle % 360) + 360) % 360;
+}
+
+function clearBackgroundImageStyles(styles: Record<string, string>): void {
+  delete styles.backgroundImage;
+  delete styles.backgroundAttachment;
+  delete styles.backgroundBlendMode;
+  delete styles.backgroundClip;
+  delete styles.backgroundOrigin;
+  delete styles.backgroundPositionX;
+  delete styles.backgroundPositionY;
+  delete styles.backgroundRepeat;
+  delete styles.backgroundSize;
+}
+
+function snapshotClippedCornerMarkerElement(element: Element): ElementSnapshot | null {
+  const parent = element.parentElement;
+  if (!parent) return null;
+
+  const computed = getComputedStyleFor(element);
+  const marker = getClippedCornerMarkerInfo(computed);
+  if (!marker) return null;
+  if (!isElementVisuallyEmpty(element)) return null;
+
+  const parentComputed = getComputedStyleFor(parent);
+  if (!isClippingOverflow(parentComputed)) return null;
+
+  const rect = element.getBoundingClientRect();
+  const parentRect = parent.getBoundingClientRect();
+  const corner = getCornerPosition(rect, parentRect);
+  if (!corner) return null;
+
+  const visibleRect = intersectDOMRects(rect, parentRect);
+  if (!visibleRect || !isReasonableCornerMarkerRect(visibleRect)) return null;
+
+  return createCornerMarkerSnapshot(visibleRect, corner, marker.color, generateNodeId(element));
+}
+
+function snapshotClippedCornerMarkerPseudo(
+  element: Element,
+  pseudo: "::before" | "::after",
+  computed: CSSStyleDeclaration,
+): ElementSnapshot | null {
+  const marker = getClippedCornerMarkerInfo(computed);
+  if (!marker) return null;
+
+  const hostComputed = getComputedStyleFor(element);
+  if (!isClippingOverflow(hostComputed)) return null;
+
+  const width = parsePx(computed.width, NaN);
+  const height = parsePx(computed.height, NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (width <= 0 || height <= 0 || width > 40 || height > 40) return null;
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 || hostRect.height <= 0) return null;
+
+  const rect = computePaintPseudoRect(pseudo, hostRect, computed, width, height);
+  const corner = getCornerPosition(rect, hostRect);
+  if (!corner) return null;
+
+  const visibleRect = intersectDOMRects(rect, hostRect);
+  if (!visibleRect || !isReasonableCornerMarkerRect(visibleRect)) return null;
+
+  return createCornerMarkerSnapshot(visibleRect, corner, marker.color, generateNodeId(null), {
+    "data-h2d-pseudo": pseudo === "::before" ? "before" : "after",
+  });
+}
+
+function getClippedCornerMarkerInfo(computed: CSSStyleDeclaration): { color: string } | null {
+  if (!isVisiblePaint(computed.backgroundColor)) return null;
+
+  const width = parsePx(computed.width, NaN);
+  const height = parsePx(computed.height, NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (width < 6 || height < 6 || width > 40 || height > 40) return null;
+  if (Math.abs(width - height) > Math.max(4, Math.min(width, height) * 0.25)) return null;
+
+  if (!isApproximatelyDiagonalRotation(computed.transform)) return null;
+  return { color: computed.backgroundColor };
+}
+
+function isElementVisuallyEmpty(element: Element): boolean {
+  if (hasDirectVisibleText(element) || hasVisibleTextDescendant(element)) return false;
+  return !Array.from(element.children).some((child) => isNodeVisible(child));
+}
+
+function isClippingOverflow(computed: CSSStyleDeclaration): boolean {
+  return /^(hidden|clip)$/i.test(computed.overflow) ||
+    /^(hidden|clip)$/i.test(computed.overflowX) ||
+    /^(hidden|clip)$/i.test(computed.overflowY);
+}
+
+function isApproximatelyDiagonalRotation(transform: string): boolean {
+  const angle = getTransformRotationAngle(transform);
+  if (!Number.isFinite(angle)) return false;
+
+  const normalized = ((Math.abs(angle) % 90) + 90) % 90;
+  return Math.abs(normalized - 45) <= 8;
+}
+
+function getCornerPosition(rect: DOMRect, container: DOMRect): CornerPosition | null {
+  const margin = 6;
+  const nearLeft = rect.left <= container.left + margin;
+  const nearRight = rect.right >= container.right - margin;
+  const nearTop = rect.top <= container.top + margin;
+  const nearBottom = rect.bottom >= container.bottom - margin;
+
+  if (nearLeft && nearTop) return "top-left";
+  if (nearRight && nearTop) return "top-right";
+  if (nearLeft && nearBottom) return "bottom-left";
+  if (nearRight && nearBottom) return "bottom-right";
+  return null;
+}
+
+function isReasonableCornerMarkerRect(rect: DOMRect): boolean {
+  return rect.width >= 4 && rect.height >= 4 && rect.width <= 36 && rect.height <= 36;
+}
+
+function createCornerMarkerSnapshot(
+  rect: DOMRect,
+  corner: CornerPosition,
+  color: string,
+  id: string,
+  extraAttributes: Record<string, string> = {},
+): ElementSnapshot {
+  const fill = escapeSvgAttribute(color);
+  const points = getCornerMarkerPoints(rect, corner)
+    .map(([x, y]) => `${roundPx(x)},${roundPx(y)}`)
+    .join(" ");
+
+  return {
+    nodeType: Node.ELEMENT_NODE as 1,
+    id,
+    tag: "SVG",
+    attributes: {
+      "data-h2d-corner-marker": corner,
+      ...extraAttributes,
+    },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: "0px",
+      top: "0px",
+      width: `${roundPx(rect.width)}px`,
+      height: `${roundPx(rect.height)}px`,
+      overflow: "visible",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(rect),
+    childNodes: [],
+    content: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${roundPx(rect.width)} ${roundPx(rect.height)}" preserveAspectRatio="none"><polygon points="${points}" fill="${fill}"/></svg>`,
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function getCornerMarkerPoints(rect: DOMRect, corner: CornerPosition): Array<[number, number]> {
+  switch (corner) {
+    case "top-left":
+      return [[0, 0], [rect.width, 0], [0, rect.height]];
+    case "top-right":
+      return [[rect.width, 0], [rect.width, rect.height], [0, 0]];
+    case "bottom-left":
+      return [[0, rect.height], [0, 0], [rect.width, rect.height]];
+    case "bottom-right":
+      return [[rect.width, rect.height], [0, rect.height], [rect.width, 0]];
+  }
+}
+
+function snapshotCssBorderTriangleElement(element: Element): ElementSnapshot | null {
+  if (!isBorderTriangleElementCandidate(element)) return null;
+
+  const computed = getComputedStyleFor(element);
+  const triangle = getCssBorderTriangle(computed);
+  if (!triangle) return null;
+
+  const rect = element.getBoundingClientRect();
+  if (!isReasonableBorderTriangleRect(rect)) return null;
+
+  return createCssBorderTriangleSnapshot(rect, triangle, generateNodeId(element));
+}
+
+function snapshotCssBorderTrianglePseudo(
+  element: Element,
+  pseudo: "::before" | "::after",
+  computed: CSSStyleDeclaration,
+): ElementSnapshot | null {
+  const triangle = getCssBorderTriangle(computed);
+  if (!triangle) return null;
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 && hostRect.height <= 0) return null;
+
+  const width = triangle.borderLeft + triangle.borderRight;
+  const height = triangle.borderTop + triangle.borderBottom;
+  if (width <= 0 || height <= 0 || width > 48 || height > 48) return null;
+
+  const rect = computePaintPseudoRect(pseudo, hostRect, computed, width, height);
+  if (!isReasonableBorderTriangleRect(rect)) return null;
+
+  return createCssBorderTriangleSnapshot(rect, triangle, generateNodeId(null), {
+    "data-h2d-pseudo": pseudo === "::before" ? "before" : "after",
+  });
+}
+
+function isBorderTriangleElementCandidate(element: Element): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (["INPUT", "TEXTAREA", "SELECT", "OPTION", "IMG", "CANVAS", "VIDEO", "SVG"].includes(tag)) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+  const width = parsePx(computed.width, 0);
+  const height = parsePx(computed.height, 0);
+  if (width > 1 || height > 1) return false;
+
+  if (hasDirectVisibleText(element) || hasVisibleTextDescendant(element)) return false;
+  if (Array.from(element.children).some((child) => isNodeVisible(child))) return false;
+
+  return true;
+}
+
+function getCssBorderTriangle(computed: CSSStyleDeclaration): CssBorderTriangle | null {
+  const borders = {
+    Top: getBorderSide(computed, "Top"),
+    Right: getBorderSide(computed, "Right"),
+    Bottom: getBorderSide(computed, "Bottom"),
+    Left: getBorderSide(computed, "Left"),
+  } as const;
+
+  const visible = (Object.keys(borders) as BorderSide[]).filter((side) => borders[side].visible);
+  if (visible.length !== 1) return null;
+
+  const side = visible[0];
+  const totalWidth = borders.Left.width + borders.Right.width;
+  const totalHeight = borders.Top.width + borders.Bottom.width;
+  if (totalWidth <= 0 || totalHeight <= 0) return null;
+
+  const hasTransparentSupport = (Object.keys(borders) as BorderSide[]).some((borderSide) => (
+    borderSide !== side &&
+    borders[borderSide].width > 0 &&
+    !borders[borderSide].visible
+  ));
+  if (!hasTransparentSupport) return null;
+
+  return {
+    side,
+    color: borders[side].color,
+    borderTop: borders.Top.width,
+    borderRight: borders.Right.width,
+    borderBottom: borders.Bottom.width,
+    borderLeft: borders.Left.width,
+  };
+}
+
+function getBorderSide(computed: CSSStyleDeclaration, side: BorderSide): { width: number; color: string; visible: boolean } {
+  const width = parsePx(computed[`border${side}Width` as keyof CSSStyleDeclaration] as string, 0);
+  const style = computed[`border${side}Style` as keyof CSSStyleDeclaration] as string;
+  const color = computed[`border${side}Color` as keyof CSSStyleDeclaration] as string;
+  return {
+    width,
+    color,
+    visible: width > 0 && style !== "none" && style !== "hidden" && isVisiblePaint(color),
+  };
+}
+
+function isReasonableBorderTriangleRect(rect: DOMRect): boolean {
+  return rect.width > 0 && rect.height > 0 && rect.width <= 64 && rect.height <= 64;
+}
+
+function createCssBorderTriangleSnapshot(
+  rect: DOMRect,
+  triangle: CssBorderTriangle,
+  id: string,
+  extraAttributes: Record<string, string> = {},
+): ElementSnapshot {
+  const points = getCssBorderTrianglePoints(rect, triangle)
+    .map(([x, y]) => `${roundPx(x)},${roundPx(y)}`)
+    .join(" ");
+  const fill = escapeSvgAttribute(triangle.color);
+  const width = Math.max(1, rect.width);
+  const height = Math.max(1, rect.height);
+
+  return {
+    nodeType: Node.ELEMENT_NODE as 1,
+    id,
+    tag: "SVG",
+    attributes: {
+      "data-h2d-css-border-triangle": triangle.side.toLowerCase(),
+      ...extraAttributes,
+    },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: "0px",
+      top: "0px",
+      width: `${roundPx(width)}px`,
+      height: `${roundPx(height)}px`,
+      overflow: "visible",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(new DOMRect(rect.x, rect.y, width, height)),
+    childNodes: [],
+    content: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${roundPx(width)} ${roundPx(height)}" preserveAspectRatio="none"><polygon points="${points}" fill="${fill}"/></svg>`,
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function getCssBorderTrianglePoints(rect: DOMRect, triangle: CssBorderTriangle): Array<[number, number]> {
+  const boxWidth = Math.max(1, triangle.borderLeft + triangle.borderRight);
+  const boxHeight = Math.max(1, triangle.borderTop + triangle.borderBottom);
+  const cx = clampNumber((triangle.borderLeft / boxWidth) * rect.width, 0, rect.width);
+  const cy = clampNumber((triangle.borderTop / boxHeight) * rect.height, 0, rect.height);
+
+  switch (triangle.side) {
+    case "Top":
+      return [[0, 0], [rect.width, 0], [cx, cy]];
+    case "Right":
+      return [[rect.width, 0], [rect.width, rect.height], [cx, cy]];
+    case "Bottom":
+      return [[rect.width, rect.height], [0, rect.height], [cx, cy]];
+    case "Left":
+      return [[0, rect.height], [0, 0], [cx, cy]];
+  }
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function isPaintPseudoCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
@@ -3809,14 +4396,18 @@ function getEmptyIframeViewportCropRect(
   if (element.tagName.toUpperCase() !== "IFRAME") return null;
   if (childNodes.length > 0) return null;
   if (element.ownerDocument !== document) return null;
-  return getLargeVisibleViewportIntersectionRect(rect);
+  return getLargeVisibleElementViewportIntersectionRect(element, rect);
 }
 
-function rasterizeEmptyIframeShells(node: SnapshotNode, assetCollector: ResourceResolver): void {
+function rasterizeEmptyIframeShells(
+  node: SnapshotNode,
+  assetCollector: ResourceResolver,
+  ancestors: ElementSnapshot[] = [],
+): void {
   if (!isElementNodeSnapshot(node)) return;
 
   if (node.tag === "IFRAME" && node.childNodes.length === 0) {
-    const cropRect = getLargeVisibleViewportIntersectionRect(node.rect);
+    const cropRect = getLargeVisibleSnapshotViewportIntersectionRect(node.rect, ancestors);
     if (cropRect) {
       node.tag = "CANVAS";
       node.rect = cropRect;
@@ -3833,18 +4424,56 @@ function rasterizeEmptyIframeShells(node: SnapshotNode, assetCollector: Resource
     return;
   }
 
+  const nextAncestors = [...ancestors, node];
   for (const child of node.childNodes) {
-    rasterizeEmptyIframeShells(child, assetCollector);
+    rasterizeEmptyIframeShells(child, assetCollector, nextAncestors);
   }
 }
 
 function getLargeVisibleViewportIntersectionRect(rect: Rect): ElementRect | null {
+  return getLargeVisibleRectIntersection(rect, new DOMRect(0, 0, window.innerWidth, window.innerHeight));
+}
+
+function getLargeVisibleElementViewportIntersectionRect(element: Element, rect: Rect): ElementRect | null {
+  let visibleRect = getLargeVisibleRectIntersection(rect, new DOMRect(0, 0, window.innerWidth, window.innerHeight));
+  if (!visibleRect) return null;
+
+  let ancestor = element.parentElement;
+  while (ancestor) {
+    const computed = getComputedStyleFor(ancestor);
+    if (isOverflowClipContainer(computed)) {
+      visibleRect = getLargeVisibleRectIntersection(visibleRect, ancestor.getBoundingClientRect());
+      if (!visibleRect) return null;
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  return visibleRect;
+}
+
+function getLargeVisibleSnapshotViewportIntersectionRect(rect: Rect, ancestors: ElementSnapshot[]): ElementRect | null {
+  let visibleRect = getLargeVisibleRectIntersection(rect, new DOMRect(0, 0, window.innerWidth, window.innerHeight));
+  if (!visibleRect) return null;
+
+  for (const ancestor of ancestors) {
+    if (!isSnapshotOverflowClipContainer(ancestor.styles)) continue;
+    visibleRect = getLargeVisibleRectIntersection(
+      visibleRect,
+      new DOMRect(ancestor.rect.x, ancestor.rect.y, ancestor.rect.width, ancestor.rect.height),
+    );
+    if (!visibleRect) return null;
+  }
+
+  return visibleRect;
+}
+
+function getLargeVisibleRectIntersection(rect: Rect, clipRect: DOMRect): ElementRect | null {
   if (rect.width < 120 || rect.height < 120) return null;
 
-  const left = Math.max(0, rect.x);
-  const top = Math.max(0, rect.y);
-  const right = Math.min(window.innerWidth, rect.x + rect.width);
-  const bottom = Math.min(window.innerHeight, rect.y + rect.height);
+  const left = Math.max(clipRect.left, rect.x);
+  const top = Math.max(clipRect.top, rect.y);
+  const right = Math.min(clipRect.right, rect.x + rect.width);
+  const bottom = Math.min(clipRect.bottom, rect.y + rect.height);
   const width = right - left;
   const height = bottom - top;
 
@@ -3858,6 +4487,18 @@ function getLargeVisibleViewportIntersectionRect(rect: Rect): ElementRect | null
     cssWidth: Math.round(width),
     cssHeight: Math.round(height),
   };
+}
+
+function isOverflowClipContainer(computed: CSSStyleDeclaration): boolean {
+  return /^(hidden|clip|auto|scroll)$/i.test(computed.overflow) ||
+    /^(hidden|clip|auto|scroll)$/i.test(computed.overflowX) ||
+    /^(hidden|clip|auto|scroll)$/i.test(computed.overflowY);
+}
+
+function isSnapshotOverflowClipContainer(styles: Record<string, string>): boolean {
+  return /^(hidden|clip|auto|scroll)(?:\s+(hidden|clip|auto|scroll))?$/i.test(styles.overflow || "") ||
+    /^(hidden|clip|auto|scroll)$/i.test(styles.overflowX || "") ||
+    /^(hidden|clip|auto|scroll)$/i.test(styles.overflowY || "");
 }
 
 function offsetSnapshotNode(node: SnapshotNode, dx: number, dy: number): void {

@@ -85,6 +85,8 @@ export function detectSelectControl(element: Element): SelectControl | null {
   const displayText = extractSelectDisplayText(root);
   const input = findSelectInput(root);
   if (!displayText.text && !input) return null;
+  if (hasExpandedCompositeSelectContent(root, visualBox)) return null;
+  if (isMultilineDisclosureSelectTrigger(root, visualBox, displayText, input)) return null;
 
   const arrow = findSelectArrow(root, visualBox);
   const arrowRect = computeArrowRect(arrow, visualBox);
@@ -761,6 +763,157 @@ function hasExplicitSelectDescendant(element: Element): boolean {
 
 function isInternalSelectIdentity(identity: string): boolean {
   return SELECT_INTERNAL_CLASS_PATTERN.test(identity) && !/(selector|selection|control|wrapper|trigger)/i.test(identity);
+}
+
+function isMultilineDisclosureSelectTrigger(
+  root: Element,
+  visualBox: Element,
+  displayText: SelectDisplayText,
+  input: HTMLInputElement | undefined,
+): boolean {
+  if (input) return false;
+  if (displayText.isPlaceholder) return false;
+  if (displayText.source !== "visible text") return false;
+
+  const visualRect = visualBox.getBoundingClientRect();
+  if (visualRect.height < 44) return false;
+
+  const textRects = getVisibleTextNodeRects(root);
+  if (textRects.length < 2) return false;
+
+  const insideRects = textRects.filter((rect) => isRectMostlyInside(rect, visualRect));
+  if (insideRects.length < 2) return false;
+
+  const rowTops = new Set<number>();
+  for (const rect of insideRects) {
+    rowTops.add(Math.round(rect.top));
+  }
+
+  if (rowTops.size < 2) return false;
+
+  const textTop = Math.min(...insideRects.map((rect) => rect.top));
+  const textBottom = Math.max(...insideRects.map((rect) => rect.bottom));
+  return textBottom - textTop >= Math.min(visualRect.height - 12, 28);
+}
+
+function hasExpandedCompositeSelectContent(root: Element, visualBox: Element): boolean {
+  const visualRect = visualBox.getBoundingClientRect();
+  const textRects = getVisibleTextNodeRects(root)
+    .filter((rect) => isRectSeparatedFromControl(rect, visualRect) && isRectInCurrentViewport(rect, root));
+
+  if (hasExpandedRectDistribution(textRects, visualRect)) return true;
+
+  const optionRects = getVisibleOptionLikeRects(root)
+    .filter((rect) => isRectSeparatedFromControl(rect, visualRect) && isRectInCurrentViewport(rect, root));
+  return hasExpandedRectDistribution(optionRects, visualRect);
+}
+
+function hasExpandedRectDistribution(rects: DOMRect[], visualRect: DOMRect): boolean {
+  if (rects.length === 0) return false;
+
+  const tallRect = rects.some((rect) => rect.height >= Math.max(48, visualRect.height * 1.25));
+  if (tallRect) return true;
+
+  const rowTops = new Set<number>();
+  for (const rect of rects) {
+    rowTops.add(Math.round(rect.top / 4) * 4);
+  }
+
+  if (rowTops.size < 3) return false;
+
+  const top = Math.min(...rects.map((rect) => rect.top));
+  const bottom = Math.max(...rects.map((rect) => rect.bottom));
+  return bottom - top >= Math.max(48, visualRect.height * 1.25);
+}
+
+function getVisibleOptionLikeRects(root: Element): DOMRect[] {
+  const rects: DOMRect[] = [];
+
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    if (!isNodeVisible(element) || isSelectDecorationElement(element)) continue;
+
+    const tag = element.tagName.toUpperCase();
+    const role = element.getAttribute("role")?.toLowerCase() || "";
+    const identity = getElementIdentity(element);
+    const optionLike =
+      tag === "LI" ||
+      role === "option" ||
+      role === "menuitem" ||
+      role === "treeitem" ||
+      /(^|[-_\s])(option|menu-item|list-item|tree-node|treeitem)([-_\s]|$)/i.test(identity);
+
+    if (!optionLike) continue;
+
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    rects.push(rect);
+  }
+
+  return rects;
+}
+
+function isRectSeparatedFromControl(rect: DOMRect, visualRect: DOMRect): boolean {
+  const margin = 4;
+  return (
+    rect.bottom <= visualRect.top - margin ||
+    rect.top >= visualRect.bottom + margin ||
+    rect.right <= visualRect.left - margin ||
+    rect.left >= visualRect.right + margin
+  );
+}
+
+function isRectInCurrentViewport(rect: DOMRect, root: Element): boolean {
+  const view = root.ownerDocument.defaultView;
+  if (!view) return true;
+
+  const margin = 8;
+  return (
+    rect.right > -margin &&
+    rect.left < view.innerWidth + margin &&
+    rect.bottom > -margin &&
+    rect.top < view.innerHeight + margin
+  );
+}
+
+function getVisibleTextNodeRects(root: Element): DOMRect[] {
+  const rects: DOMRect[] = [];
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+
+  while (node) {
+    const text = node.textContent || "";
+    const parent = node.parentElement;
+    if (text.trim() && parent && isNodeVisible(parent) && !isSelectDecorationElement(parent)) {
+      const rect = getTextRect(node);
+      if (rect.width > 0 && rect.height > 0) {
+        rects.push(new DOMRect(rect.x, rect.y, rect.width, rect.height));
+      }
+    }
+    node = walker.nextNode();
+  }
+
+  return rects;
+}
+
+function isSelectDecorationElement(element: Element): boolean {
+  const identity = getElementIdentity(element);
+  if (ARROW_CLASS_PATTERN.test(identity)) return true;
+
+  const tag = element.tagName.toUpperCase();
+  return tag === "SVG" || tag === "I" || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
+
+function isRectMostlyInside(rect: DOMRect, container: DOMRect): boolean {
+  const left = Math.max(rect.left, container.left);
+  const top = Math.max(rect.top, container.top);
+  const right = Math.min(rect.right, container.right);
+  const bottom = Math.min(rect.bottom, container.bottom);
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 0 || height <= 0) return false;
+
+  const area = rect.width * rect.height;
+  return area <= 0 || (width * height) / area >= 0.6;
 }
 
 function elementLooksLikeControlSurface(element: Element): boolean {

@@ -11,9 +11,13 @@ import type { Rect } from '../types.js';
 
 /** Image MIME types that browsers may decode but Figma cannot consume directly. */
 const UNSUPPORTED_IMAGE_TYPES = new Set(["image/avif", "image/heif", "image/heic"]);
+const H2D_TOOLBAR_HOST_ID = "__figma_capture_ext_toolbar__";
 
 /** Cache: once the extension bridge times out, skip it for all subsequent images. */
 let bridgeUnavailable = false;
+let toolbarHideDepth = 0;
+let toolbarPreviousVisibility: string | null = null;
+let toolbarPreviousPointerEvents: string | null = null;
 
 // ---------------------------------------------------------------------------
 // CaptureError
@@ -457,9 +461,16 @@ function captureVisibleTabViaExtensionBridge(): Promise<Blob | null> {
 }
 
 async function captureViewportCrop(rect: Rect): Promise<Blob> {
-  const screenshot = await captureVisibleTabViaExtensionBridge();
-  if (!screenshot) {
-    throw new Error("Visible tab screenshot bridge is unavailable");
+  const restoreToolbar = hideToolbarForViewportCapture();
+  let screenshot: Blob | null = null;
+  try {
+    await waitForNextPaint();
+    screenshot = await captureVisibleTabViaExtensionBridge();
+    if (!screenshot) {
+      throw new Error("Visible tab screenshot bridge is unavailable");
+    }
+  } finally {
+    restoreToolbar();
   }
 
   const objectUrl = URL.createObjectURL(screenshot);
@@ -500,6 +511,37 @@ async function captureViewportCrop(rect: Rect): Promise<Blob> {
   } finally {
     URL.revokeObjectURL(objectUrl);
   }
+}
+
+function hideToolbarForViewportCapture(): () => void {
+  const toolbar = document.getElementById(H2D_TOOLBAR_HOST_ID);
+  if (!toolbar) return () => {};
+
+  if (toolbarHideDepth === 0) {
+    toolbarPreviousVisibility = toolbar.style.visibility;
+    toolbarPreviousPointerEvents = toolbar.style.pointerEvents;
+    toolbar.style.visibility = "hidden";
+    toolbar.style.pointerEvents = "none";
+  }
+  toolbarHideDepth += 1;
+
+  return () => {
+    toolbarHideDepth = Math.max(0, toolbarHideDepth - 1);
+    if (toolbarHideDepth !== 0) return;
+
+    toolbar.style.visibility = toolbarPreviousVisibility ?? "";
+    toolbar.style.pointerEvents = toolbarPreviousPointerEvents ?? "";
+    toolbarPreviousVisibility = null;
+    toolbarPreviousPointerEvents = null;
+  };
+}
+
+function waitForNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
 }
 
 /**
