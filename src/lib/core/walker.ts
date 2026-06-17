@@ -210,6 +210,16 @@ export function shouldPruneNode(
     if (!hasNonZeroChild) return true;
   }
 
+  if (
+    tag !== "HTML" &&
+    tag !== "BODY" &&
+    rect.width > 0 &&
+    rect.height > 0 &&
+    isFullyClippedByHorizontalScrollAncestor(element, rect)
+  ) {
+    return true;
+  }
+
   // Offscreen detection: element is entirely outside the full document bounds.
   // Use scrollWidth/scrollHeight (not viewport) so that content below the fold
   // is captured — the previous viewport-based check was clipping everything
@@ -276,6 +286,38 @@ function isSnapshotRectInBounds(
     rect.y + rect.height >= -OFFSCREEN_MARGIN &&
     rect.y <= docH + OFFSCREEN_MARGIN
   );
+}
+
+export function isFullyClippedByHorizontalScrollAncestor(
+  element: Element,
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (rect.width <= 0 || rect.height <= 0) return false;
+
+  const elementComputed = getComputedStyleFor(element);
+  if (elementComputed.position === "fixed") return false;
+
+  let ancestor = element.parentElement;
+  while (ancestor) {
+    if (isHorizontalScrollClipAncestor(ancestor)) {
+      const clip = ancestor.getBoundingClientRect();
+      if (clip.width > 0 && (rect.x + rect.width <= clip.left || rect.x >= clip.right)) {
+        return true;
+      }
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  return false;
+}
+
+function isHorizontalScrollClipAncestor(element: Element): boolean {
+  if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return false;
+  if (element.scrollWidth <= element.clientWidth + 1) return false;
+
+  const computed = getComputedStyleFor(element);
+  return /^(auto|scroll|hidden|clip)$/i.test(computed.overflowX) ||
+    /^(auto|scroll|hidden|clip)$/i.test(computed.overflow);
 }
 
 // ---------------------------------------------------------------------------

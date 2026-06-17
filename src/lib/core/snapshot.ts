@@ -9,7 +9,7 @@ import { bakeSvgStyles } from '../media/svg.js';
 import { resolveTransform, multiplyMatrices, getElementRect } from '../transform/matrix.js';
 import { extractComponentTree, findParentComponent } from '../react/tree.js';
 import { inferLayoutSizing } from './layout.js';
-import { NODE_TYPES, isNodeVisible, shouldPruneNode, iterateChildNodes, getTextRect, getElementAttributes, matrixToSimple, INPUT_TYPES_WITH_PLACEHOLDER } from './walker.js';
+import { NODE_TYPES, isNodeVisible, shouldPruneNode, iterateChildNodes, getTextRect, getElementAttributes, matrixToSimple, INPUT_TYPES_WITH_PLACEHOLDER, isFullyClippedByHorizontalScrollAncestor } from './walker.js';
 import { diffStyles, ensureFlexProps, ensureGridProps, ensureFlexItemProps } from './styles.js';
 import { prepareForCapture, decodeImages, assertLayoutValid, resetScrollbarState, cleanupScrollbar } from './prepare.js';
 import { getDeclaredLayoutStyles } from './declared.js';
@@ -506,6 +506,7 @@ function snapshotElement(
   let rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
+  stabilizeHorizontalScrolledTableViewport(element, computedStyles, childNodes, rect);
 
   // Prune invisible nodes (zero-size without children, offscreen, etc.)
   if (shouldPruneNode(element, rect, childNodes)) {
@@ -568,14 +569,25 @@ function ensureTopChromeTextStacking(element: Element, styles: Record<string, st
 function relaxVirtualScrollClipping(element: Element, styles: Record<string, string>): void {
   const computed = getComputedStyleFor(element);
   if (!isScrollableOverflow(computed)) return;
-  if (!hasNegativeVirtualScrollLayer(element) && !hasScrolledVisibleContent(element)) return;
+
+  const hasHorizontalScrollOffset = hasElementHorizontalScrollOffset(element);
+  const shouldRelaxVertical =
+    hasNegativeVirtualScrollLayer(element) ||
+    hasVerticallyScrolledVisibleContent(element);
+  if (!shouldRelaxVertical) return;
 
   // Some enterprise shells capture the current viewport by moving scrolled
   // content into negative coordinates. Figma can clip that offscreen parent
-  // frame before considering visible descendants, so only relax clipping for
-  // scroll viewports that still have visible descendants inside the viewport.
-  styles.overflow = "visible";
-  styles.overflowX = "visible";
+  // frame before considering visible descendants. Keep horizontal clipping for
+  // tables that are intentionally captured after horizontal scrolling; otherwise
+  // hidden columns leak back into the visible viewport and overlap sticky columns.
+  if (hasHorizontalScrollOffset) {
+    styles.overflow = "hidden";
+    styles.overflowX = computed.overflowX === "clip" ? "clip" : "hidden";
+  } else {
+    styles.overflow = "visible";
+    styles.overflowX = "visible";
+  }
   styles.overflowY = "visible";
 }
 
@@ -607,10 +619,18 @@ function hasNegativeVirtualScrollLayer(element: Element): boolean {
   return false;
 }
 
-function hasScrolledVisibleContent(element: Element): boolean {
+function hasElementHorizontalScrollOffset(element: Element): boolean {
+  return (
+    isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement") &&
+    element.scrollLeft > 0 &&
+    element.scrollWidth > element.clientWidth + 1
+  );
+}
+
+function hasVerticallyScrolledVisibleContent(element: Element): boolean {
   if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return false;
-  if (element.scrollTop <= 0 && element.scrollLeft <= 0) return false;
-  if (element.scrollHeight <= element.clientHeight && element.scrollWidth <= element.clientWidth) return false;
+  if (element.scrollTop <= 0) return false;
+  if (element.scrollHeight <= element.clientHeight + 1) return false;
 
   const viewportRect = element.getBoundingClientRect();
   if (viewportRect.width < 200 || viewportRect.height < 120) return false;
@@ -1070,11 +1090,29 @@ function appendStatusDistributionOverlays(rootSnapshot: ElementSnapshot, rootEle
   for (const bar of bars) {
     const overlay = createStatusBarSnapshot(bar, generateNodeId);
     overlay.attributes["data-h2d-status-overlay"] = "true";
-    overlay.styles.zIndex = "2147483646";
+    overlay.styles.zIndex = getStatusDistributionOverlayZIndex(bar.root);
     offsetSnapshotNode(overlay, offsetX, offsetY);
     anchorSnapshotToParent(overlay, rootSnapshot.rect);
     rootSnapshot.childNodes.push(overlay);
   }
+}
+
+function getStatusDistributionOverlayZIndex(root: Element): string {
+  let maxZIndex = 0;
+  let current: Element | null = root;
+
+  while (current) {
+    const computed = getComputedStyleFor(current);
+    const zIndex = parseInt(computed.zIndex || "", 10);
+    if (Number.isFinite(zIndex)) {
+      maxZIndex = Math.max(maxZIndex, zIndex);
+    }
+    current = current.parentElement;
+  }
+
+  // Keep the lifted status bar above normal table backgrounds and sticky cells,
+  // but below modal/drawer masks whose z-index is commonly 1000+.
+  return String(Math.min(Math.max(maxZIndex + 1, 4), 99));
 }
 
 function collectStatusDistributionBars(rootElement: Element): StatusDistributionBar[] {
@@ -1096,6 +1134,7 @@ function collectStatusDistributionBars(rootElement: Element): StatusDistribution
 function isElementVisibleInDocument(element: Element): boolean {
   const rect = element.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return false;
+  if (isFullyClippedByHorizontalScrollAncestor(element, rect)) return false;
   const computed = getComputedStyleFor(element);
   return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
 }
@@ -1309,6 +1348,102 @@ function getDirectTextNodes(element: Element): Node[] {
   }
 
   return textNodes;
+}
+
+function stabilizeHorizontalScrolledTableViewport(
+  element: Element,
+  styles: Record<string, string>,
+  childNodes: SnapshotNode[],
+  rect: ElementRect,
+): void {
+  if (!isHorizontalScrolledTableViewport(element, rect)) return;
+
+  const visibleCells = getVisibleTableCellSnapshots(element, childNodes);
+  if (visibleCells.length === 0) return;
+
+  childNodes.splice(0, childNodes.length, ...visibleCells);
+
+  styles.display = "block";
+  styles.position = styles.position && styles.position !== "static" ? styles.position : "relative";
+  styles.overflow = "hidden";
+  styles.overflowX = "hidden";
+  styles.overflowY = "hidden";
+  styles.width = `${roundPx(rect.width)}px`;
+  styles.height = `${roundPx(rect.height)}px`;
+  styles.boxSizing = "border-box";
+}
+
+function isHorizontalScrolledTableViewport(element: Element, rect: { width: number; height: number }): boolean {
+  if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return false;
+  if (element.scrollLeft <= 0 || element.scrollWidth <= element.clientWidth + 1) return false;
+  if (rect.width < 240 || rect.height < 80) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (!/^(auto|scroll|hidden|clip)$/i.test(computed.overflowX) && !/^(auto|scroll|hidden|clip)$/i.test(computed.overflow)) {
+    return false;
+  }
+
+  return Boolean(element.querySelector("table th, table td, [role=\"gridcell\"], [role=\"columnheader\"]"));
+}
+
+function getVisibleTableCellSnapshots(element: Element, childNodes: SnapshotNode[]): ElementSnapshot[] {
+  const snapshotById = new Map<string, ElementSnapshot>();
+  for (const child of childNodes) {
+    if (isElementNodeSnapshot(child)) {
+      collectElementSnapshotsById(child, snapshotById);
+    }
+  }
+
+  const viewportRect = element.getBoundingClientRect();
+  const entries: ElementSnapshot[] = [];
+  const seen = new Set<ElementSnapshot>();
+  const cells = Array.from(element.querySelectorAll("th, td, [role=\"gridcell\"], [role=\"columnheader\"]"));
+
+  for (const cell of cells) {
+    const id = getNodeId(cell);
+    if (!id) continue;
+
+    const snapshot = snapshotById.get(id);
+    if (!snapshot || seen.has(snapshot)) continue;
+    if (!isTableCellVisibleInScrollViewport(cell, viewportRect)) continue;
+
+    seen.add(snapshot);
+    entries.push(materializeVisibleTableCell(snapshot, viewportRect, cell));
+  }
+
+  return entries;
+}
+
+function isTableCellVisibleInScrollViewport(cell: Element, viewportRect: DOMRect): boolean {
+  const rect = cell.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  if (rect.right <= viewportRect.left || rect.left >= viewportRect.right) return false;
+  if (rect.bottom <= viewportRect.top || rect.top >= viewportRect.bottom) return false;
+
+  const computed = getComputedStyleFor(cell);
+  return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
+}
+
+function materializeVisibleTableCell(
+  cell: ElementSnapshot,
+  viewportRect: { x: number; y: number; width: number; height: number },
+  source: Element,
+): ElementSnapshot {
+  const computed = getComputedStyleFor(source);
+  const zIndex = parseInt(computed.zIndex || "", 10);
+
+  cell.tag = "DIV";
+  cell.styles.display = "block";
+  anchorSnapshotToParent(cell, viewportRect);
+
+  if (computed.position === "sticky" || computed.position === "fixed") {
+    const currentZIndex = parseInt(cell.styles.zIndex || "", 10);
+    if (!Number.isFinite(currentZIndex) || currentZIndex < 3) {
+      cell.styles.zIndex = Number.isFinite(zIndex) ? String(Math.max(3, zIndex)) : "3";
+    }
+  }
+
+  return cell;
 }
 
 function stabilizeTopChromeLayout(
@@ -2236,10 +2371,19 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
   node.styles.width = `${roundPx(node.rect.width)}px`;
   node.styles.height = `${roundPx(node.rect.height)}px`;
   node.styles.boxSizing = "border-box";
-  if (hasSnapshotChildOutsideRect(node)) {
-    node.styles.overflow = "visible";
-    node.styles.overflowX = "visible";
-    node.styles.overflowY = "visible";
+  const overflowAxes = getSnapshotChildOverflowAxes(node);
+  if (overflowAxes.x || overflowAxes.y) {
+    if (overflowAxes.x && !overflowAxes.y) {
+      node.styles.overflow = "hidden";
+      node.styles.overflowX = "hidden";
+    } else if (overflowAxes.y && !overflowAxes.x) {
+      node.styles.overflow = "hidden";
+      node.styles.overflowY = "visible";
+    } else {
+      node.styles.overflow = "hidden";
+      node.styles.overflowX = "hidden";
+      node.styles.overflowY = "visible";
+    }
   }
   node.layoutSizingHorizontal = "FIXED";
   node.layoutSizingVertical = "FIXED";
@@ -2256,30 +2400,23 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
 function rebaseNegativeScrollLayer(parent: ElementSnapshot, child: ElementSnapshot): void {
   if (!shouldRebaseNegativeScrollLayer(parent, child)) return;
 
-  if (child.rect.x < parent.rect.x) {
-    child.rect.x = parent.rect.x;
-    child.rect.cssWidth = Math.round(child.rect.width);
-  }
-
   if (child.rect.y < parent.rect.y) {
     child.rect.y = parent.rect.y;
     child.rect.height = Math.min(child.rect.height, parent.rect.height);
     child.rect.cssHeight = Math.round(child.rect.height);
   }
 
-  child.styles.overflow = "visible";
-  child.styles.overflowX = "visible";
+  child.styles.overflow = "hidden";
   child.styles.overflowY = "visible";
 }
 
 function shouldRebaseNegativeScrollLayer(parent: ElementSnapshot, child: ElementSnapshot): boolean {
   if (parent.rect.width < 200 || parent.rect.height < 120) return false;
 
-  const aboveOrLeft = child.rect.y < parent.rect.y - 8 || child.rect.x < parent.rect.x - 8;
-  if (!aboveOrLeft) return false;
+  const above = child.rect.y < parent.rect.y - 8;
+  if (!above) return false;
 
   const layerSized =
-    child.rect.width >= parent.rect.width * 0.5 ||
     child.rect.height >= parent.rect.height * 0.5;
   if (!layerSized) return false;
 
@@ -2303,8 +2440,17 @@ function hasSnapshotDescendantInsideRect(
   return false;
 }
 
-function hasSnapshotChildOutsideRect(node: ElementSnapshot): boolean {
-  return node.childNodes.some((child) => isSnapshotRectOutsideRect(child.rect, node.rect));
+function getSnapshotChildOverflowAxes(node: ElementSnapshot): { x: boolean; y: boolean } {
+  const axes = { x: false, y: false };
+
+  for (const child of node.childNodes) {
+    const childAxes = getSnapshotRectOverflowAxes(child.rect, node.rect);
+    axes.x ||= childAxes.x;
+    axes.y ||= childAxes.y;
+    if (axes.x && axes.y) break;
+  }
+
+  return axes;
 }
 
 function isSnapshotRectIntersectingRect(
@@ -2325,19 +2471,25 @@ function isSnapshotRectOutsideRect(
   child: { x: number; y: number; width: number; height: number },
   parent: { x: number; y: number; width: number; height: number },
 ): boolean {
-  if (child.width <= 0 || child.height <= 0) return false;
+  const axes = getSnapshotRectOverflowAxes(child, parent);
+  return axes.x || axes.y;
+}
+
+function getSnapshotRectOverflowAxes(
+  child: { x: number; y: number; width: number; height: number },
+  parent: { x: number; y: number; width: number; height: number },
+): { x: boolean; y: boolean } {
+  if (child.width <= 0 || child.height <= 0) return { x: false, y: false };
 
   const parentRight = parent.x + parent.width;
   const parentBottom = parent.y + parent.height;
   const childRight = child.x + child.width;
   const childBottom = child.y + child.height;
 
-  return (
-    child.x < parent.x ||
-    child.y < parent.y ||
-    childRight > parentRight ||
-    childBottom > parentBottom
-  );
+  return {
+    x: child.x < parent.x || childRight > parentRight,
+    y: child.y < parent.y || childBottom > parentBottom,
+  };
 }
 
 function roundPx(value: number): number {
