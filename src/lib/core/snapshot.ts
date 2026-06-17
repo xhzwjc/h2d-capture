@@ -180,6 +180,7 @@ async function captureDOMInner(
     const rootSnapshot = serialized as ElementSnapshot;
     normalizeElementCaptureOrigin(rootSnapshot, elementRect);
     appendStatusDistributionOverlays(rootSnapshot, element);
+    extendLeftSidebarBackgrounds(rootSnapshot, element, getCaptureScrollHeight(element, rootSnapshot));
     removeStackedSelectClones(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
@@ -229,6 +230,7 @@ async function captureDOMInner(
     }
     const rootSnapshot = serialized as ElementSnapshot;
     appendStatusDistributionOverlays(rootSnapshot, doc.documentElement);
+    extendLeftSidebarBackgrounds(rootSnapshot, doc.documentElement, getCaptureScrollHeight(doc.documentElement, rootSnapshot));
     removeStackedSelectClones(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
@@ -1096,6 +1098,102 @@ function isElementVisibleInDocument(element: Element): boolean {
   if (rect.width <= 0 || rect.height <= 0) return false;
   const computed = getComputedStyleFor(element);
   return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
+}
+
+function getCaptureScrollHeight(rootElement: Element, rootSnapshot: ElementSnapshot): number {
+  const doc = getNodeDocument(rootElement);
+  const view = getNodeWindow(rootElement);
+  return Math.max(
+    rootSnapshot.rect.height,
+    rootElement.scrollHeight,
+    doc.documentElement.scrollHeight,
+    doc.body?.scrollHeight || 0,
+    view.innerHeight,
+  );
+}
+
+function extendLeftSidebarBackgrounds(
+  rootSnapshot: ElementSnapshot,
+  rootElement: Element,
+  captureHeight: number,
+): void {
+  if (captureHeight <= rootSnapshot.rect.height + 4 && captureHeight <= getNodeWindow(rootElement).innerHeight + 4) {
+    return;
+  }
+
+  const snapshotById = new Map<string, ElementSnapshot>();
+  collectElementSnapshotsById(rootSnapshot, snapshotById);
+
+  const candidates = [rootElement, ...Array.from(rootElement.querySelectorAll("*"))];
+  for (const candidate of candidates) {
+    const id = getNodeId(candidate);
+    if (!id) continue;
+
+    const snapshot = snapshotById.get(id);
+    if (!snapshot || !isLeftSidebarBackgroundCandidate(candidate, snapshot, rootSnapshot, captureHeight)) {
+      continue;
+    }
+
+    const targetBottom = rootSnapshot.rect.y + captureHeight;
+    const targetHeight = targetBottom - snapshot.rect.y;
+    if (targetHeight <= snapshot.rect.height + 4) continue;
+
+    snapshot.rect.height = roundPx(targetHeight);
+    snapshot.rect.cssHeight = Math.round(snapshot.rect.height);
+    snapshot.styles.height = `${roundPx(snapshot.rect.height)}px`;
+    snapshot.styles.minHeight = `${roundPx(snapshot.rect.height)}px`;
+
+    const maxHeight = parsePx(snapshot.styles.maxHeight, NaN);
+    if (Number.isFinite(maxHeight) && maxHeight < snapshot.rect.height) {
+      delete snapshot.styles.maxHeight;
+    }
+  }
+}
+
+function collectElementSnapshotsById(node: ElementSnapshot, snapshots: Map<string, ElementSnapshot>): void {
+  snapshots.set(node.id, node);
+
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    collectElementSnapshotsById(child, snapshots);
+  }
+}
+
+function isLeftSidebarBackgroundCandidate(
+  element: Element,
+  snapshot: ElementSnapshot,
+  rootSnapshot: ElementSnapshot,
+  captureHeight: number,
+): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (tag === "HTML" || tag === "BODY") return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 48 || rect.width > 360 || rect.height < 240) return false;
+
+  const view = getNodeWindow(element);
+  if (captureHeight <= rect.height + 64) return false;
+  if (rect.height < view.innerHeight * 0.55 || rect.height > view.innerHeight + 96) return false;
+
+  if (snapshot.rect.x > rootSnapshot.rect.x + 8) return false;
+  if (snapshot.rect.y > rootSnapshot.rect.y + 32) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+  if (!hasExtendableSidebarPaint(computed)) return false;
+
+  const identity = getElementIdentity(element);
+  const looksLikeSidebar = /(^|[-_\s])(aside|sidebar|side-bar|sider|layout-sider|side-menu|el-menu|ant-menu|nav|menu)([-_\s]|$)/i.test(identity);
+  const pinnedToViewport = computed.position === "fixed" || computed.position === "sticky";
+  const fillsViewport = rect.height >= view.innerHeight * 0.85;
+
+  return looksLikeSidebar || pinnedToViewport || fillsViewport;
+}
+
+function hasExtendableSidebarPaint(computed: CSSStyleDeclaration): boolean {
+  if (computed.backgroundImage && computed.backgroundImage !== "none") return true;
+  if (!isVisiblePaint(computed.backgroundColor)) return false;
+  return !isNearWhitePaint(computed.backgroundColor);
 }
 
 function pruneStatusDistributionSnapshots(root: ElementSnapshot): void {
