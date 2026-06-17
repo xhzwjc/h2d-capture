@@ -4137,8 +4137,10 @@ function snapshotTextPseudoElement(element: Element, pseudo: "::before" | "::aft
   const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
   const width = getPseudoTextWidth(text, computed, fontSize);
   const height = Math.max(1, parsePx(computed.height, 0), lineHeight);
-  const rect = computePseudoTextRect(element, pseudo, hostRect, computed, width, height, fontSize);
+  const rect = computePseudoTextRect(element, pseudo, text, hostRect, computed, width, height, fontSize);
   const styles = getPseudoTextStyles(computed, fontSize, lineHeight);
+  styles.left = `${roundPx(rect.x - hostRect.x)}px`;
+  styles.top = `${roundPx(rect.y - hostRect.y)}px`;
 
   const textNode: TextSnapshot = {
     nodeType: Node.TEXT_NODE as 3,
@@ -4212,13 +4214,14 @@ function isLayoutOnlyDotPseudoText(
 function computePseudoTextRect(
   element: Element,
   pseudo: "::before" | "::after",
+  text: string,
   hostRect: DOMRect,
   computed: CSSStyleDeclaration,
   width: number,
   height: number,
   fontSize: number,
 ): DOMRect {
-  const inlineRect = computeInlinePseudoTextRect(element, pseudo, computed, width, height);
+  const inlineRect = computeInlinePseudoTextRect(element, pseudo, text, computed, width, height);
   if (inlineRect) return inlineRect;
 
   const marginLeft = parsePx(computed.marginLeft, 0);
@@ -4254,6 +4257,7 @@ function computePseudoTextRect(
 function computeInlinePseudoTextRect(
   element: Element,
   pseudo: "::before" | "::after",
+  text: string,
   computed: CSSStyleDeclaration,
   width: number,
   height: number,
@@ -4267,12 +4271,25 @@ function computeInlinePseudoTextRect(
   const marginLeft = parsePx(computed.marginLeft, 0);
   const marginRight = parsePx(computed.marginRight, 0);
   const marginTop = parsePx(computed.marginTop, 0);
+  const requiredAsteriskGap = isRequiredFormAsteriskPseudo(element, pseudo, text)
+    ? 4
+    : 0;
   const x = pseudo === "::before"
-    ? anchor.x - width - marginRight + marginLeft
+    ? anchor.x - width - marginRight - requiredAsteriskGap + marginLeft
     : anchor.right + marginLeft;
   const y = anchor.y + Math.max(0, (anchor.height - height) / 2) + marginTop;
 
   return new DOMRect(x, y, width, height);
+}
+
+function isRequiredFormAsteriskPseudo(element: Element, pseudo: "::before" | "::after", text: string): boolean {
+  if (pseudo !== "::before" || text.trim() !== "*") return false;
+
+  const identity = getElementIdentity(element);
+  const ancestor = element.closest(
+    ".el-form-item, .ant-form-item, .form-item, .el-form, .ant-form, form, [class~='form'], [class*='-form'], [class*='form-'], [class*='_form'], [class*='form_']",
+  );
+  return /(^|[-_\s])(label|form-item__label|form-label)([-_\s]|$)/i.test(identity) || Boolean(ancestor);
 }
 
 function getDirectChildVisualRects(element: Element): DOMRect[] {
