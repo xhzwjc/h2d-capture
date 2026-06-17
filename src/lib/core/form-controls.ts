@@ -1,6 +1,6 @@
 import type { ElementRect, ElementSnapshot, SnapshotNode, TextSnapshot } from '../types.js';
 import { getComputedStyleFor } from './dom.js';
-import { NODE_TYPES, isNodeVisible } from './walker.js';
+import { NODE_TYPES, getTextRect, isNodeVisible } from './walker.js';
 
 type IdFactory = (node: Node | null) => string;
 
@@ -21,6 +21,15 @@ interface SelectControl {
   arrow?: Element;
   arrowRect: DOMRect;
   arrowInside: boolean;
+}
+
+interface RadioControl {
+  root: Element;
+  input: HTMLInputElement;
+  iconElement: Element;
+  textNodes: Node[];
+  text: string;
+  checked: boolean;
 }
 
 const SELECT_ROOT_CLASS_PATTERN =
@@ -50,6 +59,13 @@ export function snapshotSelectControl(element: Element, createId: IdFactory): El
   return createSelectSnapshot(control, createId);
 }
 
+export function snapshotRadioControl(element: Element, createId: IdFactory): ElementSnapshot | null {
+  const control = detectRadioControl(element);
+  if (!control) return null;
+
+  return createRadioSnapshot(control, createId);
+}
+
 export function detectSelectControl(element: Element): SelectControl | null {
   const root = findSelectControlRoot(element);
   if (!root) return null;
@@ -76,6 +92,316 @@ export function detectSelectControl(element: Element): SelectControl | null {
     arrowRect,
     arrowInside: arrow ? isRectInside(arrow.getBoundingClientRect(), visualRect) : false,
   };
+}
+
+function detectRadioControl(element: Element): RadioControl | null {
+  if (!isRadioRootCandidate(element)) return null;
+
+  const input = getRadioInputs(element)[0];
+  if (!input) return null;
+
+  const iconElement = findRadioIconElement(element, input);
+  if (!iconElement) return null;
+
+  const iconRect = iconElement.getBoundingClientRect();
+  const rootRect = element.getBoundingClientRect();
+  if (rootRect.width <= 0 || rootRect.height <= 0 || iconRect.width <= 0 || iconRect.height <= 0) {
+    return null;
+  }
+
+  const textNodes = getRadioTextNodes(element, iconElement);
+  const text = textNodes.map((node) => node.textContent || "").join("").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+
+  return {
+    root: element,
+    input,
+    iconElement,
+    textNodes,
+    text,
+    checked: input.checked || input.hasAttribute("checked") || element.getAttribute("aria-checked") === "true",
+  };
+}
+
+function isRadioRootCandidate(element: Element): boolean {
+  if (!isNodeVisible(element)) return false;
+  if (element.tagName.toUpperCase() === "INPUT") return false;
+
+  const inputs = getRadioInputs(element);
+  if (inputs.length !== 1) return false;
+
+  const tag = element.tagName.toUpperCase();
+  const identity = getElementIdentity(element);
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  const isLabel = tag === "LABEL";
+  const hasRadioSignal = isLabel || role === "radio" || /(^|[-_\s])radio([-_\s]|$)/i.test(identity);
+  if (!hasRadioSignal) return false;
+
+  if (!isLabel && element.querySelector("label input[type='radio'], label input[type=\"radio\"]")) {
+    return false;
+  }
+
+  const nearestLabel = inputs[0].closest("label");
+  if (nearestLabel && nearestLabel !== element) return false;
+
+  return true;
+}
+
+function getRadioInputs(element: Element): HTMLInputElement[] {
+  return Array.from(element.querySelectorAll("input[type='radio'], input[type=\"radio\"]")) as HTMLInputElement[];
+}
+
+function findRadioIconElement(root: Element, input: HTMLInputElement): Element | null {
+  const sibling = input.nextElementSibling;
+  if (sibling && isRadioIconCandidate(sibling)) return sibling;
+
+  const parent = input.parentElement;
+  if (parent && parent !== root && isRadioIconCandidate(parent)) return parent;
+
+  for (const candidate of Array.from(root.querySelectorAll("*"))) {
+    if (candidate === input || candidate.contains(input)) continue;
+    if (isRadioIconCandidate(candidate)) return candidate;
+  }
+
+  return input;
+}
+
+function isRadioIconCandidate(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 8 || rect.height < 8 || rect.width > 28 || rect.height > 28) return false;
+
+  const computed = getComputedStyleFor(element);
+  const identity = getElementIdentity(element);
+  return (
+    /(^|[-_\s])radio([-_\s]|$)/i.test(identity) ||
+    hasVisibleRadius(computed) ||
+    isVisibleColor(computed.backgroundColor) ||
+    hasVisibleBorder(computed)
+  );
+}
+
+function getRadioTextNodes(root: Element, iconElement: Element): Node[] {
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes: Node[] = [];
+
+  let node = walker.nextNode();
+  while (node) {
+    const text = node.textContent || "";
+    const parent = node.parentElement;
+    if (
+      text.trim() &&
+      parent &&
+      !iconElement.contains(parent) &&
+      parent !== iconElement &&
+      isNodeVisible(parent)
+    ) {
+      nodes.push(node);
+    }
+    node = walker.nextNode();
+  }
+
+  return nodes;
+}
+
+function createRadioSnapshot(control: RadioControl, createId: IdFactory): ElementSnapshot {
+  const rootRect = control.root.getBoundingClientRect();
+  const iconSourceRect = control.iconElement.getBoundingClientRect();
+  const rootComputed = getComputedStyleFor(control.root);
+  const iconComputed = getComputedStyleFor(control.iconElement);
+  const textRectData = getTextRect(control.textNodes);
+  const textRect = new DOMRect(textRectData.x, textRectData.y, textRectData.width, textRectData.height);
+  const iconRect = normalizeRadioIconRect(iconSourceRect);
+  const checkedColor = getRadioCheckedColor(iconComputed, rootComputed);
+  const uncheckedBorder = hasVisibleBorder(iconComputed)
+    ? firstVisibleColor(
+      iconComputed.borderTopColor,
+      iconComputed.borderRightColor,
+      iconComputed.borderBottomColor,
+      iconComputed.borderLeftColor,
+      "rgb(217, 217, 217)",
+    )
+    : "rgb(217, 217, 217)";
+  const checkedUsesFilledOuter = control.checked && isVisibleColor(iconComputed.backgroundColor) && !isNearWhiteColor(iconComputed.backgroundColor);
+  const outerBackground = control.checked && checkedUsesFilledOuter ? checkedColor : "rgb(255, 255, 255)";
+  const innerColor = checkedUsesFilledOuter ? "rgb(255, 255, 255)" : checkedColor;
+  const innerSize = Math.max(5, Math.round(iconRect.width * 0.38));
+  const outerRadius = `${roundPx(iconRect.width / 2)}px`;
+  const innerRadius = `${roundPx(innerSize / 2)}px`;
+
+  const outer: ElementSnapshot = {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(control.iconElement),
+    tag: "DIV",
+    attributes: { "data-h2d-radio-icon": control.checked ? "checked" : "unchecked" },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: `${roundPx(iconRect.x - rootRect.x)}px`,
+      top: `${roundPx(iconRect.y - rootRect.y)}px`,
+      width: `${roundPx(iconRect.width)}px`,
+      height: `${roundPx(iconRect.height)}px`,
+      boxSizing: "border-box",
+      borderRadius: outerRadius,
+      borderTopLeftRadius: outerRadius,
+      borderTopRightRadius: outerRadius,
+      borderBottomRightRadius: outerRadius,
+      borderBottomLeftRadius: outerRadius,
+      backgroundColor: outerBackground,
+      borderTopWidth: "1px",
+      borderRightWidth: "1px",
+      borderBottomWidth: "1px",
+      borderLeftWidth: "1px",
+      borderTopStyle: "solid",
+      borderRightStyle: "solid",
+      borderBottomStyle: "solid",
+      borderLeftStyle: "solid",
+      borderTopColor: control.checked ? checkedColor : uncheckedBorder,
+      borderRightColor: control.checked ? checkedColor : uncheckedBorder,
+      borderBottomColor: control.checked ? checkedColor : uncheckedBorder,
+      borderLeftColor: control.checked ? checkedColor : uncheckedBorder,
+      overflow: "hidden",
+    },
+    rect: toElementRect(iconRect),
+    childNodes: [],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+
+  if (control.checked) {
+    const innerRect = new DOMRect(
+      iconRect.x + (iconRect.width - innerSize) / 2,
+      iconRect.y + (iconRect.height - innerSize) / 2,
+      innerSize,
+      innerSize,
+    );
+    outer.childNodes.push({
+      nodeType: NODE_TYPES.ELEMENT_NODE,
+      id: createId(null),
+      tag: "DIV",
+      attributes: { "data-h2d-radio-inner": "true" },
+      styles: {
+        display: "block",
+        position: "absolute",
+        left: `${roundPx(innerRect.x - iconRect.x)}px`,
+        top: `${roundPx(innerRect.y - iconRect.y)}px`,
+        width: `${roundPx(innerRect.width)}px`,
+        height: `${roundPx(innerRect.height)}px`,
+        borderRadius: innerRadius,
+        borderTopLeftRadius: innerRadius,
+        borderTopRightRadius: innerRadius,
+        borderBottomRightRadius: innerRadius,
+        borderBottomLeftRadius: innerRadius,
+        backgroundColor: innerColor,
+        boxSizing: "border-box",
+      },
+      rect: toElementRect(innerRect),
+      childNodes: [],
+      layoutSizingHorizontal: "FIXED",
+      layoutSizingVertical: "FIXED",
+    });
+  }
+
+  const textNode: TextSnapshot = {
+    nodeType: NODE_TYPES.TEXT_NODE,
+    id: createId(control.textNodes.length === 1 ? control.textNodes[0] : null),
+    text: control.text,
+    rect: {
+      x: textRect.x,
+      y: textRect.y,
+      width: textRect.width,
+      height: textRect.height,
+    },
+    lineCount: Math.max(1, textRectData.lineCount),
+  };
+
+  const textComputed = control.textNodes[0]?.parentElement
+    ? getComputedStyleFor(control.textNodes[0].parentElement)
+    : rootComputed;
+  const textLayer: ElementSnapshot = {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-radio-text": "true" },
+    styles: {
+      display: "block",
+      position: "absolute",
+      left: `${roundPx(textRect.x - rootRect.x)}px`,
+      top: `${roundPx(textRect.y - rootRect.y)}px`,
+      width: `${roundPx(textRect.width)}px`,
+      height: `${roundPx(textRect.height)}px`,
+      overflow: "visible",
+      color: firstVisibleColor(textComputed.color, rootComputed.color, "rgb(31, 35, 41)"),
+      fontFamily: textComputed.fontFamily || rootComputed.fontFamily,
+      fontSize: textComputed.fontSize || rootComputed.fontSize,
+      fontWeight: textComputed.fontWeight || rootComputed.fontWeight,
+      lineHeight: `${roundPx(textRect.height)}px`,
+      whiteSpace: "nowrap",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(textRect),
+    childNodes: [textNode],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: createId(control.root),
+    tag: "DIV",
+    attributes: {
+      "data-h2d-radio-control": "true",
+      role: "radio",
+      "aria-checked": control.checked ? "true" : "false",
+    },
+    styles: {
+      display: "block",
+      position: "relative",
+      width: `${roundPx(rootRect.width)}px`,
+      height: `${roundPx(rootRect.height)}px`,
+      overflow: "visible",
+      boxSizing: "border-box",
+      color: rootComputed.color,
+      fontFamily: rootComputed.fontFamily,
+      fontSize: rootComputed.fontSize,
+      fontWeight: rootComputed.fontWeight,
+      lineHeight: rootComputed.lineHeight,
+    },
+    rect: toElementRect(rootRect),
+    childNodes: [outer, textLayer],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function normalizeRadioIconRect(rect: DOMRect): DOMRect {
+  const size = clamp(Math.max(rect.width, rect.height), 10, 18);
+  return new DOMRect(
+    rect.x + (rect.width - size) / 2,
+    rect.y + (rect.height - size) / 2,
+    size,
+    size,
+  );
+}
+
+function getRadioCheckedColor(iconComputed: CSSStyleDeclaration, rootComputed: CSSStyleDeclaration): string {
+  const visibleBorderColor = hasVisibleBorder(iconComputed)
+    ? firstVisibleColor(
+      iconComputed.borderTopColor,
+      iconComputed.borderRightColor,
+      iconComputed.borderBottomColor,
+      iconComputed.borderLeftColor,
+    )
+    : "";
+  const controlColor = isLikelyAccentColor(iconComputed.color) ? iconComputed.color : "";
+  const inheritedColor = isLikelyAccentColor(rootComputed.color) ? rootComputed.color : "";
+
+  return firstVisibleColor(
+    !isNearWhiteColor(iconComputed.backgroundColor) ? iconComputed.backgroundColor : "",
+    visibleBorderColor,
+    controlColor,
+    inheritedColor,
+    "rgb(0, 143, 80)",
+  );
 }
 
 function findSelectControlRoot(element: Element): Element | null {
@@ -416,6 +742,8 @@ function isNonSelectPickerCandidate(element: Element): boolean {
     return true;
   }
 
+  if (isUploadLikeControl(element)) return true;
+
   if (isCompactMediaDropdown(element)) return true;
 
   if (isInsideDateTimePicker(element)) return true;
@@ -433,6 +761,19 @@ function isNonSelectPickerCandidate(element: Element): boolean {
     (element.querySelector("img, picture, canvas") || /avatar|user/i.test(element.innerHTML));
 
   return Boolean(hasOnlyMediaAndArrow);
+}
+
+function isUploadLikeControl(element: Element): boolean {
+  if (element.querySelector("input[type='file'], input[type=\"file\"]")) return true;
+
+  const identity = getElementIdentity(element);
+  const text = (element.textContent || "").replace(/\s+/g, "");
+  if (!text) return false;
+
+  const hasUploadIdentity = /(^|[-_\s])(upload|uploader|file-upload|attachment)([-_\s]|$)/i.test(identity);
+  const hasUploadText = /点击上传|上传文件|选择文件|upload/i.test(text);
+  const hasHelperText = /Excel|文件|表格|合并|分别上传|format/i.test(text);
+  return hasUploadText && (hasUploadIdentity || hasHelperText);
 }
 
 function isCompactMediaDropdown(element: Element): boolean {
@@ -883,6 +1224,27 @@ function hasVisibleRadius(computed: CSSStyleDeclaration): boolean {
 
 function isVisibleColor(color: string): boolean {
   return Boolean(color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)");
+}
+
+function isNearWhiteColor(color: string): boolean {
+  const channels = parseRgbChannels(color);
+  if (!channels) return false;
+
+  const [red, green, blue, alpha] = channels;
+  if (alpha != null && alpha < 0.1) return false;
+  return red >= 245 && green >= 245 && blue >= 245;
+}
+
+function isLikelyAccentColor(color: string): boolean {
+  const channels = parseRgbChannels(color);
+  if (!channels) return false;
+
+  const [red, green, blue, alpha] = channels;
+  if (alpha != null && alpha < 0.2) return false;
+
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  return max - min >= 32 && max >= 96;
 }
 
 function getBackgroundColor(computed: CSSStyleDeclaration): string {

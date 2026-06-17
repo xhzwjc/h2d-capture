@@ -9,12 +9,12 @@ import { bakeSvgStyles } from '../media/svg.js';
 import { resolveTransform, multiplyMatrices, getElementRect } from '../transform/matrix.js';
 import { extractComponentTree, findParentComponent } from '../react/tree.js';
 import { inferLayoutSizing } from './layout.js';
-import { NODE_TYPES, isNodeVisible, shouldPruneNode, iterateChildNodes, getTextRect, getElementAttributes, matrixToSimple, INPUT_TYPES_WITH_PLACEHOLDER, isFullyClippedByHorizontalScrollAncestor } from './walker.js';
+import { NODE_TYPES, isNodeVisible, shouldPruneNode, iterateChildNodes, getTextRect, getElementAttributes, matrixToSimple, INPUT_TYPES_WITH_PLACEHOLDER, isFullyClippedByHorizontalScrollAncestor, isFullyClippedByVerticalOverlayScrollAncestor, isVerticalOverlayScrollClipAncestor } from './walker.js';
 import { diffStyles, ensureFlexProps, ensureGridProps, ensureFlexItemProps } from './styles.js';
 import { prepareForCapture, decodeImages, assertLayoutValid, resetScrollbarState, cleanupScrollbar } from './prepare.js';
 import { getDeclaredLayoutStyles } from './declared.js';
 import { getComputedStyleFor, getNodeDocument, getNodeWindow, isInstanceOfOwner } from './dom.js';
-import { resetFormControlDebugState, snapshotSelectControl } from './form-controls.js';
+import { resetFormControlDebugState, snapshotRadioControl, snapshotSelectControl } from './form-controls.js';
 import type {
   CaptureTree,
   SnapshotNode,
@@ -381,6 +381,11 @@ function snapshotElement(
     return statusDistributionSnapshot;
   }
 
+  const radioControlSnapshot = snapshotRadioControl(element, generateNodeId);
+  if (radioControlSnapshot) {
+    return radioControlSnapshot;
+  }
+
   const selectControlSnapshot = snapshotSelectControl(element, generateNodeId);
   if (selectControlSnapshot) {
     return selectControlSnapshot;
@@ -506,6 +511,7 @@ function snapshotElement(
   let rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
+  const verticalScrollViewportStabilized = stabilizeVerticalOverlayScrollViewport(element, computedStyles, childNodes, rect);
   stabilizeHorizontalScrolledTableViewport(element, computedStyles, childNodes, rect);
 
   // Prune invisible nodes (zero-size without children, offscreen, etc.)
@@ -520,7 +526,7 @@ function snapshotElement(
     nodeType: Node.ELEMENT_NODE as 1,
     id: generateNodeId(element),
     tag: expandedIframe ? "DIV" : tag,
-    attributes: getElementAttributes(element),
+    attributes: getSnapshotElementAttributes(element, verticalScrollViewportStabilized),
     styles: computedStyles,
     rect,
     childNodes,
@@ -540,6 +546,119 @@ function snapshotElement(
   }
 
   return node;
+}
+
+function getSnapshotElementAttributes(element: Element, forceVerticalScrollViewport = false): Record<string, string> {
+  const attributes = getElementAttributes(element);
+  if (forceVerticalScrollViewport || isVerticalOverlayScrollClipAncestor(element)) {
+    attributes["data-h2d-vertical-scroll-viewport"] = "true";
+  }
+  return attributes;
+}
+
+function stabilizeVerticalOverlayScrollViewport(
+  element: Element,
+  styles: Record<string, string>,
+  childNodes: SnapshotNode[],
+  rect: ElementRect,
+): boolean {
+  if (rect.width < 200 || rect.height < 120) return false;
+  if (element.tagName.toUpperCase() === "HTML" || element.tagName.toUpperCase() === "BODY") return false;
+
+  const computed = getComputedStyleFor(element);
+  if (!isScrollableOverflow(computed)) return false;
+
+  const isOverlayScroll = isVerticalOverlayScrollClipAncestor(element);
+  const isNegativeLayerScroll = hasNegativeScrolledViewportLayer(childNodes, rect);
+  if (!isOverlayScroll && !isNegativeLayerScroll) return false;
+
+  let rebased = false;
+  for (const child of childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (child.rect.y >= rect.y - 8) continue;
+    if (child.rect.height < rect.height * 0.5) continue;
+    if (!hasSnapshotDescendantInsideRect(child.childNodes, rect)) continue;
+
+    child.rect.y = rect.y;
+    child.rect.height = Math.min(child.rect.height, rect.height);
+    child.rect.cssHeight = Math.round(child.rect.height);
+    child.styles.overflow = "hidden";
+    child.styles.overflowY = "visible";
+    rebaseNestedVisibleScrollLayers(child, rect);
+    rebased = true;
+  }
+
+  if (!rebased) return false;
+  styles.overflow = "hidden";
+  styles.overflowX = "hidden";
+  styles.overflowY = "hidden";
+  return true;
+}
+
+function hasNegativeScrolledViewportLayer(
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  return childNodes.some((child) => {
+    if (!isElementNodeSnapshot(child)) return false;
+    if (child.rect.y >= rect.y - 8) return false;
+    if (child.rect.height < rect.height * 0.5) return false;
+    return hasSnapshotDescendantInsideRect(child.childNodes, rect);
+  });
+}
+
+function rebaseNestedVisibleScrollLayers(
+  node: ElementSnapshot,
+  viewportRect: { x: number; y: number; width: number; height: number },
+): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (
+      child.rect.y < viewportRect.y - 1 &&
+      child.rect.y + child.rect.height > viewportRect.y &&
+      hasSnapshotDescendantInsideRect(child.childNodes, viewportRect)
+    ) {
+      const visibleTop = getSnapshotDescendantTopInsideRect(child.childNodes, viewportRect);
+      const topInset = getSnapshotTopInset(child);
+      const targetY = Number.isFinite(visibleTop)
+        ? Math.max(child.rect.y, Math.min(viewportRect.y, visibleTop - topInset))
+        : viewportRect.y;
+      if (targetY > child.rect.y + 0.5) {
+        const delta = targetY - child.rect.y;
+        child.rect.y = roundPx(targetY);
+        child.rect.height = roundPx(Math.max(0, child.rect.height - delta));
+        child.rect.cssHeight = Math.round(child.rect.height);
+      }
+
+      child.styles.overflow = "visible";
+      child.styles.overflowY = "visible";
+    }
+
+    rebaseNestedVisibleScrollLayers(child, viewportRect);
+  }
+}
+
+function getSnapshotDescendantTopInsideRect(
+  childNodes: SnapshotNode[],
+  rect: { x: number; y: number; width: number; height: number },
+): number {
+  let top = Number.POSITIVE_INFINITY;
+
+  for (const child of childNodes) {
+    if (isSnapshotRectIntersectingRect(child.rect, rect)) {
+      top = Math.min(top, child.rect.y);
+    }
+    if (child.nodeType === NODE_TYPES.ELEMENT_NODE) {
+      top = Math.min(top, getSnapshotDescendantTopInsideRect(child.childNodes, rect));
+    }
+  }
+
+  return top;
+}
+
+function getSnapshotTopInset(node: ElementSnapshot): number {
+  return parsePx(node.styles.paddingTop || "", 0) + parsePx(node.styles.borderTopWidth || "", 0);
 }
 
 function ensurePositionForZIndex(styles: Record<string, string>): void {
@@ -569,6 +688,7 @@ function ensureTopChromeTextStacking(element: Element, styles: Record<string, st
 function relaxVirtualScrollClipping(element: Element, styles: Record<string, string>): void {
   const computed = getComputedStyleFor(element);
   if (!isScrollableOverflow(computed)) return;
+  if (isVerticalOverlayScrollClipAncestor(element)) return;
 
   const hasHorizontalScrollOffset = hasElementHorizontalScrollOffset(element);
   const shouldRelaxVertical =
@@ -1135,6 +1255,7 @@ function isElementVisibleInDocument(element: Element): boolean {
   const rect = element.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return false;
   if (isFullyClippedByHorizontalScrollAncestor(element, rect)) return false;
+  if (isFullyClippedByVerticalOverlayScrollAncestor(element, rect)) return false;
   const computed = getComputedStyleFor(element);
   return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
 }
@@ -1967,10 +2088,11 @@ function snapshotPaintPseudoElement(element: Element, pseudo: "::before" | "::af
 
 function isPaintPseudoCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
   const hostTag = element.tagName.toUpperCase();
-  if (hostTag !== "I" && hostTag !== "SPAN") return false;
+  const isIconHost = hostTag === "I" || hostTag === "SPAN";
+  if (!isIconHost && !isSmallMarkerPseudoCandidate(element, computed)) return false;
 
   const hostRect = element.getBoundingClientRect();
-  if (hostRect.width > 48 || hostRect.height > 48) return false;
+  if (isIconHost && (hostRect.width > 48 || hostRect.height > 48)) return false;
 
   const text = parseCssTextContent(computed.content);
   if (text && text.trim()) return false;
@@ -1985,6 +2107,22 @@ function isPaintPseudoCandidate(element: Element, computed: CSSStyleDeclaration)
   }
 
   return isVisiblePaint(computed.backgroundColor) || hasVisibleBorderStyles(computed);
+}
+
+function isSmallMarkerPseudoCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 || hostRect.height <= 0 || hostRect.height > 80) return false;
+
+  const width = parsePx(computed.width, NaN);
+  const height = parsePx(computed.height, NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
+  if (width <= 0 || height <= 0 || width > 10 || height > 36) return false;
+  if (!isVisiblePaint(computed.backgroundColor) && !hasVisibleBorderStyles(computed)) return false;
+
+  const left = parsePx(computed.left, NaN);
+  const top = parsePx(computed.top, NaN);
+  const bottom = parsePx(computed.bottom, NaN);
+  return Number.isFinite(left) || Number.isFinite(top) || Number.isFinite(bottom) || computed.position === "absolute";
 }
 
 function computePaintPseudoRect(
@@ -2372,7 +2510,12 @@ function lockSnapshotGeometry(node: SnapshotNode, parentRect: { x: number; y: nu
   node.styles.height = `${roundPx(node.rect.height)}px`;
   node.styles.boxSizing = "border-box";
   const overflowAxes = getSnapshotChildOverflowAxes(node);
-  if (overflowAxes.x || overflowAxes.y) {
+  const isVerticalOverlayScrollViewport = node.attributes["data-h2d-vertical-scroll-viewport"] === "true";
+  if (isVerticalOverlayScrollViewport) {
+    node.styles.overflow = "hidden";
+    node.styles.overflowX = "hidden";
+    node.styles.overflowY = "hidden";
+  } else if (overflowAxes.x || overflowAxes.y) {
     if (overflowAxes.x && !overflowAxes.y) {
       node.styles.overflow = "hidden";
       node.styles.overflowX = "hidden";

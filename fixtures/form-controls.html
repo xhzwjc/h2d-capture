@@ -642,6 +642,149 @@
         font-size: 14px;
         line-height: 32px;
       }
+
+      .radio-row {
+        display: inline-flex;
+        grid-column: 1 / -1;
+        align-items: center;
+        gap: 8px;
+        height: 24px;
+        color: rgba(0, 0, 0, 0.88);
+        font-size: 14px;
+      }
+
+      .ant-radio-wrapper {
+        position: relative;
+        display: inline-flex;
+        align-items: flex-start;
+        height: 22px;
+        color: rgba(0, 0, 0, 0.88);
+        line-height: 22px;
+      }
+
+      .ant-radio {
+        position: relative;
+        display: block;
+        width: 16px;
+        height: 16px;
+        margin-top: 3px;
+      }
+
+      .ant-radio input {
+        position: absolute;
+        inset: 0;
+        width: 16px;
+        height: 16px;
+        margin: 0;
+        opacity: 0;
+      }
+
+      .ant-radio-inner {
+        position: relative;
+        display: block;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: rgb(255, 255, 255);
+      }
+
+      .ant-radio-checked .ant-radio-inner {
+        background: rgb(0, 143, 80);
+      }
+
+      .ant-radio-checked .ant-radio-inner::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: rgb(255, 255, 255);
+        transform: scale(0.375);
+      }
+
+      .ant-radio-label {
+        display: block;
+        padding-left: 8px;
+        white-space: nowrap;
+      }
+
+      .fixture-drawer {
+        position: fixed;
+        z-index: 1100;
+        right: 0;
+        top: 0;
+        width: 560px;
+        height: 520px;
+        border-left: 1px solid #e5e6eb;
+        background: #fff;
+        box-shadow: -8px 0 18px rgba(0, 0, 0, 0.08);
+      }
+
+      .fixture-drawer-header,
+      .fixture-drawer-footer {
+        height: 52px;
+        padding: 0 20px;
+        border-bottom: 1px solid #eef0f3;
+        color: #1d2129;
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 52px;
+      }
+
+      .fixture-drawer-footer {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        border-top: 1px solid #eef0f3;
+        border-bottom: 0;
+        text-align: right;
+      }
+
+      .fixture-drawer-body {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 52px;
+        bottom: 52px;
+        overflow: auto;
+        padding: 18px 20px;
+      }
+
+      .drawer-step {
+        height: 220px;
+        margin-bottom: 20px;
+        border-radius: 4px;
+        background: #f2f3f5;
+        color: #4e5969;
+        line-height: 220px;
+        text-align: center;
+      }
+
+      .drawer-result {
+        width: 100%;
+        border-collapse: collapse;
+        color: #1d2129;
+        font-size: 14px;
+      }
+
+      .drawer-result th,
+      .drawer-result td {
+        height: 48px;
+        border-bottom: 1px solid #e5e6eb;
+        text-align: left;
+      }
+
+      .drawer-bottom-marker {
+        display: inline-flex;
+        align-items: center;
+        height: 24px;
+        padding: 0 8px;
+        border-radius: 4px;
+        background: rgb(0, 143, 80);
+        color: #fff;
+      }
     </style>
   </head>
   <body>
@@ -828,6 +971,23 @@
           </div>
         </div>
 
+        <div class="radio-row">
+          <label class="ant-radio-wrapper">
+            <span class="ant-radio ant-radio-checked">
+              <input type="radio" checked value="0" />
+              <span class="ant-radio-inner"></span>
+            </span>
+            <span class="ant-radio-label">连续劳务多个税计算规则</span>
+          </label>
+          <label class="ant-radio-wrapper">
+            <span class="ant-radio">
+              <input type="radio" value="1" />
+              <span class="ant-radio-inner"></span>
+            </span>
+            <span class="ant-radio-label">个人薪金所得个税计算规则</span>
+          </label>
+        </div>
+
         <div class="field italent-like-field">
           <label>iTalent 下拉</label>
           <div class="italent-select-shell">
@@ -853,8 +1013,38 @@
         </div>
       </section>
     </main>
+    <aside class="fixture-drawer">
+      <div class="fixture-drawer-header">税金试算</div>
+      <div class="fixture-drawer-body" id="fixture-drawer-body">
+        <div class="drawer-step">第一步：选择结算运营主体</div>
+        <div class="drawer-step">第二步：个税计算规则</div>
+        <table class="drawer-result">
+          <thead>
+            <tr>
+              <th>试算任务编号</th>
+              <th>试算状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>SR-584954732930...</td>
+              <td>试算成功</td>
+              <td><span class="drawer-bottom-marker">下载明细</span></td>
+            </tr>
+            <tr>
+              <td>SR-576610368290...</td>
+              <td>试算成功</td>
+              <td><span class="drawer-bottom-marker">下载明细</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="fixture-drawer-footer">去结算</div>
+    </aside>
     <script>
       document.getElementById("fixture-page-jump").value = "3";
+      document.getElementById("fixture-drawer-body").scrollTop = 360;
     </script>
   </body>
 </html>

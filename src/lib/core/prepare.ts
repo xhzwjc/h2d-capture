@@ -106,6 +106,12 @@ const MAX_SCROLL_HEIGHT = 15000;
 /** Max number of scroll steps to keep capture time reasonable */
 const MAX_SCROLL_STEPS = 25;
 
+interface ElementScrollPosition {
+  element: Element;
+  left: number;
+  top: number;
+}
+
 /**
  * Scroll through the entire page top-to-bottom to trigger
  * IntersectionObserver-based lazy loading.
@@ -270,6 +276,7 @@ export async function prepareForCapture(container: Element): Promise<void> {
   const isRoot =
     container === document.documentElement || container === document.body;
   const originalScroll = getScrollPosition(container, isRoot);
+  const nestedScrollPositions = collectNestedScrollPositions(container);
 
   // Install before any scrolling so pages with `scroll-behavior: smooth` do
   // not leave sticky headers mid-transition when snapshotting starts.
@@ -289,8 +296,37 @@ export async function prepareForCapture(container: Element): Promise<void> {
   } else {
     setElementScroll(container, originalScroll.left, originalScroll.top);
   }
+  restoreNestedScrollPositions(nestedScrollPositions);
   await waitForScrollPosition(container, isRoot, originalScroll.left, originalScroll.top);
+  restoreNestedScrollPositions(nestedScrollPositions);
 
   // Wait for layout to settle
   await new Promise((r) => setTimeout(r, 100));
+  restoreNestedScrollPositions(nestedScrollPositions);
+}
+
+function collectNestedScrollPositions(container: Element): ElementScrollPosition[] {
+  const positions: ElementScrollPosition[] = [];
+  const elements = [container, ...Array.from(container.querySelectorAll("*"))];
+
+  for (const element of elements) {
+    if (element === document.documentElement || element === document.body) continue;
+    if (!(element instanceof HTMLElement)) continue;
+
+    const left = element.scrollLeft;
+    const top = element.scrollTop;
+    if (Math.abs(left) <= 1 && Math.abs(top) <= 1) continue;
+
+    positions.push({ element, left, top });
+  }
+
+  return positions;
+}
+
+function restoreNestedScrollPositions(positions: ElementScrollPosition[]): void {
+  for (const { element, left, top } of positions) {
+    if (!element.isConnected) continue;
+    element.scrollLeft = left;
+    element.scrollTop = top;
+  }
 }

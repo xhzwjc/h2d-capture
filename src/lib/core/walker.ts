@@ -215,7 +215,8 @@ export function shouldPruneNode(
     tag !== "BODY" &&
     rect.width > 0 &&
     rect.height > 0 &&
-    isFullyClippedByHorizontalScrollAncestor(element, rect)
+    (isFullyClippedByHorizontalScrollAncestor(element, rect) ||
+      isFullyClippedByVerticalOverlayScrollAncestor(element, rect))
   ) {
     return true;
   }
@@ -311,6 +312,42 @@ export function isFullyClippedByHorizontalScrollAncestor(
   return false;
 }
 
+export function isFullyClippedByVerticalOverlayScrollAncestor(
+  element: Element,
+  rect: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (rect.width <= 0 || rect.height <= 0) return false;
+
+  const elementComputed = getComputedStyleFor(element);
+  if (elementComputed.position === "fixed") return false;
+
+  let ancestor = element.parentElement;
+  while (ancestor) {
+    if (isVerticalOverlayScrollClipAncestor(ancestor)) {
+      const clip = ancestor.getBoundingClientRect();
+      if (clip.height > 0 && (rect.y + rect.height <= clip.top || rect.y >= clip.bottom)) {
+        return true;
+      }
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  return false;
+}
+
+export function isVerticalOverlayScrollClipAncestor(element: Element): boolean {
+  if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return false;
+  if (element.tagName.toUpperCase() === "HTML" || element.tagName.toUpperCase() === "BODY") return false;
+  if (element.scrollHeight <= element.clientHeight + 1) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (!/^(auto|scroll|hidden|clip)$/i.test(computed.overflowY) && !/^(auto|scroll|hidden|clip)$/i.test(computed.overflow)) {
+    return false;
+  }
+
+  return isOverlayScrollIdentity(element) || isInsideOverlayShell(element) || isFixedOverlayScrollContainer(element);
+}
+
 function isHorizontalScrollClipAncestor(element: Element): boolean {
   if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return false;
   if (element.scrollWidth <= element.clientWidth + 1) return false;
@@ -318,6 +355,47 @@ function isHorizontalScrollClipAncestor(element: Element): boolean {
   const computed = getComputedStyleFor(element);
   return /^(auto|scroll|hidden|clip)$/i.test(computed.overflowX) ||
     /^(auto|scroll|hidden|clip)$/i.test(computed.overflow);
+}
+
+function isOverlayScrollIdentity(element: Element): boolean {
+  const identity = getElementIdentity(element);
+  return /(^|[-_\s])(drawer|modal|dialog|sheet|slideover|slide-over|side-panel|side-drawer|overlay|popup)([-_\s]|$)/i.test(identity);
+}
+
+function isInsideOverlayShell(element: Element): boolean {
+  let ancestor = element.parentElement;
+  let depth = 0;
+  while (ancestor && depth < 6) {
+    if (isOverlayScrollIdentity(ancestor)) return true;
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+  return false;
+}
+
+function isFixedOverlayScrollContainer(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  const view = getNodeWindow(element);
+  if (rect.width < 320 || rect.height < view.innerHeight * 0.45) return false;
+  if (rect.x < view.innerWidth * 0.25 && rect.width < view.innerWidth * 0.9) return false;
+
+  let current: Element | null = element;
+  let depth = 0;
+  while (current && depth < 5) {
+    const computed = getComputedStyleFor(current);
+    const zIndex = parseInt(computed.zIndex || "", 10);
+    if (computed.position === "fixed" && (!Number.isFinite(zIndex) || zIndex >= 10)) {
+      return true;
+    }
+    current = current.parentElement;
+    depth += 1;
+  }
+
+  return false;
+}
+
+function getElementIdentity(element: Element): string {
+  return `${String((element as HTMLElement | SVGElement).className || "")} ${element.id || ""} ${element.getAttribute("role") || ""}`;
 }
 
 // ---------------------------------------------------------------------------
