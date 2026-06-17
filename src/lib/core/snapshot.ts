@@ -1736,6 +1736,10 @@ function appendContentHeaderTabOverlays(rootSnapshot: ElementSnapshot, rootEleme
   const rootRect = rootElement.getBoundingClientRect();
   const offsetX = rootSnapshot.rect.x - rootRect.x;
   const offsetY = rootSnapshot.rect.y - rootRect.y;
+  const surfaceRect = getConnectedTabSurfaceBaseRect(primaryGroup.rect, rootRect, topSurfaceRect);
+  const snapshotSurfaceRect = offsetDOMRect(surfaceRect, offsetX, offsetY);
+
+  normalizeConnectedTabSurfaceSnapshots(rootSnapshot, snapshotSurfaceRect);
 
   if (secondaryGroup && secondaryTabs.length > 0) {
     const pruneIds = new Set([generateNodeId(secondaryGroup.tabList)]);
@@ -1744,10 +1748,8 @@ function appendContentHeaderTabOverlays(rootSnapshot: ElementSnapshot, rootEleme
   }
 
   const band = createConnectedTabSurfaceBackground(
-    primaryGroup.rect,
+    surfaceRect,
     secondaryTabs,
-    rootRect,
-    topSurfaceRect,
   );
   if (band) {
     offsetSnapshotNode(band, offsetX, offsetY);
@@ -1946,28 +1948,39 @@ function isConnectedTopSurfaceCandidate(element: Element, rect: DOMRect, mainTab
   return !Number.isFinite(opacity) || opacity > 0.01;
 }
 
-function createConnectedTabSurfaceBackground(
+function getConnectedTabSurfaceBaseRect(
   mainTabRect: DOMRect,
-  overlays: ElementSnapshot[],
   rootRect: DOMRect,
   topSurfaceRect: DOMRect | null,
-): ElementSnapshot | null {
-  if (mainTabRect.width <= 0 || mainTabRect.height <= 0) return null;
-
+): DOMRect {
   const rootRight = rootRect.right;
   const rootBottom = rootRect.bottom;
   const left = Math.max(rootRect.left, topSurfaceRect ? topSurfaceRect.left : mainTabRect.left - 16);
   const right = Math.min(rootRight, topSurfaceRect ? topSurfaceRect.right : mainTabRect.right + 16);
   const top = Math.max(rootRect.top, topSurfaceRect ? topSurfaceRect.top : mainTabRect.top - 8);
-  let bottom = topSurfaceRect ? rootBottom : mainTabRect.bottom + 88;
+  const bottom = topSurfaceRect ? rootBottom : mainTabRect.bottom + 88;
+
+  return new DOMRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
+}
+
+function offsetDOMRect(rect: DOMRect, dx: number, dy: number): DOMRect {
+  return new DOMRect(rect.x + dx, rect.y + dy, rect.width, rect.height);
+}
+
+function createConnectedTabSurfaceBackground(
+  baseRect: DOMRect,
+  overlays: ElementSnapshot[],
+): ElementSnapshot | null {
+  if (baseRect.width <= 0 || baseRect.height <= 0) return null;
+
+  let bottom = baseRect.bottom;
 
   for (const overlay of overlays) {
     bottom = Math.max(bottom, overlay.rect.y + overlay.rect.height + 8);
   }
-  bottom = Math.min(rootBottom, bottom);
 
-  const height = Math.max(1, bottom - top);
-  const rect = new DOMRect(left, top, Math.max(1, right - left), height);
+  const height = Math.max(1, bottom - baseRect.top);
+  const rect = new DOMRect(baseRect.left, baseRect.top, baseRect.width, height);
   const node: ElementSnapshot = {
     nodeType: NODE_TYPES.ELEMENT_NODE,
     id: generateNodeId(null),
@@ -1989,6 +2002,38 @@ function createConnectedTabSurfaceBackground(
     layoutSizingVertical: "FIXED",
   };
   return node;
+}
+
+function normalizeConnectedTabSurfaceSnapshots(rootSnapshot: ElementSnapshot, surfaceRect: DOMRect): void {
+  for (const child of rootSnapshot.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (isConnectedTabSurfaceSnapshotCandidate(child, surfaceRect)) {
+      child.styles.backgroundColor = "rgb(255, 255, 255)";
+      delete child.styles.backgroundImage;
+    }
+
+    normalizeConnectedTabSurfaceSnapshots(child, surfaceRect);
+  }
+}
+
+function isConnectedTabSurfaceSnapshotCandidate(node: ElementSnapshot, surfaceRect: DOMRect): boolean {
+  if (node.attributes["data-h2d-connected-tab-surface"] === "true") return false;
+  if (!isWhiteDominantLinearGradient(node.styles.backgroundImage || "")) return false;
+
+  const rect = node.rect;
+  if (rect.width < surfaceRect.width - 4 || rect.width > surfaceRect.width + 96) return false;
+  if (Math.abs(rect.x - surfaceRect.x) > 20) return false;
+  if (rect.y > surfaceRect.y + 20) return false;
+
+  const rectBottom = rect.y + rect.height;
+  const surfaceBottom = surfaceRect.y + surfaceRect.height;
+  return rectBottom >= surfaceRect.y + surfaceRect.height * 0.7 || rectBottom >= surfaceBottom - 48;
+}
+
+function isWhiteDominantLinearGradient(backgroundImage: string): boolean {
+  if (!/linear-gradient/i.test(backgroundImage)) return false;
+  return /rgb\(\s*255\s*,\s*255\s*,\s*255\s*\)|rgba\(\s*255\s*,\s*255\s*,\s*255\s*,\s*(?:1|1\.0+)\s*\)|#fff(?:fff)?\b|\bwhite\b/i.test(backgroundImage);
 }
 
 function pruneSnapshotsByIds(rootSnapshot: ElementSnapshot, ids: Set<string>): void {
