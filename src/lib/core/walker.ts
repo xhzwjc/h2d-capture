@@ -214,11 +214,12 @@ export function shouldPruneNode(
     tag !== "HTML" &&
     tag !== "BODY" &&
     rect.width > 0 &&
-    rect.height > 0 &&
-    (isFullyClippedByHorizontalScrollAncestor(element, rect) ||
-      isFullyClippedByVerticalOverlayScrollAncestor(element, rect))
+    rect.height > 0
   ) {
-    return true;
+    const clippingRects = getFullyClippingScrollAncestorRects(element, rect);
+    if (clippingRects.length > 0 && !hasVisibleSnapshotDescendantInAllClips(childNodes, clippingRects)) {
+      return true;
+    }
   }
 
   // Offscreen detection: element is entirely outside the full document bounds.
@@ -253,6 +254,71 @@ export function shouldPruneNode(
   }
 
   return false;
+}
+
+function getFullyClippingScrollAncestorRects(
+  element: Element,
+  rect: { x: number; y: number; width: number; height: number },
+): DOMRect[] {
+  if (rect.width <= 0 || rect.height <= 0) return [];
+
+  const elementComputed = getComputedStyleFor(element);
+  if (elementComputed.position === "fixed") return [];
+
+  const clippingRects: DOMRect[] = [];
+  let ancestor = element.parentElement;
+  while (ancestor) {
+    if (isHorizontalScrollClipAncestor(ancestor)) {
+      const clip = ancestor.getBoundingClientRect();
+      if (clip.width > 0 && (rect.x + rect.width <= clip.left || rect.x >= clip.right)) {
+        clippingRects.push(clip);
+      }
+    }
+
+    if (isVerticalOverlayScrollClipAncestor(ancestor)) {
+      const clip = ancestor.getBoundingClientRect();
+      if (clip.height > 0 && (rect.y + rect.height <= clip.top || rect.y >= clip.bottom)) {
+        clippingRects.push(clip);
+      }
+    }
+
+    ancestor = ancestor.parentElement;
+  }
+
+  return clippingRects;
+}
+
+function hasVisibleSnapshotDescendantInAllClips(childNodes: SnapshotNode[], clippingRects: DOMRect[]): boolean {
+  for (const child of childNodes) {
+    if (
+      child.rect.width > 0 &&
+      child.rect.height > 0 &&
+      clippingRects.every((clipRect) => isRectIntersectingDomRect(child.rect, clipRect))
+    ) {
+      return true;
+    }
+
+    if (
+      child.nodeType === NODE_TYPES.ELEMENT_NODE &&
+      hasVisibleSnapshotDescendantInAllClips(child.childNodes, clippingRects)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isRectIntersectingDomRect(
+  rect: { x: number; y: number; width: number; height: number },
+  clipRect: DOMRect,
+): boolean {
+  return (
+    rect.x < clipRect.right &&
+    rect.x + rect.width > clipRect.left &&
+    rect.y < clipRect.bottom &&
+    rect.y + rect.height > clipRect.top
+  );
 }
 
 function hasVisibleSnapshotDescendantInBounds(

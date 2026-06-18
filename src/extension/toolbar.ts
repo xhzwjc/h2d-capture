@@ -23,6 +23,65 @@
   document.body.appendChild(host);
 
   const shadow = host.attachShadow({ mode: "closed" });
+  const toolbarActions = new Map<HTMLButtonElement, () => void>();
+  let toolbarActivationShieldUntil = 0;
+  let toolbarActivationPointerId: number | null = null;
+
+  function consumeToolbarEvent(event: Event): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+  }
+
+  function isElementVisible(element: HTMLElement): boolean {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const computed = getComputedStyle(element);
+    return computed.display !== "none" && computed.visibility !== "hidden";
+  }
+
+  function findToolbarActionAtPoint(x: number, y: number): (() => void) | null {
+    for (const [button, action] of toolbarActions) {
+      if (!isElementVisible(button) || button.classList.contains("disabled")) continue;
+      const rect = button.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return action;
+      }
+    }
+
+    return null;
+  }
+
+  function shouldShieldToolbarFollowup(event: Event): boolean {
+    if (Date.now() > toolbarActivationShieldUntil) return false;
+    if (toolbarActivationPointerId === null || !("pointerId" in event)) return true;
+    return (event as PointerEvent).pointerId === toolbarActivationPointerId;
+  }
+
+  function onWindowToolbarEvent(event: Event): void {
+    if (event.type === "pointerdown" && event instanceof PointerEvent && event.button === 0) {
+      const action = findToolbarActionAtPoint(event.clientX, event.clientY);
+      if (!action) return;
+
+      toolbarActivationPointerId = event.pointerId;
+      toolbarActivationShieldUntil = Date.now() + 1200;
+      consumeToolbarEvent(event);
+      action();
+      return;
+    }
+
+    if (shouldShieldToolbarFollowup(event)) {
+      consumeToolbarEvent(event);
+    }
+  }
+
+  const toolbarShieldEvents = ["pointerdown", "mousedown", "mouseup", "pointerup", "pointercancel", "click"] as const;
+  const toolbarShieldOptions: AddEventListenerOptions = { capture: true, passive: false };
+  for (const eventName of toolbarShieldEvents) {
+    window.addEventListener(eventName, onWindowToolbarEvent, toolbarShieldOptions);
+  }
 
   // --- Styles ---
   const style = document.createElement("style");
@@ -315,22 +374,45 @@
   const header = document.createElement("div");
   header.className = "header";
 
-  function consumeToolbarEvent(event: Event): void {
-    event.preventDefault();
-    event.stopPropagation();
-    if (typeof event.stopImmediatePropagation === "function") {
-      event.stopImmediatePropagation();
-    }
-  }
-
   function wireToolbarButtonAction(button: HTMLButtonElement, onActivate: () => void): void {
+    toolbarActions.set(button, onActivate);
     let handledPointerActivation = false;
+    let activePointerId: number | null = null;
+
+    function releaseActivePointer(): void {
+      if (activePointerId === null) return;
+      try {
+        if (button.hasPointerCapture(activePointerId)) {
+          button.releasePointerCapture(activePointerId);
+        }
+      } catch (_err) {
+        // Ignore stale pointer ids; the browser may auto-release after cancel.
+      }
+      activePointerId = null;
+    }
 
     button.addEventListener("pointerdown", (event: PointerEvent) => {
       if (event.button !== 0) return;
       handledPointerActivation = true;
+      activePointerId = event.pointerId;
+      try {
+        button.setPointerCapture(event.pointerId);
+      } catch (_err) {
+        // Pointer capture is best-effort; event swallowing below still protects the page.
+      }
       consumeToolbarEvent(event);
       onActivate();
+    });
+
+    button.addEventListener("mousedown", consumeToolbarEvent);
+    button.addEventListener("mouseup", consumeToolbarEvent);
+    button.addEventListener("pointerup", (event: PointerEvent) => {
+      consumeToolbarEvent(event);
+      releaseActivePointer();
+    });
+    button.addEventListener("pointercancel", (event: PointerEvent) => {
+      consumeToolbarEvent(event);
+      releaseActivePointer();
     });
 
     button.addEventListener("click", (event: MouseEvent) => {
@@ -1011,7 +1093,7 @@
     }
   }
 
-  stopBtn.addEventListener("click", () => {
+  wireToolbarButtonAction(stopBtn, () => {
     captureAborted = true;
     clearStopTimer();
     stopBtn.classList.remove("visible");
@@ -1138,6 +1220,9 @@
   // --- Cleanup ---
   function destroy(): void {
     stopSelection();
+    for (const eventName of toolbarShieldEvents) {
+      window.removeEventListener(eventName, onWindowToolbarEvent, toolbarShieldOptions);
+    }
     host.remove();
   }
 

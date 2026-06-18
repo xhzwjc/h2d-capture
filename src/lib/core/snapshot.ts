@@ -260,9 +260,15 @@ async function captureDOMInner(
 
     if (shouldUseViewportRect) {
       normalizeDocumentViewportSnapshot(rootSnapshot, ownerWindow);
+      normalizeViewportOverflowShells(rootSnapshot);
+      pruneViewportTopOverflowSnapshots(rootSnapshot);
     }
     normalizeViewportCropCanvasGeometry(rootSnapshot);
     promoteExternalActionToolbarSnapshots(rootSnapshot);
+    if (shouldUseViewportRect) {
+      normalizeGeneratedViewportRootOverlays(rootSnapshot);
+      clampSlightViewportRootOverscroll(rootSnapshot);
+    }
 
     return {
       documentTitle: doc.title || undefined,
@@ -510,6 +516,128 @@ function normalizeDocumentViewportSnapshot(rootSnapshot: ElementSnapshot, ownerW
 
   normalizeViewportRootRect(rootSnapshot, viewportRect);
   normalizeScrolledViewportShells(rootSnapshot, viewportRect);
+}
+
+function normalizeViewportOverflowShells(rootSnapshot: ElementSnapshot): void {
+  normalizeViewportOverflowShellsInner(rootSnapshot, rootSnapshot.rect);
+}
+
+function normalizeViewportOverflowShellsInner(node: ElementSnapshot, viewportRect: ElementRect): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (isViewportOverflowShellSnapshot(child, viewportRect)) {
+      child.rect.y = viewportRect.y;
+      child.rect.height = viewportRect.height;
+      child.rect.cssHeight = Math.round(child.rect.height);
+      child.styles.height = `${roundPx(child.rect.height)}px`;
+
+      if (child.rect.x <= viewportRect.x + 1 && child.rect.width >= viewportRect.width - 2) {
+        child.rect.x = viewportRect.x;
+        child.rect.width = viewportRect.width;
+        child.rect.cssWidth = Math.round(child.rect.width);
+        child.styles.width = `${roundPx(child.rect.width)}px`;
+      }
+    }
+
+    normalizeViewportOverflowShellsInner(child, viewportRect);
+  }
+}
+
+function isViewportOverflowShellSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
+  if (node.rect.y >= viewportRect.y - 1) return false;
+  if (node.rect.y + node.rect.height < viewportRect.y + viewportRect.height - 1) return false;
+  if (node.rect.width < viewportRect.width * 0.45) return false;
+  if (!hasSnapshotDescendantInsideRect(node.childNodes, viewportRect)) return false;
+
+  return true;
+}
+
+function pruneViewportTopOverflowSnapshots(rootSnapshot: ElementSnapshot): void {
+  pruneViewportTopOverflowSnapshotsInner(rootSnapshot, rootSnapshot.rect);
+}
+
+function pruneViewportTopOverflowSnapshotsInner(node: ElementSnapshot, viewportRect: ElementRect): void {
+  node.childNodes = node.childNodes.filter((child) => {
+    if (!isElementNodeSnapshot(child)) return true;
+    if (isViewportTopOverflowSnapshot(child, viewportRect)) return false;
+
+    pruneViewportTopOverflowSnapshotsInner(child, viewportRect);
+    return true;
+  });
+}
+
+function isViewportTopOverflowSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
+  if (node.rect.y >= viewportRect.y - 1) return false;
+
+  const visibleBottom = node.rect.y + node.rect.height;
+  if (visibleBottom <= viewportRect.y) return true;
+
+  const visibleHeight = visibleBottom - viewportRect.y;
+  return visibleHeight <= 8 && node.rect.height >= 16;
+}
+
+function normalizeGeneratedViewportRootOverlays(rootSnapshot: ElementSnapshot): void {
+  for (const child of rootSnapshot.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (!isGeneratedRootOverlaySnapshot(child)) continue;
+    anchorSnapshotToParent(child, rootSnapshot.rect);
+  }
+}
+
+function isGeneratedRootOverlaySnapshot(node: ElementSnapshot): boolean {
+  return Boolean(
+    node.attributes["data-h2d-toolbar-action"] ||
+    node.attributes["data-h2d-status-overlay"] ||
+    node.attributes["data-h2d-tab-overlay"] ||
+    node.attributes["data-h2d-connected-tab-surface"],
+  );
+}
+
+function clampSlightViewportRootOverscroll(rootSnapshot: ElementSnapshot): void {
+  clampSlightViewportOverscrollInner(rootSnapshot, rootSnapshot.rect);
+}
+
+function clampSlightViewportOverscrollInner(node: ElementSnapshot, viewportRect: ElementRect): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    clampSlightViewportOverscrollNode(child, viewportRect);
+    clampSlightViewportOverscrollInner(child, viewportRect);
+  }
+}
+
+function clampSlightViewportOverscrollNode(node: ElementSnapshot, viewportRect: ElementRect): void {
+  if (!isSnapshotOverflowClipContainer(node.styles)) return;
+
+  const viewportRight = viewportRect.x + viewportRect.width;
+  const viewportBottom = viewportRect.y + viewportRect.height;
+  const nodeRight = node.rect.x + node.rect.width;
+  const nodeBottom = node.rect.y + node.rect.height;
+
+  const bottomOvershoot = nodeBottom - viewportBottom;
+  if (
+    bottomOvershoot > 0 &&
+    bottomOvershoot <= 32 &&
+    node.rect.y >= viewportRect.y - 1 &&
+    node.rect.height > bottomOvershoot
+  ) {
+    node.rect.height -= bottomOvershoot;
+    node.rect.cssHeight = Math.round(node.rect.height);
+    node.styles.height = `${roundPx(node.rect.height)}px`;
+  }
+
+  const rightOvershoot = nodeRight - viewportRight;
+  if (
+    rightOvershoot > 0 &&
+    rightOvershoot <= 32 &&
+    node.rect.x >= viewportRect.x - 1 &&
+    node.rect.width > rightOvershoot
+  ) {
+    node.rect.width -= rightOvershoot;
+    node.rect.cssWidth = Math.round(node.rect.width);
+    node.styles.width = `${roundPx(node.rect.width)}px`;
+  }
 }
 
 function normalizeViewportRootRect(
@@ -2330,6 +2458,9 @@ function pruneSnapshotsByIds(rootSnapshot: ElementSnapshot, ids: Set<string>): v
 function createCompactToolbarActionOverlay(source: Element, text: string): ElementSnapshot | null {
   const computed = getComputedStyleFor(source);
   const sourceRect = source.getBoundingClientRect();
+  const surface = findCompactToolbarActionSurfaceElement(source, sourceRect);
+  const surfaceRect = surface?.getBoundingClientRect() ?? null;
+  const surfaceComputed = surface ? getComputedStyleFor(surface) : null;
   const svg = findToolbarActionSvg(source);
   const textRect = getElementTextRangeRect(source) ?? getFallbackTextRect(sourceRect, computed, text);
   if (textRect.width <= 0 || textRect.height <= 0) return null;
@@ -2337,14 +2468,16 @@ function createCompactToolbarActionOverlay(source: Element, text: string): Eleme
   const svgRect = svg?.getBoundingClientRect() ?? null;
   const fontSize = parsePx(computed.fontSize, 12);
   const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
-  const left = Math.min(sourceRect.left, textRect.x, svgRect?.left ?? sourceRect.left);
-  const top = Math.min(sourceRect.top, textRect.y, svgRect?.top ?? sourceRect.top);
-  const right = Math.max(sourceRect.right, textRect.x + textRect.width, svgRect?.right ?? sourceRect.right);
-  const bottom = Math.max(sourceRect.bottom, textRect.y + textRect.height, svgRect?.bottom ?? sourceRect.bottom);
+  const baseRect = surfaceRect ?? sourceRect;
+  const left = Math.min(baseRect.left, sourceRect.left, textRect.x, svgRect?.left ?? sourceRect.left);
+  const top = Math.min(baseRect.top, sourceRect.top, textRect.y, svgRect?.top ?? sourceRect.top);
+  const right = Math.max(baseRect.right, sourceRect.right, textRect.x + textRect.width, svgRect?.right ?? sourceRect.right);
+  const bottom = Math.max(baseRect.bottom, sourceRect.bottom, textRect.y + textRect.height, svgRect?.bottom ?? sourceRect.bottom);
   const rect = new DOMRect(left, top, Math.max(1, right - left), Math.max(sourceRect.height, bottom - top));
   const childNodes: SnapshotNode[] = [];
 
   if (svg && svgRect && svgRect.width > 0 && svgRect.height > 0) {
+    const svgColor = getComputedStyleFor(svg).color || computed.color;
     childNodes.push({
       nodeType: NODE_TYPES.ELEMENT_NODE,
       id: generateNodeId(null),
@@ -2353,17 +2486,17 @@ function createCompactToolbarActionOverlay(source: Element, text: string): Eleme
       styles: {
         display: "block",
         position: "absolute",
-        left: "0px",
-        top: "0px",
+        left: `${roundPx(svgRect.left - rect.left)}px`,
+        top: `${roundPx(svgRect.top - rect.top)}px`,
         width: `${roundPx(svgRect.width)}px`,
         height: `${roundPx(svgRect.height)}px`,
-        color: getComputedStyleFor(svg).color || computed.color,
+        color: svgColor,
         overflow: "visible",
         boxSizing: "border-box",
       },
       rect: toElementRect(svgRect),
       childNodes: [],
-      content: serializeToolbarActionSvg(svg),
+      content: serializeToolbarActionSvg(svg, svgColor),
       layoutSizingHorizontal: "FIXED",
       layoutSizingVertical: "FIXED",
     });
@@ -2382,34 +2515,118 @@ function createCompactToolbarActionOverlay(source: Element, text: string): Eleme
     lineCount: 1,
   });
 
+  const styles: Record<string, string> = {
+    display: "block",
+    position: "absolute",
+    left: "0px",
+    top: "0px",
+    width: `${roundPx(rect.width)}px`,
+    height: `${roundPx(rect.height)}px`,
+    overflow: "visible",
+    color: computed.color,
+    fontFamily: computed.fontFamily,
+    fontSize: computed.fontSize || `${roundPx(fontSize)}px`,
+    fontWeight: computed.fontWeight,
+    lineHeight: Number.isFinite(lineHeight) ? `${roundPx(lineHeight)}px` : computed.lineHeight,
+    whiteSpace: "nowrap",
+    textAlign: computed.textAlign,
+    boxSizing: "border-box",
+    zIndex: "120",
+  };
+  if (surfaceComputed) {
+    copyCompactToolbarActionSurfaceStyles(surfaceComputed, styles);
+  }
+
   return {
     nodeType: NODE_TYPES.ELEMENT_NODE,
     id: generateNodeId(null),
     tag: "DIV",
     attributes: { "data-h2d-toolbar-action": "true" },
-    styles: {
-      display: "block",
-      position: "absolute",
-      left: "0px",
-      top: "0px",
-      width: `${roundPx(rect.width)}px`,
-      height: `${roundPx(rect.height)}px`,
-      overflow: "visible",
-      color: computed.color,
-      fontFamily: computed.fontFamily,
-      fontSize: computed.fontSize || `${roundPx(fontSize)}px`,
-      fontWeight: computed.fontWeight,
-      lineHeight: Number.isFinite(lineHeight) ? `${roundPx(lineHeight)}px` : computed.lineHeight,
-      whiteSpace: "nowrap",
-      textAlign: computed.textAlign,
-      boxSizing: "border-box",
-      zIndex: "120",
-    },
+    styles,
     rect: toElementRect(rect),
     childNodes,
     layoutSizingHorizontal: "FIXED",
     layoutSizingVertical: "FIXED",
   };
+}
+
+function findCompactToolbarActionSurfaceElement(source: Element, sourceRect: DOMRect): Element | null {
+  let best: { element: Element; area: number } | null = null;
+  const candidates: Element[] = [source, ...Array.from(source.querySelectorAll("*"))];
+
+  let ancestor = source.parentElement;
+  for (let depth = 0; ancestor && depth < 3; depth += 1) {
+    candidates.push(ancestor);
+    ancestor = ancestor.parentElement;
+  }
+
+  for (const candidate of candidates) {
+    if (!isElementVisibleInDocument(candidate)) continue;
+    if (!isCompactToolbarActionSurfaceElement(candidate, sourceRect)) continue;
+
+    const rect = candidate.getBoundingClientRect();
+    const area = rect.width * rect.height;
+    if (!best || area < best.area) {
+      best = { element: candidate, area };
+    }
+  }
+
+  return best?.element ?? null;
+}
+
+function isCompactToolbarActionSurfaceElement(element: Element, sourceRect: DOMRect): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width < Math.max(24, sourceRect.width * 0.65)) return false;
+  if (rect.height < Math.max(18, sourceRect.height * 0.65)) return false;
+  if (rect.width > Math.max(sourceRect.width + 96, sourceRect.width * 3)) return false;
+  if (rect.height > Math.max(sourceRect.height + 24, sourceRect.height * 2.2)) return false;
+  if (rect.left > sourceRect.left + 4 || rect.right < sourceRect.right - 4) return false;
+  if (rect.top > sourceRect.top + 4 || rect.bottom < sourceRect.bottom - 4) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+  const hasBackground =
+    isVisiblePaint(computed.backgroundColor) ||
+    Boolean(computed.backgroundImage && computed.backgroundImage !== "none");
+  const hasBorder = hasVisibleBorderStyles(computed);
+  const hasShadow = Boolean(computed.boxShadow && computed.boxShadow !== "none");
+  const hasRadius = hasRoundedCorners(computed, 1);
+
+  return (hasBackground || hasBorder || hasShadow) && (hasRadius || hasBorder || hasShadow);
+}
+
+function copyCompactToolbarActionSurfaceStyles(
+  computed: CSSStyleDeclaration,
+  styles: Record<string, string>,
+): void {
+  if (isVisiblePaint(computed.backgroundColor)) {
+    styles.backgroundColor = computed.backgroundColor;
+  }
+  if (computed.backgroundImage && computed.backgroundImage !== "none") {
+    styles.backgroundImage = computed.backgroundImage;
+  }
+  if (computed.boxShadow && computed.boxShadow !== "none") {
+    styles.boxShadow = computed.boxShadow;
+  }
+
+  for (const corner of ["TopLeft", "TopRight", "BottomRight", "BottomLeft"] as const) {
+    const value = computed[`border${corner}Radius` as keyof CSSStyleDeclaration] as string;
+    if (parsePx(value, 0) > 0) {
+      styles[`border${corner}Radius`] = value;
+    }
+  }
+
+  for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
+    const width = computed[`border${side}Width` as keyof CSSStyleDeclaration] as string;
+    const style = computed[`border${side}Style` as keyof CSSStyleDeclaration] as string;
+    const color = computed[`border${side}Color` as keyof CSSStyleDeclaration] as string;
+    if (parsePx(width, 0) <= 0 || style === "none" || style === "hidden") continue;
+
+    styles[`border${side}Width`] = width;
+    styles[`border${side}Style`] = style;
+    styles[`border${side}Color`] = color;
+  }
 }
 
 function findToolbarActionSvg(source: Element): SVGElement | null {
@@ -2425,10 +2642,13 @@ function findToolbarActionSvg(source: Element): SVGElement | null {
   return null;
 }
 
-function serializeToolbarActionSvg(svg: SVGElement): string {
+function serializeToolbarActionSvg(svg: SVGElement, color: string): string {
   let content = new XMLSerializer().serializeToString(svg);
   if (!/\sxmlns=/.test(content)) {
     content = content.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
+  }
+  if (/currentColor/i.test(content) && isVisiblePaint(color)) {
+    content = content.replace(/currentColor/gi, escapeSvgAttribute(color));
   }
   return content;
 }
@@ -3300,7 +3520,7 @@ function snapshotPseudoChevronIcon(element: Element): ElementSnapshot | null {
 
   const before = getComputedStyleFor(element, "::before");
   const after = getComputedStyleFor(element, "::after");
-  if (!isPaintPseudoCandidate(element, before) || !isPaintPseudoCandidate(element, after)) return null;
+  if (!isPaintPseudoCandidate(element, before, "::before") || !isPaintPseudoCandidate(element, after, "::after")) return null;
   if (!isChevronPseudoBar(before) || !isChevronPseudoBar(after)) return null;
 
   const hostRect = element.getBoundingClientRect();
@@ -3613,7 +3833,7 @@ function snapshotPaintPseudoElement(element: Element, pseudo: "::before" | "::af
   const clippedCornerMarker = snapshotClippedCornerMarkerPseudo(element, pseudo, computed);
   if (clippedCornerMarker) return clippedCornerMarker;
 
-  if (!isPaintPseudoCandidate(element, computed)) return null;
+  if (!isPaintPseudoCandidate(element, computed, pseudo)) return null;
 
   const width = parsePx(computed.width, NaN);
   const height = parsePx(computed.height, NaN);
@@ -4083,11 +4303,14 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function isPaintPseudoCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
+function isPaintPseudoCandidate(
+  element: Element,
+  computed: CSSStyleDeclaration,
+  pseudo?: "::before" | "::after",
+): boolean {
   const hostTag = element.tagName.toUpperCase();
   const isIconHost = hostTag === "I" || hostTag === "SPAN";
-  if (!isIconHost && !isSmallMarkerPseudoCandidate(element, computed)) return false;
-
+  const isControlSurface = isControlSurfacePseudoCandidate(element, computed);
   const hostRect = element.getBoundingClientRect();
   if (isIconHost && (hostRect.width > 48 || hostRect.height > 48)) return false;
 
@@ -4097,13 +4320,85 @@ function isPaintPseudoCandidate(element: Element, computed: CSSStyleDeclaration)
   const width = parsePx(computed.width, NaN);
   const height = parsePx(computed.height, NaN);
   if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
-  if (width <= 0 || height <= 0 || width > 32 || height > 32) return false;
+  const isLeadingIcon = isLeadingIconPseudoCandidate(element, pseudo, computed, hostRect, width, height);
+  if (!isIconHost && !isSmallMarkerPseudoCandidate(element, computed) && !isControlSurface && !isLeadingIcon) return false;
+
+  const maxWidth = isControlSurface ? Math.max(32, hostRect.width + 16) : 32;
+  const maxHeight = isControlSurface ? Math.max(32, hostRect.height + 16) : 32;
+  const effectiveMaxWidth = isLeadingIcon ? Math.max(maxWidth, 40) : maxWidth;
+  const effectiveMaxHeight = isLeadingIcon ? Math.max(maxHeight, 40) : maxHeight;
+  if (width <= 0 || height <= 0 || width > effectiveMaxWidth || height > effectiveMaxHeight) return false;
 
   if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") {
     return false;
   }
 
-  return isVisiblePaint(computed.backgroundColor) || hasVisibleBorderStyles(computed);
+  return (
+    isVisiblePaint(computed.backgroundColor) ||
+    hasVisibleBorderStyles(computed) ||
+    Boolean(computed.backgroundImage && computed.backgroundImage !== "none")
+  );
+}
+
+function isLeadingIconPseudoCandidate(
+  element: Element,
+  pseudo: "::before" | "::after" | undefined,
+  computed: CSSStyleDeclaration,
+  hostRect: DOMRect,
+  width: number,
+  height: number,
+): boolean {
+  if (pseudo !== "::before") return false;
+  if (hostRect.width <= 0 || hostRect.height <= 0 || hostRect.height > 80) return false;
+  if (width < 8 || height < 8 || width > 40 || height > 40) return false;
+
+  const aspectRatio = width / height;
+  if (aspectRatio < 0.5 || aspectRatio > 2) return false;
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+  if (!isVisiblePaint(computed.backgroundColor) && !hasVisibleBorderStyles(computed) && (!computed.backgroundImage || computed.backgroundImage === "none")) {
+    return false;
+  }
+
+  const hasText = Boolean((element.textContent || "").replace(/\s+/g, " ").trim());
+  if (!hasText) return false;
+
+  const left = parsePx(computed.left, NaN);
+  const top = parsePx(computed.top, NaN);
+  const bottom = parsePx(computed.bottom, NaN);
+  if (computed.position === "absolute" || computed.position === "fixed") {
+    if (!Number.isFinite(left) || left < -48 || left > 56) return false;
+    return Number.isFinite(top) || Number.isFinite(bottom) || hostRect.height <= 40;
+  }
+
+  const firstAnchorRect = getFirstDirectTextRect(element) ?? getFirstDirectChildVisualRect(element);
+  if (!firstAnchorRect) return false;
+  const availableLeadingSpace = firstAnchorRect.x - hostRect.x;
+  return availableLeadingSpace >= Math.min(width, 12) || hostRect.width > width + firstAnchorRect.width;
+}
+
+function isControlSurfacePseudoCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 || hostRect.height <= 0 || hostRect.width > 360 || hostRect.height > 80) return false;
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+  if (!isVisiblePaint(computed.backgroundColor) && !hasVisibleBorderStyles(computed)) return false;
+
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  const hasSelectedState =
+    element.getAttribute("aria-selected") === "true" ||
+    element.getAttribute("aria-pressed") === "true" ||
+    element.getAttribute("aria-current") === "true";
+  if (!hasSelectedState || (role && role !== "tab" && role !== "button" && role !== "switch")) return false;
+
+  const width = parsePx(computed.width, NaN);
+  const height = parsePx(computed.height, NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
+
+  return (
+    width >= hostRect.width * 0.5 &&
+    height >= hostRect.height * 0.5 &&
+    width <= hostRect.width + 16 &&
+    height <= hostRect.height + 16
+  );
 }
 
 function isSmallMarkerPseudoCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
@@ -4167,9 +4462,13 @@ function computeInlinePaintPseudoMarkerRect(
   width: number,
   height: number,
 ): DOMRect | null {
-  if (!isInlineTabMarkerPseudoCandidate(element, pseudo, computed, width, height)) return null;
+  const isTabMarker = isInlineTabMarkerPseudoCandidate(element, pseudo, computed, width, height);
+  const isLeadingIcon = isInlineLeadingIconPseudoCandidate(element, pseudo, computed, width, height);
+  if (!isTabMarker && !isLeadingIcon) {
+    return null;
+  }
 
-  const textRect = getFirstDirectTextRect(element);
+  const textRect = getFirstDirectTextRect(element) ?? (isLeadingIcon ? getFirstDirectChildVisualRect(element) : null);
   if (!textRect) return null;
 
   const marginLeft = parsePx(computed.marginLeft, 0);
@@ -4182,6 +4481,26 @@ function computeInlinePaintPseudoMarkerRect(
   const y = hostRect.y + Math.max(0, (hostRect.height - height) / 2);
 
   return new DOMRect(x, y, width, height);
+}
+
+function isInlineLeadingIconPseudoCandidate(
+  element: Element,
+  pseudo: "::before" | "::after",
+  computed: CSSStyleDeclaration,
+  width: number,
+  height: number,
+): boolean {
+  if (pseudo !== "::before") return false;
+  if (computed.position === "absolute" || computed.position === "fixed") return false;
+  if (width < 8 || height < 8 || width > 40 || height > 40) return false;
+  if (!isVisiblePaint(computed.backgroundColor) && !hasVisibleBorderStyles(computed) && (!computed.backgroundImage || computed.backgroundImage === "none")) {
+    return false;
+  }
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 || hostRect.height <= 0 || hostRect.height > 80) return false;
+  if (!(element.textContent || "").trim()) return false;
+  return Boolean(getFirstDirectTextRect(element) ?? getFirstDirectChildVisualRect(element));
 }
 
 function isInlineTabMarkerPseudoCandidate(
@@ -4221,6 +4540,12 @@ function getFirstDirectTextRect(element: Element): { x: number; y: number; width
   }
 
   return null;
+}
+
+function getFirstDirectChildVisualRect(element: Element): { x: number; y: number; width: number; height: number } | null {
+  const rect = getDirectChildVisualRects(element)[0];
+  if (!rect) return null;
+  return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
 }
 
 function getPaintPseudoStyles(computed: CSSStyleDeclaration, width: number, height: number): Record<string, string> {
@@ -4560,10 +4885,114 @@ function snapshotIframeDocument(
     height: frameElement.clientHeight || rect.height,
   };
   offsetSnapshotNode(serialized, frameRect.x, frameRect.y);
+  normalizeExpandedIframeDocumentShell(serialized, frameRect);
   rasterizeEmptyIframeShells(serialized, assetCollector);
   lockSnapshotGeometry(serialized, frameRect);
   childNodes.push(serialized);
   return true;
+}
+
+function normalizeExpandedIframeDocumentShell(
+  node: SnapshotNode,
+  frameRect: { x: number; y: number; width: number; height: number },
+): void {
+  if (!isElementNodeSnapshot(node)) return;
+
+  node.rect.x = frameRect.x;
+  node.rect.y = frameRect.y;
+  node.rect.width = Math.max(node.rect.width, frameRect.width);
+  node.rect.height = Math.max(node.rect.height, frameRect.height);
+  node.rect.cssWidth = Math.round(node.rect.width);
+  node.rect.cssHeight = Math.round(node.rect.height);
+  node.styles.width = `${roundPx(node.rect.width)}px`;
+  node.styles.height = `${roundPx(node.rect.height)}px`;
+
+  expandIframeViewportShellDescendants(node, frameRect, 0);
+}
+
+function expandIframeViewportShellDescendants(
+  node: ElementSnapshot,
+  frameRect: { x: number; y: number; width: number; height: number },
+  depth: number,
+): void {
+  if (depth > 6) return;
+
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    const visibleBounds = getSnapshotDescendantVisibleBounds(child.childNodes, frameRect);
+    if (visibleBounds && isIframeViewportShellSnapshot(child, frameRect, depth)) {
+      const visibleRight = Math.min(frameRect.x + frameRect.width, visibleBounds.x + visibleBounds.width);
+      const visibleBottom = Math.min(frameRect.y + frameRect.height, visibleBounds.y + visibleBounds.height);
+      const nextWidth = Math.max(child.rect.width, visibleRight - child.rect.x);
+      const nextHeight = Math.max(child.rect.height, visibleBottom - child.rect.y);
+
+      child.rect.width = Math.max(1, nextWidth);
+      child.rect.height = Math.max(1, nextHeight);
+      child.rect.cssWidth = Math.round(child.rect.width);
+      child.rect.cssHeight = Math.round(child.rect.height);
+      child.styles.width = `${roundPx(child.rect.width)}px`;
+      child.styles.height = `${roundPx(child.rect.height)}px`;
+    }
+
+    expandIframeViewportShellDescendants(child, frameRect, depth + 1);
+  }
+}
+
+function isIframeViewportShellSnapshot(
+  node: ElementSnapshot,
+  frameRect: { x: number; y: number; width: number; height: number },
+  depth: number,
+): boolean {
+  if (node.tag === "HTML" || node.tag === "BODY") return true;
+  if (depth > 4) return false;
+  if (isSnapshotOverflowClipContainer(node.styles)) return false;
+  if (Math.abs(node.rect.x - frameRect.x) > 2 || Math.abs(node.rect.y - frameRect.y) > 2) return false;
+  return node.rect.width >= frameRect.width * 0.5;
+}
+
+function getSnapshotDescendantVisibleBounds(
+  childNodes: SnapshotNode[],
+  clipRect: { x: number; y: number; width: number; height: number },
+): Rect | null {
+  const rects: Rect[] = [];
+  collectSnapshotVisibleDescendantRects(childNodes, clipRect, rects);
+  return unionSnapshotRects(rects);
+}
+
+function collectSnapshotVisibleDescendantRects(
+  childNodes: SnapshotNode[],
+  clipRect: { x: number; y: number; width: number; height: number },
+  rects: Rect[],
+): void {
+  for (const child of childNodes) {
+    const visibleRect = intersectSnapshotRect(child.rect, clipRect);
+    if (visibleRect) rects.push(visibleRect);
+
+    if (isElementNodeSnapshot(child)) {
+      collectSnapshotVisibleDescendantRects(child.childNodes, clipRect, rects);
+    }
+  }
+}
+
+function intersectSnapshotRect(
+  rect: { x: number; y: number; width: number; height: number },
+  clipRect: { x: number; y: number; width: number; height: number },
+): Rect | null {
+  if (rect.width <= 0 || rect.height <= 0) return null;
+
+  const left = Math.max(rect.x, clipRect.x);
+  const top = Math.max(rect.y, clipRect.y);
+  const right = Math.min(rect.x + rect.width, clipRect.x + clipRect.width);
+  const bottom = Math.min(rect.y + rect.height, clipRect.y + clipRect.height);
+  if (right <= left || bottom <= top) return null;
+
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
 }
 
 function getEmptyIframeViewportCropRect(
