@@ -39,6 +39,7 @@ export const DEFAULT_CONFIG: Required<Omit<CaptureOptions, 'timeoutSignal'>> = {
   skipRemoteAssetSerialization: false,
   includeReactFiberTree: false,
   captureDeclaredStyles: false,
+  captureMode: "viewport",
 };
 
 const LAYOUT_STYLE_PROPS = [
@@ -179,7 +180,15 @@ async function captureDOMInner(
       throw new Error("Container node could not be serialized");
     }
     const rootSnapshot = serialized as ElementSnapshot;
-    normalizeElementCaptureOrigin(rootSnapshot, elementRect);
+    const elementViewportCrop = getElementViewportCrop(element, elementRect, ownerWindow, mergedOptions.captureMode);
+    if (elementViewportCrop) {
+      normalizeElementViewportSnapshot(rootSnapshot, elementViewportCrop);
+      normalizeViewportOverflowShells(rootSnapshot);
+      relaxViewportVisibleClipContainers(rootSnapshot);
+      pruneViewportTopOverflowSnapshots(rootSnapshot);
+    } else {
+      normalizeElementCaptureOrigin(rootSnapshot, elementRect);
+    }
     normalizeViewportCropCanvasGeometry(rootSnapshot);
     promoteExternalActionToolbarSnapshots(rootSnapshot);
     appendStatusDistributionOverlays(rootSnapshot, element);
@@ -199,14 +208,14 @@ async function captureDOMInner(
       documentRect: {
         x: 0,
         y: 0,
-        width: element.scrollWidth,
-        height: element.scrollHeight,
+        width: elementViewportCrop?.width ?? element.scrollWidth,
+        height: elementViewportCrop?.height ?? element.scrollHeight,
       },
       viewportRect: {
-        x: element.scrollLeft,
-        y: element.scrollTop,
-        width,
-        height,
+        x: elementViewportCrop ? 0 : element.scrollLeft,
+        y: elementViewportCrop ? 0 : element.scrollTop,
+        width: elementViewportCrop?.width ?? width,
+        height: elementViewportCrop?.height ?? height,
       },
       devicePixelRatio: ownerWindow.devicePixelRatio,
       assets: blobMap,
@@ -250,18 +259,25 @@ async function captureDOMInner(
     const viewportHeight = ownerWindow.innerHeight;
     const documentWidth = doc.documentElement.scrollWidth;
     const documentHeight = doc.documentElement.scrollHeight;
-    const shouldUseViewportRect = shouldNormalizeDocumentToViewport(
-      doc.documentElement,
-      rootSnapshot,
-      ownerWindow,
-      documentScrollY,
-      documentHeight,
-    );
+    const shouldUseViewportRect = mergedOptions.captureMode !== "full-page";
 
     if (shouldUseViewportRect) {
       normalizeDocumentViewportSnapshot(rootSnapshot, ownerWindow);
       normalizeViewportOverflowShells(rootSnapshot);
+      relaxViewportVisibleClipContainers(rootSnapshot);
       pruneViewportTopOverflowSnapshots(rootSnapshot);
+    } else {
+      normalizeFullPageDocumentSnapshot(
+        rootSnapshot,
+        documentScrollX,
+        documentScrollY,
+        documentWidth,
+        documentHeight,
+        viewportWidth,
+        viewportHeight,
+      );
+      extendFullPageFixedBackgrounds(rootSnapshot, viewportHeight);
+      extendLeftSidebarBackgrounds(rootSnapshot, doc.documentElement, documentHeight);
     }
     normalizeViewportCropCanvasGeometry(rootSnapshot);
     promoteExternalActionToolbarSnapshots(rootSnapshot);
@@ -298,6 +314,69 @@ async function captureDOMInner(
 function normalizeElementCaptureOrigin(rootSnapshot: ElementSnapshot, elementRect: DOMRect): void {
   if (elementRect.x === 0 && elementRect.y === 0) return;
   offsetSnapshotNode(rootSnapshot, -elementRect.x, -elementRect.y);
+}
+
+interface ElementViewportCrop {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function getElementViewportCrop(
+  element: Element,
+  elementRect: DOMRect,
+  ownerWindow: Window,
+  captureMode: string | undefined,
+): ElementViewportCrop | null {
+  if (captureMode === "full-page") return null;
+
+  const viewportWidth = ownerWindow.innerWidth;
+  const viewportHeight = ownerWindow.innerHeight;
+  if (viewportWidth <= 0 || viewportHeight <= 0) return null;
+
+  const left = Math.max(elementRect.left, 0);
+  const top = Math.max(elementRect.top, 0);
+  const right = Math.min(elementRect.right, viewportWidth);
+  const bottom = Math.min(elementRect.bottom, viewportHeight);
+  if (right <= left || bottom <= top) return null;
+
+  if (!isViewportPageContainerElement(element, elementRect, ownerWindow)) return null;
+
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function isViewportPageContainerElement(element: Element, elementRect: DOMRect, ownerWindow: Window): boolean {
+  const viewportWidth = ownerWindow.innerWidth;
+  const viewportHeight = ownerWindow.innerHeight;
+  const fillsViewportWidth = elementRect.width >= viewportWidth * 0.7;
+  const fillsViewportHeight = elementRect.height >= viewportHeight * 0.85;
+  if (!fillsViewportWidth || !fillsViewportHeight) return false;
+
+  const crossesViewport =
+    elementRect.top < -1 ||
+    elementRect.left < -1 ||
+    elementRect.bottom > viewportHeight + 1 ||
+    elementRect.right > viewportWidth + 1;
+  if (!crossesViewport) return false;
+
+  const identity = `${element.tagName} ${element.id} ${element.className}`.toLowerCase();
+  return /(page|layout|container|content|main|app|pro-page)/.test(identity);
+}
+
+function normalizeElementViewportSnapshot(rootSnapshot: ElementSnapshot, crop: ElementViewportCrop): void {
+  offsetSnapshotNode(rootSnapshot, -crop.x, -crop.y);
+  normalizeViewportRootRect(rootSnapshot, {
+    x: 0,
+    y: 0,
+    width: crop.width,
+    height: crop.height,
+  });
 }
 
 function normalizeViewportCropCanvasGeometry(node: ElementSnapshot, parentRect?: Rect): void {
@@ -483,25 +562,6 @@ function alignSnapshotGeometryToParent(node: ElementSnapshot, parentRect: Rect):
   delete node.relativeTransform;
 }
 
-function shouldNormalizeDocumentToViewport(
-  rootElement: Element,
-  rootSnapshot: ElementSnapshot,
-  ownerWindow: Window,
-  documentScrollY: number,
-  documentHeight: number,
-): boolean {
-  const viewportHeight = ownerWindow.innerHeight;
-  if (viewportHeight <= 0) return false;
-  if (documentScrollY > 1) return true;
-
-  const fullHeight = Math.max(documentHeight, rootSnapshot.rect.height, rootElement.scrollHeight);
-  const extraHeight = fullHeight - viewportHeight;
-  if (extraHeight <= 0) return true;
-
-  const meaningfulLongPageExtra = Math.max(360, viewportHeight * 0.5);
-  return extraHeight < meaningfulLongPageExtra;
-}
-
 function normalizeDocumentViewportSnapshot(rootSnapshot: ElementSnapshot, ownerWindow: Window): void {
   const viewportWidth = ownerWindow.innerWidth;
   const viewportHeight = ownerWindow.innerHeight;
@@ -518,6 +578,48 @@ function normalizeDocumentViewportSnapshot(rootSnapshot: ElementSnapshot, ownerW
   normalizeScrolledViewportShells(rootSnapshot, viewportRect);
 }
 
+function normalizeFullPageDocumentSnapshot(
+  rootSnapshot: ElementSnapshot,
+  scrollX: number,
+  scrollY: number,
+  documentWidth: number,
+  documentHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): void {
+  if (scrollX !== 0 || scrollY !== 0) {
+    offsetSnapshotNode(rootSnapshot, scrollX, scrollY);
+    rebaseFullPageFixedSnapshots(rootSnapshot, scrollX, scrollY);
+  }
+
+  rootSnapshot.rect.x = 0;
+  rootSnapshot.rect.y = 0;
+  rootSnapshot.rect.width = documentWidth;
+  rootSnapshot.rect.height = documentHeight;
+  rootSnapshot.rect.cssWidth = Math.round(documentWidth);
+  rootSnapshot.rect.cssHeight = Math.round(documentHeight);
+  rootSnapshot.styles.width = `${roundPx(documentWidth)}px`;
+  rootSnapshot.styles.height = `${roundPx(documentHeight)}px`;
+  rootSnapshot.styles.overflow = "visible";
+  rootSnapshot.styles.overflowX = "visible";
+  rootSnapshot.styles.overflowY = "visible";
+  rootSnapshot.styles.minWidth = `${roundPx(Math.max(documentWidth, viewportWidth))}px`;
+  rootSnapshot.styles.minHeight = `${roundPx(Math.max(documentHeight, viewportHeight))}px`;
+}
+
+function rebaseFullPageFixedSnapshots(node: ElementSnapshot, scrollX: number, scrollY: number): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (child.styles.position === "fixed") {
+      offsetSnapshotNode(child, -scrollX, -scrollY);
+      continue;
+    }
+
+    rebaseFullPageFixedSnapshots(child, scrollX, scrollY);
+  }
+}
+
 function normalizeViewportOverflowShells(rootSnapshot: ElementSnapshot): void {
   normalizeViewportOverflowShellsInner(rootSnapshot, rootSnapshot.rect);
 }
@@ -531,6 +633,9 @@ function normalizeViewportOverflowShellsInner(node: ElementSnapshot, viewportRec
       child.rect.height = viewportRect.height;
       child.rect.cssHeight = Math.round(child.rect.height);
       child.styles.height = `${roundPx(child.rect.height)}px`;
+      child.styles.overflow = "hidden";
+      child.styles.overflowX = "hidden";
+      child.styles.overflowY = "hidden";
 
       if (child.rect.x <= viewportRect.x + 1 && child.rect.width >= viewportRect.width - 2) {
         child.rect.x = viewportRect.x;
@@ -538,19 +643,112 @@ function normalizeViewportOverflowShellsInner(node: ElementSnapshot, viewportRec
         child.rect.cssWidth = Math.round(child.rect.width);
         child.styles.width = `${roundPx(child.rect.width)}px`;
       }
+
+      const maxHeight = parsePx(child.styles.maxHeight || "", NaN);
+      if (Number.isFinite(maxHeight) && maxHeight < child.rect.height) {
+        delete child.styles.maxHeight;
+      }
     }
 
     normalizeViewportOverflowShellsInner(child, viewportRect);
   }
 }
 
+function relaxViewportVisibleClipContainers(rootSnapshot: ElementSnapshot): void {
+  relaxViewportVisibleClipContainersInner(rootSnapshot, rootSnapshot.rect);
+}
+
+function relaxViewportVisibleClipContainersInner(node: ElementSnapshot, viewportRect: ElementRect): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (isSnapshotOverflowClipContainer(child.styles)) {
+      relaxViewportVisibleClipContainer(child, viewportRect);
+    }
+
+    relaxViewportVisibleClipContainersInner(child, viewportRect);
+  }
+}
+
+function relaxViewportVisibleClipContainer(node: ElementSnapshot, viewportRect: ElementRect): void {
+  if (isNarrowNavigationClipSnapshot(node, viewportRect)) return;
+  if (isCollapsedFixedViewportBarSnapshot(node, viewportRect)) return;
+
+  const visibleBounds = getSnapshotDescendantVisibleBounds(node.childNodes, viewportRect);
+  if (!visibleBounds) return;
+
+  const nodeBottom = node.rect.y + node.rect.height;
+  const visibleBottom = visibleBounds.y + visibleBounds.height;
+  if (visibleBottom <= nodeBottom + 1) return;
+
+  node.rect.height = roundPx(Math.max(node.rect.height, visibleBottom - node.rect.y));
+  node.rect.cssHeight = Math.round(node.rect.height);
+  node.styles.height = `${roundPx(node.rect.height)}px`;
+  node.styles.overflow = "visible";
+  node.styles.overflowY = "visible";
+
+  const maxHeight = parsePx(node.styles.maxHeight || "", NaN);
+  if (Number.isFinite(maxHeight) && maxHeight < node.rect.height) {
+    delete node.styles.maxHeight;
+  }
+}
+
+function isNarrowNavigationClipSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
+  const maxNavWidth = Math.min(360, viewportRect.width * 0.28);
+  if (node.rect.width <= 0 || node.rect.width > maxNavWidth) return false;
+
+  const isNearViewportEdge =
+    node.rect.x <= viewportRect.x + maxNavWidth ||
+    node.rect.x + node.rect.width >= viewportRect.x + viewportRect.width - maxNavWidth;
+  if (!isNearViewportEdge) return false;
+
+  return hasNavigationListDescendant(node, 0);
+}
+
+function hasNavigationListDescendant(node: ElementSnapshot, depth: number): boolean {
+  if (depth > 3) return false;
+
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if ((child.tag === "UL" || child.tag === "OL") && hasListItemChild(child)) return true;
+    if (hasNavigationListDescendant(child, depth + 1)) return true;
+  }
+
+  return false;
+}
+
+function hasListItemChild(node: ElementSnapshot): boolean {
+  return node.childNodes.some((child) => isElementNodeSnapshot(child) && child.tag === "LI");
+}
+
+function isCollapsedFixedViewportBarSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
+  if (node.styles.position !== "fixed") return false;
+
+  const top = parsePx(node.styles.top || "", NaN);
+  const bottom = parsePx(node.styles.bottom || "", NaN);
+  if (!Number.isFinite(top) || !Number.isFinite(bottom)) return false;
+  if (Math.abs(node.rect.y - top) > 2) return false;
+
+  const cssHeight = viewportRect.height - top - bottom;
+  if (cssHeight <= 0 || cssHeight > 160) return false;
+
+  const rectHeight = node.rect.height;
+  return rectHeight <= cssHeight + 2 || rectHeight >= viewportRect.height - 2;
+}
+
 function isViewportOverflowShellSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
   if (node.rect.y >= viewportRect.y - 1) return false;
-  if (node.rect.y + node.rect.height < viewportRect.y + viewportRect.height - 1) return false;
   if (node.rect.width < viewportRect.width * 0.45) return false;
   if (!hasSnapshotDescendantInsideRect(node.childNodes, viewportRect)) return false;
 
-  return true;
+  const viewportBottom = viewportRect.y + viewportRect.height;
+  const nodeBottom = node.rect.y + node.rect.height;
+  if (nodeBottom >= viewportBottom - 1) return true;
+
+  const visibleBounds = getSnapshotDescendantVisibleBounds(node.childNodes, viewportRect);
+  if (!visibleBounds || visibleBounds.y + visibleBounds.height <= nodeBottom + 1) return false;
+
+  return isViewportShellLikeSnapshot(node, viewportRect);
 }
 
 function pruneViewportTopOverflowSnapshots(rootSnapshot: ElementSnapshot): void {
@@ -569,12 +767,48 @@ function pruneViewportTopOverflowSnapshotsInner(node: ElementSnapshot, viewportR
 
 function isViewportTopOverflowSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
   if (node.rect.y >= viewportRect.y - 1) return false;
+  if (isViewportTopOverflowToolbarSnapshot(node, viewportRect)) return true;
 
   const visibleBottom = node.rect.y + node.rect.height;
   if (visibleBottom <= viewportRect.y) return true;
 
   const visibleHeight = visibleBottom - viewportRect.y;
   return visibleHeight <= 8 && node.rect.height >= 16;
+}
+
+function isViewportTopOverflowToolbarSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
+  const visibleBottom = node.rect.y + node.rect.height;
+  if (visibleBottom <= viewportRect.y || visibleBottom > viewportRect.y + 96) return false;
+  if (node.rect.height < 16 || node.rect.height > 120) return false;
+
+  const name = node.owningReactComponent || "";
+  const identity = `${node.tag} ${node.attributes.id || ""} ${node.attributes.class || ""} ${name}`;
+  const compactIdentity = identity.replace(/[-_\s]/g, "").toLowerCase();
+  const isToolbarNode = /(listtoolbar|toolbar|pageheader|listheader)/.test(compactIdentity);
+  if (!isToolbarNode && !hasToolbarSnapshotDescendant(node)) {
+    return false;
+  }
+
+  const text = normalizeToolbarActionText(getSnapshotText(node));
+  if (!text || text.length > 80) return false;
+
+  return true;
+}
+
+function hasToolbarSnapshotDescendant(node: ElementSnapshot, depth = 0): boolean {
+  if (depth >= 4) return false;
+
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    const name = child.owningReactComponent || "";
+    const identity = `${child.tag} ${child.attributes.id || ""} ${child.attributes.class || ""} ${name}`;
+    const compactIdentity = identity.replace(/[-_\s]/g, "").toLowerCase();
+    if (/(listtoolbar|toolbar|pageheader|listheader)/.test(compactIdentity)) return true;
+    if (hasToolbarSnapshotDescendant(child, depth + 1)) return true;
+  }
+
+  return false;
 }
 
 function normalizeGeneratedViewportRootOverlays(rootSnapshot: ElementSnapshot): void {
@@ -669,6 +903,9 @@ function normalizeScrolledViewportShells(
       child.rect.height = viewportRect.height;
       child.rect.cssHeight = Math.round(viewportRect.height);
       child.styles.height = `${roundPx(viewportRect.height)}px`;
+      child.styles.overflow = "hidden";
+      child.styles.overflowX = "hidden";
+      child.styles.overflowY = "hidden";
 
       if (child.rect.x <= viewportRect.x + 1 && child.rect.width >= viewportRect.width - 2) {
         child.rect.x = viewportRect.x;
@@ -692,10 +929,24 @@ function isScrolledViewportShell(
   viewportRect: { x: number; y: number; width: number; height: number },
 ): boolean {
   if (node.rect.y >= viewportRect.y - 1) return false;
-  if (node.rect.y + node.rect.height < viewportRect.height * 0.55) return false;
+  const visibleBounds = getSnapshotDescendantVisibleBounds(node.childNodes, viewportRect);
+  if (!visibleBounds) return false;
+  const viewportBottom = viewportRect.y + viewportRect.height;
+  const nodeBottom = node.rect.y + node.rect.height;
+  if (nodeBottom < viewportRect.height * 0.55 && visibleBounds.y + visibleBounds.height <= nodeBottom + 1) {
+    return false;
+  }
   if (node.rect.width < viewportRect.width * 0.55) return false;
   if (!hasSnapshotDescendantInsideRect(node.childNodes, viewportRect)) return false;
+  if (nodeBottom < viewportBottom - 1 && !isViewportShellLikeSnapshot(node, viewportRect)) return false;
 
+  return isViewportShellLikeSnapshot(node, viewportRect);
+}
+
+function isViewportShellLikeSnapshot(
+  node: ElementSnapshot,
+  viewportRect: { width: number; height: number },
+): boolean {
   const identity = `${node.tag} ${node.attributes.id || ""} ${node.attributes.class || ""}`;
   if (/(^|\s)(HTML|BODY)(\s|$)/i.test(identity)) return true;
   if (/(^|[-_\s])(root|app|layout|container|page|screen)([-_\s]|$)/i.test(identity)) return true;
@@ -967,6 +1218,9 @@ function snapshotElement(
   let rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
+  if (isTableMeasurementSnapshot(element, rect, childNodes)) {
+    return null;
+  }
   unclipZeroSizeVisibleWrapper(computedStyles, rect, childNodes);
   const externalPseudoOverflowRelaxed = relaxExternalPseudoElementClipping(computedStyles, rect, childNodes);
   const externalControlOverflowRelaxed = relaxExternalMaterializedControlClipping(computedStyles, rect, childNodes);
@@ -2857,6 +3111,97 @@ function getCaptureScrollHeight(rootElement: Element, rootSnapshot: ElementSnaps
   );
 }
 
+function extendFullPageFixedBackgrounds(rootSnapshot: ElementSnapshot, viewportHeight: number): void {
+  extendFullPageFixedBackgroundsInner(rootSnapshot, rootSnapshot.rect, viewportHeight);
+}
+
+function extendFullPageFixedBackgroundsInner(
+  node: ElementSnapshot,
+  pageRect: ElementRect,
+  viewportHeight: number,
+): void {
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (isFullPageFixedBackgroundSnapshot(child, pageRect, viewportHeight)) {
+      const oldRect = { ...child.rect };
+      anchorSnapshotToParent(child, pageRect);
+      child.rect.x = pageRect.x;
+      child.rect.y = pageRect.y;
+      child.rect.width = pageRect.width;
+      child.rect.height = pageRect.height;
+      child.rect.cssWidth = Math.round(child.rect.width);
+      child.rect.cssHeight = Math.round(child.rect.height);
+      child.styles.left = "0px";
+      child.styles.top = "0px";
+      child.styles.width = `${roundPx(child.rect.width)}px`;
+      child.styles.height = `${roundPx(child.rect.height)}px`;
+      child.styles.minHeight = `${roundPx(child.rect.height)}px`;
+      child.styles.overflow = "hidden";
+      child.styles.overflowX = "hidden";
+      child.styles.overflowY = "hidden";
+      rebaseBottomAnchoredDescendants(child, oldRect, child.rect);
+    }
+
+    extendFullPageFixedBackgroundsInner(child, pageRect, viewportHeight);
+  }
+}
+
+function isFullPageFixedBackgroundSnapshot(
+  node: ElementSnapshot,
+  pageRect: ElementRect,
+  viewportHeight: number,
+): boolean {
+  if (node.styles.position !== "fixed") return false;
+  if (node.rect.x > pageRect.x + 2 || node.rect.y > pageRect.y + 2) return false;
+  if (node.rect.width < pageRect.width * 0.75) return false;
+  if (node.rect.height < viewportHeight * 0.5) return false;
+  if (!hasSnapshotBackgroundPaint(node.styles)) return false;
+
+  const zIndex = parseInt(node.styles.zIndex || "", 10);
+  if (Number.isFinite(zIndex) && zIndex > 2) return false;
+
+  const identity = `${node.tag} ${node.attributes.id || ""} ${node.attributes.class || ""}`;
+  return /(^|[-_\s])(bg|background|layout-bg|page-bg|root-bg)([-_\s]|$)/i.test(identity) ||
+    node.rect.width >= pageRect.width - 2;
+}
+
+function hasSnapshotBackgroundPaint(styles: Record<string, string>): boolean {
+  if (styles.backgroundImage && styles.backgroundImage !== "none") return true;
+  return Boolean(styles.backgroundColor && isVisiblePaint(styles.backgroundColor));
+}
+
+function rebaseBottomAnchoredDescendants(
+  node: ElementSnapshot,
+  oldParentRect: ElementRect,
+  newParentRect: ElementRect,
+): void {
+  const oldBottom = oldParentRect.y + oldParentRect.height;
+  const newBottom = newParentRect.y + newParentRect.height;
+  const deltaY = newBottom - oldBottom;
+  if (Math.abs(deltaY) <= 0.5) return;
+
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+
+    if (isBottomAnchoredSnapshot(child)) {
+      offsetSnapshotNode(child, 0, deltaY);
+      child.styles.top = `${roundPx(child.rect.y - newParentRect.y)}px`;
+      continue;
+    }
+
+    rebaseBottomAnchoredDescendants(child, oldParentRect, newParentRect);
+  }
+}
+
+function isBottomAnchoredSnapshot(node: ElementSnapshot): boolean {
+  const position = node.styles.position || "";
+  if (position !== "absolute" && position !== "fixed") return false;
+
+  const bottom = parsePx(node.styles.bottom || "", NaN);
+  return Number.isFinite(bottom);
+}
+
 function extendLeftSidebarBackgrounds(
   rootSnapshot: ElementSnapshot,
   rootElement: Element,
@@ -2879,6 +3224,7 @@ function extendLeftSidebarBackgrounds(
       continue;
     }
 
+    anchorFullPageSidebarSnapshot(candidate, snapshot, rootSnapshot);
     const targetBottom = rootSnapshot.rect.y + captureHeight;
     const targetHeight = targetBottom - snapshot.rect.y;
     if (targetHeight <= snapshot.rect.height + 4) continue;
@@ -2920,25 +3266,53 @@ function isLeftSidebarBackgroundCandidate(
   if (captureHeight <= rect.height + 64) return false;
   if (rect.height < view.innerHeight * 0.55 || rect.height > view.innerHeight + 96) return false;
 
-  if (snapshot.rect.x > rootSnapshot.rect.x + 8) return false;
-  if (snapshot.rect.y > rootSnapshot.rect.y + 32) return false;
-
   const computed = getComputedStyleFor(element);
   if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
-  if (!hasExtendableSidebarPaint(computed)) return false;
 
   const identity = getElementIdentity(element);
   const looksLikeSidebar = /(^|[-_\s])(aside|sidebar|side-bar|sider|layout-sider|side-menu|el-menu|ant-menu|nav|menu)([-_\s]|$)/i.test(identity);
   const pinnedToViewport = computed.position === "fixed" || computed.position === "sticky";
   const fillsViewport = rect.height >= view.innerHeight * 0.85;
+  if (!looksLikeSidebar && !pinnedToViewport && !fillsViewport) return false;
+  if (!hasExtendableSidebarPaint(computed) && !(looksLikeSidebar && hasSidebarSurfacePaint(computed))) return false;
 
-  return looksLikeSidebar || pinnedToViewport || fillsViewport;
+  if (snapshot.rect.x > rootSnapshot.rect.x + 8) return false;
+  const allowedTopOffset = (looksLikeSidebar || pinnedToViewport || fillsViewport)
+    ? Math.max(32, Math.min(96, view.innerHeight * 0.18))
+    : 32;
+  if (snapshot.rect.y > rootSnapshot.rect.y + allowedTopOffset) return false;
+
+  return true;
+}
+
+function anchorFullPageSidebarSnapshot(
+  element: Element,
+  snapshot: ElementSnapshot,
+  rootSnapshot: ElementSnapshot,
+): void {
+  const view = getNodeWindow(element);
+  if (rootSnapshot.rect.height <= view.innerHeight + 4) return;
+
+  const computed = getComputedStyleFor(element);
+  const identity = getElementIdentity(element);
+  const shouldAnchor = computed.position === "fixed" ||
+    computed.position === "sticky" ||
+    /(^|[-_\s])(aside|sidebar|side-bar|sider|layout-sider|side-menu|el-menu|ant-menu|nav|menu)([-_\s]|$)/i.test(identity);
+  if (!shouldAnchor) return;
+
+  anchorSnapshotToParent(snapshot, rootSnapshot.rect);
 }
 
 function hasExtendableSidebarPaint(computed: CSSStyleDeclaration): boolean {
   if (computed.backgroundImage && computed.backgroundImage !== "none") return true;
   if (!isVisiblePaint(computed.backgroundColor)) return false;
   return !isNearWhitePaint(computed.backgroundColor);
+}
+
+function hasSidebarSurfacePaint(computed: CSSStyleDeclaration): boolean {
+  if (computed.backgroundImage && computed.backgroundImage !== "none") return true;
+  if (isVisiblePaint(computed.backgroundColor)) return true;
+  return hasVisibleBorderStyles(computed);
 }
 
 function pruneStatusDistributionSnapshots(root: ElementSnapshot): void {
@@ -3488,6 +3862,35 @@ function getSnapshotText(node: SnapshotNode): string {
     .join("")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isTableMeasurementSnapshot(
+  element: Element,
+  rect: ElementRect,
+  childNodes: SnapshotNode[],
+): boolean {
+  if (rect.height > 0.5) return false;
+  if (!hasSnapshotText(childNodes)) return false;
+  if (!element.closest(".ant-table, [class*=\"ant-table\"]")) return false;
+
+  const tag = element.tagName.toUpperCase();
+  if (tag === "TR" && element.getAttribute("aria-hidden") === "true") return true;
+  if ((tag === "TD" || tag === "TH") && element.closest("tr[aria-hidden=\"true\"]")) return true;
+
+  const identity = getElementIdentity(element);
+  if (/(^|[-_\s])(measure|measurement|measure-row|measure-cell|resize-observer)([-_\s]|$)/i.test(identity)) {
+    return true;
+  }
+
+  if (element.closest(".ant-table-measure-row, .ant-table-measure-cell, [class*=\"measure-row\"], [class*=\"measure-cell\"]")) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasSnapshotText(childNodes: SnapshotNode[]): boolean {
+  return childNodes.some((child) => getSnapshotText(child).length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -4966,6 +5369,8 @@ function collectSnapshotVisibleDescendantRects(
   rects: Rect[],
 ): void {
   for (const child of childNodes) {
+    if (isElementNodeSnapshot(child) && isSnapshotVisuallyHidden(child)) continue;
+
     const visibleRect = intersectSnapshotRect(child.rect, clipRect);
     if (visibleRect) rects.push(visibleRect);
 
@@ -4973,6 +5378,14 @@ function collectSnapshotVisibleDescendantRects(
       collectSnapshotVisibleDescendantRects(child.childNodes, clipRect, rects);
     }
   }
+}
+
+function isSnapshotVisuallyHidden(node: ElementSnapshot): boolean {
+  const opacity = Number.parseFloat(node.styles.opacity || "1");
+  return node.styles.display === "none" ||
+    node.styles.visibility === "hidden" ||
+    node.styles.visibility === "collapse" ||
+    (Number.isFinite(opacity) && opacity <= 0.01);
 }
 
 function intersectSnapshotRect(

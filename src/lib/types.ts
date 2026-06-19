@@ -225,11 +225,18 @@ export interface CaptureTree {
 // Serialization options
 // ---------------------------------------------------------------------------
 
+export type CaptureMode = "viewport" | "full-page";
+
+export interface CapturePageOptions {
+  captureMode?: CaptureMode;
+}
+
 export interface CaptureOptions {
   assertLayoutValid?: boolean;
   skipRemoteAssetSerialization?: boolean;
   includeReactFiberTree?: boolean;
   captureDeclaredStyles?: boolean;
+  captureMode?: CaptureMode;
   timeoutSignal?: AbortSignal;
 }
 
@@ -285,7 +292,7 @@ export interface SubmitResult {
 // ---------------------------------------------------------------------------
 
 export interface DomCaptureAPI {
-  capturePage: (selector?: string) => Promise<string>;
+  capturePage: (selector?: string, options?: CapturePageOptions) => Promise<string>;
   submitCapture: (
     json: string,
     captureId: string,

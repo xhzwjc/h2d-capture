@@ -1,4 +1,6 @@
 (() => {
+  type CaptureMode = "viewport" | "full-page";
+
   const HOST_ID = "__figma_capture_ext_toolbar__";
 
   // Detect Firefox in MAIN world via CSS/navigator (browser.runtime.getBrowserInfo
@@ -160,7 +162,7 @@
     /* Actions */
     .actions {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, max-content);
       gap: 6px;
       padding: 0 10px 4px;
     }
@@ -353,6 +355,7 @@
 
   const iconPaths: Record<string, string[]> = {
     screen: ["M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v7a1.5 1.5 0 0 1-1.5 1.5H9v2h2a.5.5 0 0 1 0 1H5a.5.5 0 0 1 0-1h2v-2H3.5A1.5 1.5 0 0 1 2 10.5v-7ZM3.5 3a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.5-.5h-9Z"],
+    page: ["M4 1.5A1.5 1.5 0 0 0 2.5 3v10A1.5 1.5 0 0 0 4 14.5h8A1.5 1.5 0 0 0 13.5 13V5.25a.75.75 0 0 0-.22-.53L10.28 1.72a.75.75 0 0 0-.53-.22H4Zm0 1h5V5a1 1 0 0 0 1 1h2.5v7a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5Zm6 .7L11.8 5H10V3.2ZM5.25 8a.5.5 0 0 1 .5-.5h4.5a.5.5 0 0 1 0 1h-4.5a.5.5 0 0 1-.5-.5Zm0 2a.5.5 0 0 1 .5-.5h4.5a.5.5 0 0 1 0 1h-4.5a.5.5 0 0 1-.5-.5Z"],
     select: ["M3 2a1 1 0 0 0-1 1v2.5a.5.5 0 0 1-1 0V3a2 2 0 0 1 2-2h2.5a.5.5 0 0 1 0 1H3Zm7.5-1a.5.5 0 0 1 .5-.5H13a2 2 0 0 1 2 2v2.5a.5.5 0 0 1-1 0V3a1 1 0 0 0-1-1h-2.5a.5.5 0 0 1-.5-.5ZM1.5 10a.5.5 0 0 1 .5.5V13a1 1 0 0 0 1 1h2.5a.5.5 0 0 1 0 1H3a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5Zm13 0a.5.5 0 0 1 .5.5V13a2 2 0 0 1-2 2h-2.5a.5.5 0 0 1 0-1H13a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 .5-.5Z"],
     chevronDown: ["M4.22 5.22a.75.75 0 0 1 1.06 0L8 7.94l2.72-2.72a.75.75 0 1 1 1.06 1.06L8.53 9.53a.75.75 0 0 1-1.06 0L4.22 6.28a.75.75 0 0 1 0-1.06Z"],
     close: ["M3.47 3.47a.75.75 0 0 1 1.06 0L8 6.94l3.47-3.47a.75.75 0 1 1 1.06 1.06L9.06 8l3.47 3.47a.75.75 0 1 1-1.06 1.06L8 9.06l-3.47 3.47a.75.75 0 0 1-1.06-1.06L6.94 8 3.47 4.53a.75.75 0 0 1 0-1.06Z"],
@@ -457,14 +460,15 @@
     return btn;
   }
 
-  const btnScreen = makeActionBtn("screen", isFrame ? "This frame" : "Entire screen", () => capture("body", true));
+  const btnScreen = makeActionBtn("screen", isFrame ? "This frame" : "Entire screen", () => capture("body", true, "viewport"));
+  const btnFullPage = makeActionBtn("page", "Full page", () => capture("body", true, "full-page"));
   const btnSelect = makeActionBtn("select", "Select element", () => startSelection("figma"));
   const btnDebugScreen = makeActionBtn("screen", "Copy screen", () => copyDebugData("body", true));
   btnDebugScreen.classList.add("debug");
   const btnDebugSelect = makeActionBtn("select", "Copy element", () => startSelection("debug"));
   btnDebugSelect.classList.add("debug");
 
-  actions.append(btnScreen, btnSelect);
+  actions.append(btnScreen, btnFullPage, btnSelect);
 
   const debugToggleWrap = document.createElement("div");
   debugToggleWrap.className = "debug-toggle-wrap";
@@ -562,7 +566,7 @@
   let captureAborted = false;
   let stopTimer: ReturnType<typeof setTimeout> | null = null;
 
-  async function capture(selector: string, autoDestroy: boolean = true): Promise<void> {
+  async function capture(selector: string, autoDestroy: boolean = true, captureMode: CaptureMode = "viewport"): Promise<void> {
     if (!window.figma?.capturePage) {
       showStatus("Error: capture script not loaded", false);
       return;
@@ -595,7 +599,7 @@
     }
 
     try {
-      const json = await window.figma.capturePage(selector);
+      const json = await window.figma.capturePage(selector, { captureMode });
       if (captureAborted) {
         ffClipboard?.reject(new Error("aborted"));
         return;
@@ -642,7 +646,7 @@
 
     try {
       const beforeDiagnostics = collectDebugDiagnostics(selector);
-      const json = await window.figma.capturePage(selector);
+      const json = await window.figma.capturePage(selector, { captureMode: "viewport" });
       const afterDiagnostics = collectDebugDiagnostics(selector);
       if (captureAborted) return;
 

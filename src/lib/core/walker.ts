@@ -89,6 +89,9 @@ export function isNodeVisible(element: Element): boolean {
   // Figma can't represent that, so skip the subtree)
   if (computed.visibility === "hidden") return false;
 
+  const opacity = Number.parseFloat(computed.opacity || "1");
+  if (Number.isFinite(opacity) && opacity <= 0.01) return false;
+
   return true;
 }
 
