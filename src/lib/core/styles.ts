@@ -42,8 +42,10 @@ export function diffStyles(element: Element, pseudo?: string): Record<string, st
   // Compare each tracked property against its default.
   for (const [property, defaultValue] of Object.entries(BASELINE_STYLES)) {
     const value = computed.getPropertyValue(property) || (computed as unknown as Record<string, string>)[property];
-    if (value !== defaultValue) {
-      diff[property] = value;
+    const normalizedValue = normalizeCssColorFunctions(value);
+    const normalizedDefault = normalizeCssColorFunctions(defaultValue);
+    if (normalizedValue !== normalizedDefault) {
+      diff[property] = normalizedValue;
     }
   }
 
@@ -70,6 +72,39 @@ export function diffStyles(element: Element, pseudo?: string): Record<string, st
   }
 
   return diff;
+}
+
+export function normalizeCssColorFunctions(value: string): string {
+  if (!value || !value.includes("color(")) return value;
+
+  return value.replace(
+    /color\(\s*srgb\s+([+-]?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?%?)\s+([+-]?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?%?)\s+([+-]?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?%?)(?:\s*\/\s*([+-]?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?%?))?\s*\)/gi,
+    (_match, red: string, green: string, blue: string, alpha: string | undefined) => {
+      const r = Math.round(clampCssColorComponent(red) * 255);
+      const g = Math.round(clampCssColorComponent(green) * 255);
+      const b = Math.round(clampCssColorComponent(blue) * 255);
+      const a = alpha == null ? 1 : clampCssAlpha(alpha);
+      return a >= 1 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${roundCssAlpha(a)})`;
+    },
+  );
+}
+
+function clampCssColorComponent(value: string): number {
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed)) return 0;
+  const normalized = value.trim().endsWith("%") ? parsed / 100 : parsed;
+  return Math.min(1, Math.max(0, normalized));
+}
+
+function clampCssAlpha(value: string): number {
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed)) return 1;
+  const normalized = value.trim().endsWith("%") ? parsed / 100 : parsed;
+  return Math.min(1, Math.max(0, normalized));
+}
+
+function roundCssAlpha(value: number): number {
+  return Math.round(value * 10000) / 10000;
 }
 
 // ---------------------------------------------------------------------------

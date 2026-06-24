@@ -247,6 +247,7 @@ export interface CaptureOptions {
 export interface CaptureContext {
   captureDeclaredStyles: boolean;
   declaredStylesCache: Map<Document, StylesheetCache> | undefined;
+  svgSpriteCache?: Map<string, Document>;
 }
 
 export interface StylesheetCache {

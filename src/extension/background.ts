@@ -237,11 +237,19 @@ function installCorsBridge(): void {
 
   // Use whichever API is available (Firefox: browser.*, Chrome: chrome.*)
   const rt = typeof browser !== "undefined" ? browser.runtime : chrome.runtime;
+  const handledBridgeRequestIds = new Set<string>();
+
+  function claimBridgeRequest(callbackId: string): boolean {
+    if (handledBridgeRequestIds.has(callbackId)) return false;
+    handledBridgeRequestIds.add(callbackId);
+    window.setTimeout(() => handledBridgeRequestIds.delete(callbackId), 30_000);
+    return true;
+  }
 
   // CORS image fetch bridge
-  window.addEventListener("figma-capture-fetch", async (event) => {
-    const detail = (event as CustomEvent).detail;
+  async function handleFetchBridgeRequest(detail: { url?: string; callbackId?: string } | undefined): Promise<void> {
     if (!detail?.url || !detail?.callbackId) return;
+    if (!claimBridgeRequest(detail.callbackId)) return;
 
     try {
       const result = await rt.sendMessage({
@@ -254,21 +262,60 @@ function installCorsBridge(): void {
           detail: { callbackId: detail.callbackId, result },
         }),
       );
+      window.postMessage(
+        {
+          type: "figma-capture-fetch-result",
+          callbackId: detail.callbackId,
+          result,
+        },
+        window.location.origin,
+      );
     } catch (err) {
+      const result = { error: String(err) };
       window.dispatchEvent(
         new CustomEvent("figma-capture-fetch-result", {
           detail: {
             callbackId: detail.callbackId,
-            result: { error: String(err) },
+            result,
           },
         }),
       );
+      window.postMessage(
+        {
+          type: "figma-capture-fetch-result",
+          callbackId: detail.callbackId,
+          result,
+        },
+        window.location.origin,
+      );
     }
+  }
+
+  window.addEventListener("figma-capture-fetch", async (event) => {
+    await handleFetchBridgeRequest((event as CustomEvent).detail);
+  });
+
+  window.addEventListener("message", async (event) => {
+    if (event.source !== window) return;
+    const data = event.data as { type?: string; url?: string; callbackId?: string } | null;
+    if (data?.type !== "figma-capture-fetch") return;
+    await handleFetchBridgeRequest(data);
   });
 
   window.addEventListener("figma-capture-visible-tab", async (event) => {
-    const detail = (event as CustomEvent).detail;
+    await handleVisibleTabBridgeRequest((event as CustomEvent).detail);
+  });
+
+  window.addEventListener("message", async (event) => {
+    if (event.source !== window) return;
+    const data = event.data as { type?: string; callbackId?: string } | null;
+    if (data?.type !== "figma-capture-visible-tab") return;
+    await handleVisibleTabBridgeRequest(data);
+  });
+
+  async function handleVisibleTabBridgeRequest(detail: { callbackId?: string } | undefined): Promise<void> {
     if (!detail?.callbackId) return;
+    if (!claimBridgeRequest(detail.callbackId)) return;
 
     try {
       const result = await rt.sendMessage({
@@ -280,16 +327,33 @@ function installCorsBridge(): void {
           detail: { callbackId: detail.callbackId, result },
         }),
       );
+      window.postMessage(
+        {
+          type: "figma-capture-visible-tab-result",
+          callbackId: detail.callbackId,
+          result,
+        },
+        window.location.origin,
+      );
     } catch (err) {
+      const result = { error: String(err) };
       window.dispatchEvent(
         new CustomEvent("figma-capture-visible-tab-result", {
           detail: {
             callbackId: detail.callbackId,
-            result: { error: String(err) },
+            result,
           },
         }),
       );
+      window.postMessage(
+        {
+          type: "figma-capture-visible-tab-result",
+          callbackId: detail.callbackId,
+          result,
+        },
+        window.location.origin,
+      );
     }
-  });
+  }
 
 }

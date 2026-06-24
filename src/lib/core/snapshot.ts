@@ -5,12 +5,12 @@
 import { getSourceAnnotations, getInspectorSelectedId } from '../react/fiber.js';
 import { TypefaceProbe, resolveFonts } from '../typography/probe.js';
 import { ResourceResolver, CaptureError, resolveResources, canvasToBlob } from '../media/resolver.js';
-import { bakeSvgStyles } from '../media/svg.js';
+import { bakeSvgStyles, preloadExternalSvgSprites } from '../media/svg.js';
 import { resolveTransform, multiplyMatrices, getElementRect } from '../transform/matrix.js';
 import { extractComponentTree, findParentComponent } from '../react/tree.js';
 import { inferLayoutSizing } from './layout.js';
 import { NODE_TYPES, isNodeVisible, shouldPruneNode, iterateChildNodes, getTextRect, getElementAttributes, matrixToSimple, INPUT_TYPES_WITH_PLACEHOLDER, isFullyClippedByHorizontalScrollAncestor, isFullyClippedByVerticalOverlayScrollAncestor, isVerticalOverlayScrollClipAncestor } from './walker.js';
-import { diffStyles, ensureFlexProps, ensureGridProps, ensureFlexItemProps } from './styles.js';
+import { diffStyles, ensureFlexProps, ensureGridProps, ensureFlexItemProps, normalizeCssColorFunctions } from './styles.js';
 import { prepareForCapture, decodeImages, assertLayoutValid, resetScrollbarState, cleanupScrollbar } from './prepare.js';
 import { getDeclaredLayoutStyles } from './declared.js';
 import { getComputedStyleFor, getNodeDocument, getNodeWindow, isInstanceOfOwner } from './dom.js';
@@ -70,6 +70,12 @@ const LAYOUT_STYLE_PROPS = [
   "gridColumn",
   "gridRow",
 ] as const;
+
+const PRIVATE_USE_GLYPH_PATTERN = /[\uE000-\uF8FF]/u;
+const PRIVATE_USE_GLYPH_ONLY_PATTERN = /^[\uE000-\uF8FF]+$/u;
+const TOOLBAR_ACTION_TEXT_PATTERN = /^(新建|新增|创建|发起|关闭|转交|批量|授权|审批|导入|导出|删除|移除|编辑|保存|提交|发布|取消|通过|驳回|分配|转移|复制|下载|上传|启用|停用|禁用|加入|进入|设置|重置)/;
+const TOOLBAR_ACTION_TEXT_START_PATTERN = /新建|新增|创建|发起|关闭|转交|批量|导入|导出|删除|移除|编辑|保存|提交|发布|取消|通过|驳回|分配|转移|复制|下载|上传|启用|停用|禁用|加入|进入|设置|重置/g;
+const TOOLBAR_ACTION_TEXT_HIT_PATTERN = /新建|新增|创建|发起|关闭|转交|批量|授权|审批|导入|导出|删除|移除|编辑|保存|提交|发布|取消|通过|驳回|分配|转移|复制|下载|上传|启用|停用|禁用|加入|进入|设置|重置/g;
 
 // ---------------------------------------------------------------------------
 // Node ID tracking
@@ -162,6 +168,7 @@ async function captureDOMInner(
     // Scroll through the page to trigger lazy-loaded images
     await prepareForCapture(element);
     await decodeImages(Array.from(element.querySelectorAll("img")));
+    ctx.svgSpriteCache = await preloadExternalSvgSprites(element);
 
     const serialized = await snapshotInAnimationFrame(
       element,
@@ -186,6 +193,8 @@ async function captureDOMInner(
       normalizeViewportOverflowShells(rootSnapshot);
       relaxViewportVisibleClipContainers(rootSnapshot);
       pruneViewportTopOverflowSnapshots(rootSnapshot);
+      pruneNestedViewportClipOverflowSnapshots(rootSnapshot);
+      normalizeVirtualViewportWrapperBounds(rootSnapshot);
     } else {
       normalizeElementCaptureOrigin(rootSnapshot, elementRect);
     }
@@ -227,6 +236,7 @@ async function captureDOMInner(
 
     await prepareForCapture(doc.documentElement);
     await decodeImages(Array.from(doc.images));
+    ctx.svgSpriteCache = await preloadExternalSvgSprites(doc.documentElement);
 
     const serialized = await snapshotInAnimationFrame(
       doc.documentElement,
@@ -266,6 +276,8 @@ async function captureDOMInner(
       normalizeViewportOverflowShells(rootSnapshot);
       relaxViewportVisibleClipContainers(rootSnapshot);
       pruneViewportTopOverflowSnapshots(rootSnapshot);
+      pruneNestedViewportClipOverflowSnapshots(rootSnapshot);
+      normalizeVirtualViewportWrapperBounds(rootSnapshot);
     } else {
       normalizeFullPageDocumentSnapshot(
         rootSnapshot,
@@ -282,6 +294,8 @@ async function captureDOMInner(
     normalizeViewportCropCanvasGeometry(rootSnapshot);
     promoteExternalActionToolbarSnapshots(rootSnapshot);
     if (shouldUseViewportRect) {
+      removeGeneratedToolbarActionOverlays(rootSnapshot);
+      appendCompactToolbarActionOverlays(rootSnapshot, doc.documentElement);
       normalizeGeneratedViewportRootOverlays(rootSnapshot);
       clampSlightViewportRootOverscroll(rootSnapshot);
     }
@@ -693,6 +707,242 @@ function relaxViewportVisibleClipContainer(node: ElementSnapshot, viewportRect: 
   }
 }
 
+function pruneNestedViewportClipOverflowSnapshots(rootSnapshot: ElementSnapshot): void {
+  pruneNestedViewportClipOverflowSnapshotsInner(rootSnapshot, rootSnapshot.rect, 0);
+}
+
+function pruneNestedViewportClipOverflowSnapshotsInner(
+  node: ElementSnapshot,
+  viewportRect: ElementRect,
+  depth: number,
+): void {
+  if (isNestedViewportClipSnapshot(node, viewportRect, depth)) {
+    pruneSnapshotChildrenToClipRect(node, node.rect);
+  }
+
+  for (const child of node.childNodes) {
+    if (isElementNodeSnapshot(child)) {
+      pruneNestedViewportClipOverflowSnapshotsInner(child, viewportRect, depth + 1);
+    }
+  }
+}
+
+function isNestedViewportClipSnapshot(
+  node: ElementSnapshot,
+  viewportRect: ElementRect,
+  depth: number,
+): boolean {
+  if (depth < 3) return false;
+  if (node.tag === "HTML" || node.tag === "BODY") return false;
+  if (node.childNodes.length === 0) return false;
+  if (node.rect.width <= 0 || node.rect.height <= 0) return false;
+  if (isNarrowNavigationClipSnapshot(node, viewportRect)) return false;
+  if (!isSnapshotRectIntersectingRect(node.rect, viewportRect)) return false;
+  if (!isViewportPaneSizedSnapshot(node, viewportRect)) return false;
+  if (!isSnapshotOverflowClipContainer(node.styles)) return false;
+  if (!hasSnapshotDescendantInsideRect(node.childNodes, node.rect)) return false;
+  return hasSnapshotChildOutsideRect(node.childNodes, node.rect);
+}
+
+function isViewportPaneSizedSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
+  if (node.rect.width < Math.min(480, viewportRect.width * 0.35)) return false;
+  if (node.rect.height < Math.min(360, viewportRect.height * 0.42)) return false;
+
+  const viewportBottom = viewportRect.y + viewportRect.height;
+  const nodeBottom = node.rect.y + node.rect.height;
+  if (node.rect.y > viewportRect.y + viewportRect.height * 0.28) return false;
+  return nodeBottom >= viewportBottom - Math.max(48, viewportRect.height * 0.08);
+}
+
+function pruneSnapshotChildrenToClipRect(node: ElementSnapshot, clipRect: ElementRect): void {
+  node.childNodes = node.childNodes.filter((child) => {
+    if (isElementNodeSnapshot(child)) {
+      pruneSnapshotChildrenToClipRect(child, clipRect);
+      normalizeTransparentClipWrapperBounds(child, clipRect);
+      if (isPreservedOverflowActionToolbarSnapshot(child, clipRect)) return true;
+    }
+
+    if (!isSnapshotFullyOutsideRect(child.rect, clipRect)) return true;
+    if (isElementNodeSnapshot(child) && hasSnapshotDescendantInsideRect(child.childNodes, clipRect)) return true;
+    return false;
+  });
+}
+
+function isPreservedOverflowActionToolbarSnapshot(node: ElementSnapshot, clipRect: ElementRect): boolean {
+  if (!isSnapshotRectNearRect(node.rect, clipRect, 96)) return false;
+  return isActionToolbarSnapshot(node) ||
+    isActionToolbarTextClusterSnapshot(node) ||
+    hasActionToolbarSnapshotDescendant(node, 0);
+}
+
+function hasActionToolbarSnapshotDescendant(node: ElementSnapshot, depth: number): boolean {
+  if (depth >= 5) return false;
+
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (isActionToolbarSnapshot(child) || isActionToolbarTextClusterSnapshot(child)) return true;
+    if (hasActionToolbarSnapshotDescendant(child, depth + 1)) return true;
+  }
+
+  return false;
+}
+
+function isActionToolbarTextClusterSnapshot(node: ElementSnapshot): boolean {
+  if (node.rect.width < 120 || node.rect.width > 1000) return false;
+  if (node.rect.height < 20 || node.rect.height > 120) return false;
+
+  const text = normalizeToolbarActionText(getSnapshotText(node));
+  if (text.length < 6 || text.length > 96) return false;
+  return countToolbarActionTextHits(text) >= 3;
+}
+
+function isSnapshotRectNearRect(
+  rect: { x: number; y: number; width: number; height: number },
+  clipRect: { x: number; y: number; width: number; height: number },
+  margin: number,
+): boolean {
+  return rect.x + rect.width >= clipRect.x - margin &&
+    rect.x <= clipRect.x + clipRect.width + margin &&
+    rect.y + rect.height >= clipRect.y - margin &&
+    rect.y <= clipRect.y + clipRect.height + margin;
+}
+
+function normalizeTransparentClipWrapperBounds(node: ElementSnapshot, clipRect: ElementRect): void {
+  if (!isTransparentStructuralSnapshot(node)) return;
+  if (isSnapshotOverflowClipContainer(node.styles)) return;
+  if (!hasSnapshotChildOutsideRect(node.childNodes, clipRect) && !isSnapshotRectOutsideRect(node.rect, clipRect)) {
+    return;
+  }
+
+  const visibleBounds = getSnapshotDescendantVisibleBounds(node.childNodes, clipRect);
+  if (!visibleBounds) return;
+  if (visibleBounds.width <= 0 || visibleBounds.height <= 0) return;
+
+  node.rect.x = roundPx(visibleBounds.x);
+  node.rect.y = roundPx(visibleBounds.y);
+  node.rect.width = roundPx(visibleBounds.width);
+  node.rect.height = roundPx(visibleBounds.height);
+  node.rect.cssWidth = Math.round(node.rect.width);
+  node.rect.cssHeight = Math.round(node.rect.height);
+  delete node.rect.quad;
+
+  node.styles.width = `${roundPx(node.rect.width)}px`;
+  node.styles.height = `${roundPx(node.rect.height)}px`;
+  node.styles.minHeight = "0px";
+  if (!isSnapshotOverflowClipContainer(node.styles)) {
+    node.styles.overflow = "visible";
+    node.styles.overflowX = "visible";
+    node.styles.overflowY = "visible";
+  }
+  node.layoutSizingHorizontal = "FIXED";
+  node.layoutSizingVertical = "FIXED";
+}
+
+function isSnapshotFullyOutsideRect(
+  rect: { x: number; y: number; width: number; height: number },
+  clipRect: { x: number; y: number; width: number; height: number },
+): boolean {
+  if (rect.width <= 0 || rect.height <= 0) return false;
+
+  const tolerance = 0.5;
+  return rect.x + rect.width <= clipRect.x + tolerance ||
+    rect.x >= clipRect.x + clipRect.width - tolerance ||
+    rect.y + rect.height <= clipRect.y + tolerance ||
+    rect.y >= clipRect.y + clipRect.height - tolerance;
+}
+
+function normalizeVirtualViewportWrapperBounds(rootSnapshot: ElementSnapshot): void {
+  normalizeVirtualViewportWrapperBoundsInner(rootSnapshot, rootSnapshot.rect, 0);
+}
+
+function normalizeVirtualViewportWrapperBoundsInner(
+  node: ElementSnapshot,
+  viewportRect: ElementRect,
+  depth: number,
+): void {
+  for (const child of node.childNodes) {
+    if (isElementNodeSnapshot(child)) {
+      normalizeVirtualViewportWrapperBoundsInner(child, viewportRect, depth + 1);
+    }
+  }
+
+  if (!isVirtualViewportWrapperOutlier(node, viewportRect, depth)) return;
+
+  const visibleBounds = getSnapshotDescendantVisibleBounds(node.childNodes, viewportRect);
+  if (!visibleBounds) return;
+
+  node.rect.x = roundPx(visibleBounds.x);
+  node.rect.y = roundPx(visibleBounds.y);
+  node.rect.width = roundPx(visibleBounds.width);
+  node.rect.height = roundPx(visibleBounds.height);
+  node.rect.cssWidth = Math.round(node.rect.width);
+  node.rect.cssHeight = Math.round(node.rect.height);
+  delete node.rect.quad;
+
+  node.styles.width = `${roundPx(node.rect.width)}px`;
+  node.styles.height = `${roundPx(node.rect.height)}px`;
+  node.styles.minHeight = "0px";
+  if (!isSnapshotOverflowClipContainer(node.styles)) {
+    node.styles.overflow = "visible";
+    node.styles.overflowX = "visible";
+    node.styles.overflowY = "visible";
+  }
+  node.layoutSizingHorizontal = "FIXED";
+  node.layoutSizingVertical = "FIXED";
+}
+
+function isVirtualViewportWrapperOutlier(
+  node: ElementSnapshot,
+  viewportRect: ElementRect,
+  depth: number,
+): boolean {
+  if (depth < 3) return false;
+  if (node.tag === "HTML" || node.tag === "BODY") return false;
+  if (node.childNodes.length === 0) return false;
+  if (node.rect.width <= 0 || node.rect.height <= 0) return false;
+  if (!isTransparentStructuralSnapshot(node)) return false;
+  if (isNarrowNavigationClipSnapshot(node, viewportRect)) return false;
+
+  const viewportRight = viewportRect.x + viewportRect.width;
+  const viewportBottom = viewportRect.y + viewportRect.height;
+  if (node.rect.x + node.rect.width <= viewportRect.x || node.rect.x >= viewportRight) return false;
+
+  const sticksFarAbove = node.rect.y < viewportRect.y - 96;
+  const sticksFarBelow = node.rect.y + node.rect.height > viewportBottom + 96;
+  const muchTallerThanViewport = node.rect.height > viewportRect.height * 1.35;
+  if (!sticksFarAbove && !sticksFarBelow && !muchTallerThanViewport) return false;
+
+  const visibleBounds = getSnapshotDescendantVisibleBounds(node.childNodes, viewportRect);
+  if (!visibleBounds) return false;
+  if (visibleBounds.width <= 0 || visibleBounds.height <= 0) return false;
+
+  const nodeArea = node.rect.width * node.rect.height;
+  const visibleArea = visibleBounds.width * visibleBounds.height;
+  return visibleArea < nodeArea * 0.9;
+}
+
+function isTransparentStructuralSnapshot(node: ElementSnapshot): boolean {
+  if (isVisiblePaint(node.styles.backgroundColor || "")) return false;
+  if (node.styles.backgroundImage && node.styles.backgroundImage !== "none") return false;
+  if (node.styles.boxShadow && node.styles.boxShadow !== "none") return false;
+  if (hasSnapshotBorderStyles(node.styles)) return false;
+  if (node.placeholderUrl || node.content || node.pseudoElementStyles) return false;
+  return true;
+}
+
+function hasSnapshotBorderStyles(styles: Record<string, string>): boolean {
+  for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
+    const width = parsePx(styles[`border${side}Width`] || "", 0);
+    const style = styles[`border${side}Style`];
+    const color = styles[`border${side}Color`];
+    if (width > 0 && style && style !== "none" && (!color || isVisiblePaint(color))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function isNarrowNavigationClipSnapshot(node: ElementSnapshot, viewportRect: ElementRect): boolean {
   const maxNavWidth = Math.min(360, viewportRect.width * 0.28);
   if (node.rect.width <= 0 || node.rect.width > maxNavWidth) return false;
@@ -1060,6 +1310,11 @@ function snapshotElement(
 
   if (!isNodeVisible(element)) return null;
 
+  const iconFontGlyphSnapshot = snapshotIconFontGlyphElement(element, assetCollector);
+  if (iconFontGlyphSnapshot) {
+    return iconFontGlyphSnapshot;
+  }
+
   const clippedCornerMarkerSnapshot = snapshotClippedCornerMarkerElement(element);
   if (clippedCornerMarkerSnapshot) {
     return clippedCornerMarkerSnapshot;
@@ -1116,6 +1371,8 @@ function snapshotElement(
   ensureTextOnlyLineHeight(element, computedStyles);
   relaxVirtualScrollClipping(element, computedStyles);
   stabilizePopupLayerStacking(element, computedStyles);
+  preserveFloatingMenuSurfaceStyles(element, computedStyles);
+  const absorbedPseudoElements = absorbFullCoverBackgroundPseudos(element, computedStyles);
 
   // Browser propagates body background to the viewport when html has no background.
   // Replicate this so Figma shows the correct background on the root frame.
@@ -1159,7 +1416,7 @@ function snapshotElement(
 
   // SVG: serialize inline; Canvas: rasterize; otherwise: recurse children.
   if (isInstanceOfOwner<SVGElement>(element, element, "SVGElement")) {
-    svgContent = bakeSvgStyles(element);
+    svgContent = bakeSvgStyles(element, ctx.svgSpriteCache);
   } else if (isInstanceOfOwner<HTMLCanvasElement>(element, element, "HTMLCanvasElement")) {
     placeholderUrl = assetCollector.addCanvas(element);
   } else if (!snapshotIframeDocument(element, assetCollector, fontCollector, ctx, childNodes)) {
@@ -1184,13 +1441,14 @@ function snapshotElement(
 
   // Pseudo-element styles (::before, ::after, ::placeholder).
   let pseudoElementStyles: Record<string, Record<string, string>> | undefined;
-  const materializedPseudoElements = materializePseudoElements(element, childNodes);
+  const materializedPseudoElements = materializePseudoElements(element, childNodes, absorbedPseudoElements);
 
   // ::before / ::after — capture when they have visible content
   for (const pseudo of ["::before", "::after"] as const) {
     const pseudoComputed = getComputedStyleFor(element, pseudo);
     const contentValue = pseudoComputed.content;
     if (contentValue && contentValue !== "none" && contentValue !== "normal") {
+      if (absorbedPseudoElements.has(pseudo)) continue;
       if (materializedPseudoElements.has(pseudo)) continue;
       if (!pseudoElementStyles) pseudoElementStyles = {};
       const styles = diffStyles(element, pseudo);
@@ -1216,8 +1474,20 @@ function snapshotElement(
 
   // Element bounding rect (may include rotated quad).
   let rect = getElementRect(element, computedStyles as unknown as CSSStyleDeclaration, combinedTransform);
+  rect = applyNegativeVirtualScrollOffsetToElementRect(element, rect);
   rect = normalizeSmallSvgImageRect(element, computedStyles, rect);
   rect = normalizeTopChromeTextLineBox(element, computedStyles, childNodes, rect);
+  normalizeExcessiveBorderRadii(computedStyles, rect);
+  const insetClipPathNormalized = normalizeInsetClipPathElement(computedStyles, rect);
+  const visibleImageCropRect = getSmallVisibleImageViewportCropRect(element);
+  if (visibleImageCropRect) {
+    placeholderUrl = assetCollector.addViewportCrop(visibleImageCropRect);
+    tagOverride = "CANVAS";
+    rasterizedFrame = true;
+    computedStyles.overflow = "hidden";
+    computedStyles.overflowX = "hidden";
+    computedStyles.overflowY = "hidden";
+  }
   if (isTableMeasurementSnapshot(element, rect, childNodes)) {
     return null;
   }
@@ -1248,6 +1518,10 @@ function snapshotElement(
 
   // Infer layout sizing hints for Figma Auto Layout.
   const sizing = inferLayoutSizing(element, computedStyles, element.parentElement);
+  if (insetClipPathNormalized || stabilizeMeasuredInlineTextGroup(element, computedStyles, rect, childNodes)) {
+    sizing.horizontal = "FIXED";
+    sizing.vertical = "FIXED";
+  }
 
   const attributes = getSnapshotElementAttributes(element, verticalScrollViewportStabilized);
   if (popupActionOverflowRelaxed) {
@@ -1298,6 +1572,305 @@ function getSnapshotElementAttributes(element: Element, forceVerticalScrollViewp
     attributes["data-h2d-vertical-scroll-viewport"] = "true";
   }
   return attributes;
+}
+
+function snapshotIconFontGlyphElement(
+  element: Element,
+  assetCollector: ResourceResolver,
+): ElementSnapshot | null {
+  const glyphText = getPrivateUseGlyphText(element);
+  if (!glyphText || !isIconFontGlyphElement(element, glyphText)) return null;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+
+  const iconCanvas = createIconFontGlyphCanvas(element, glyphText, rect);
+  if (!iconCanvas) return null;
+
+  const computed = getComputedStyleFor(element);
+  const styles: Record<string, string> = {
+    display: "block",
+    boxSizing: "border-box",
+    width: `${roundPx(rect.width)}px`,
+    height: `${roundPx(rect.height)}px`,
+    overflow: "hidden",
+  };
+
+  if (computed.opacity && computed.opacity !== "1") {
+    styles.opacity = computed.opacity;
+  }
+  if (computed.transform && computed.transform !== "none") {
+    styles.transform = computed.transform;
+  }
+  if (computed.borderRadius && computed.borderRadius !== "0px") {
+    styles.borderRadius = computed.borderRadius;
+  }
+
+  return {
+    nodeType: Node.ELEMENT_NODE as 1,
+    id: generateNodeId(element),
+    tag: "CANVAS",
+    attributes: {
+      ...getSnapshotElementAttributes(element),
+      "data-h2d-icon-font-glyph": "true",
+    },
+    styles,
+    rect: toElementRect(rect),
+    childNodes: [],
+    placeholderUrl: assetCollector.addCanvas(iconCanvas),
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function isIconFontGlyphElement(element: Element, glyphText: string): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (tag === "HTML" || tag === "BODY" || tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
+    return false;
+  }
+
+  if (element.childElementCount > 0) return false;
+  if (glyphText.length > 4) return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 4 || rect.height < 4 || rect.width > 64 || rect.height > 64) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.visibility === "hidden" || computed.display === "none") return false;
+  if (Number.parseFloat(computed.opacity || "1") <= 0.01) return false;
+
+  const fontFamily = computed.fontFamily || "";
+  const identity = getElementIdentity(element);
+  const hasIconIdentity =
+    /(^|[-_\s])(icon|glyph|symbol)([-_\s]|$)/i.test(identity) ||
+    /icon|symbol|glyph/i.test(fontFamily);
+  const looksSquare = rect.width <= rect.height * 2.5 && rect.height <= rect.width * 2.5;
+
+  return hasIconIdentity || looksSquare;
+}
+
+function getPrivateUseGlyphText(element: Element): string {
+  const rawText = Array.from(element.childNodes)
+    .filter((node) => node.nodeType === Node.TEXT_NODE)
+    .map((node) => node.textContent || "")
+    .join("");
+  if (!PRIVATE_USE_GLYPH_PATTERN.test(rawText)) return "";
+
+  const glyphText = rawText.replace(/\s+/g, "");
+  return PRIVATE_USE_GLYPH_ONLY_PATTERN.test(glyphText) ? glyphText : "";
+}
+
+function getSmallVisibleImageViewportCropRect(element: Element): Rect | null {
+  if (!isInstanceOfOwner<HTMLImageElement>(element, element, "HTMLImageElement")) return null;
+
+  const img = element;
+  const src = img.currentSrc || img.src || img.getAttribute("src") || "";
+  if (!src) return null;
+  if (!img.complete || img.naturalWidth <= 0 || img.naturalHeight <= 0) return null;
+  if (!isSmallIdentityImageElement(img, src)) return null;
+
+  const view = getNodeWindow(img);
+  if (view.top !== view) return null;
+
+  const rect = img.getBoundingClientRect();
+  if (rect.width < 4 || rect.height < 4 || rect.width > 240 || rect.height > 120) return null;
+  if (rect.left < 0 || rect.top < 0 || rect.right > view.innerWidth || rect.bottom > view.innerHeight) {
+    return null;
+  }
+
+  const computed = getComputedStyleFor(img);
+  if (computed.display === "none" || computed.visibility === "hidden") return null;
+  if (Number.parseFloat(computed.opacity || "1") <= 0.01) return null;
+
+  return {
+    x: rect.left,
+    y: rect.top,
+    width: Math.max(1, rect.width),
+    height: Math.max(1, rect.height),
+  };
+}
+
+function isSmallIdentityImageElement(img: HTMLImageElement, src: string): boolean {
+  const identity = [
+    getElementIdentity(img),
+    img.alt,
+    img.title,
+    img.getAttribute("aria-label") || "",
+    src,
+  ].join(" ");
+
+  return /(^|[-_/.\s])(logo|brand|avatar|portrait|head|icon|symbol|favicon|userpic|profile|图标|头像|标识)([-_/.\s]|$)/i.test(identity);
+}
+
+function createIconFontGlyphCanvas(
+  element: Element,
+  glyphText: string,
+  rect: DOMRect,
+): HTMLCanvasElement | null {
+  const width = Math.max(1, rect.width);
+  const height = Math.max(1, rect.height);
+  const view = getNodeWindow(element);
+  const scale = Math.max(1, Math.min(3, view.devicePixelRatio || 1));
+  const canvas = getNodeDocument(element).createElement("canvas");
+  canvas.width = Math.max(1, Math.ceil(width * scale));
+  canvas.height = Math.max(1, Math.ceil(height * scale));
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  const computed = getComputedStyleFor(element);
+  ctx.scale(scale, scale);
+  ctx.font = getCanvasFontForElement(computed, height);
+  ctx.fillStyle = isVisiblePaint(computed.color) ? computed.color : "rgb(18, 18, 18)";
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left";
+  ctx.direction = computed.direction === "rtl" ? "rtl" : "ltr";
+
+  const metrics = ctx.measureText(glyphText);
+  const left = Number.isFinite(metrics.actualBoundingBoxLeft) ? metrics.actualBoundingBoxLeft : 0;
+  const right = Number.isFinite(metrics.actualBoundingBoxRight) ? metrics.actualBoundingBoxRight : metrics.width;
+  const ascent = Number.isFinite(metrics.actualBoundingBoxAscent) && metrics.actualBoundingBoxAscent > 0
+    ? metrics.actualBoundingBoxAscent
+    : height * 0.75;
+  const descent = Number.isFinite(metrics.actualBoundingBoxDescent)
+    ? metrics.actualBoundingBoxDescent
+    : height * 0.25;
+  const glyphWidth = Math.max(1, left + right, metrics.width);
+  const glyphHeight = Math.max(1, ascent + descent);
+  const x = (width - glyphWidth) / 2 + left;
+  const y = (height - glyphHeight) / 2 + ascent;
+
+  ctx.fillText(glyphText, x, y);
+  return canvas;
+}
+
+function getCanvasFontForElement(computed: CSSStyleDeclaration, fallbackHeight: number): string {
+  if (computed.font && computed.font !== "normal") {
+    return computed.font;
+  }
+
+  const fontStyle = computed.fontStyle && computed.fontStyle !== "normal" ? computed.fontStyle : "";
+  const fontVariant = computed.fontVariant && computed.fontVariant !== "normal" ? computed.fontVariant : "";
+  const fontWeight = computed.fontWeight || "400";
+  const fontSize = computed.fontSize || `${roundPx(Math.max(1, fallbackHeight))}px`;
+  const fontFamily = computed.fontFamily || "sans-serif";
+  return [fontStyle, fontVariant, fontWeight, fontSize, fontFamily].filter(Boolean).join(" ");
+}
+
+function normalizeExcessiveBorderRadii(
+  styles: Record<string, string>,
+  rect: { width: number; height: number },
+): void {
+  if (rect.width <= 0 || rect.height <= 0) return;
+
+  const maxUsefulRadius = Math.max(0, Math.min(rect.width, rect.height) / 2);
+  if (maxUsefulRadius <= 0) return;
+
+  for (const corner of ["TopLeft", "TopRight", "BottomRight", "BottomLeft"] as const) {
+    const key = `border${corner}Radius`;
+    const value = styles[key];
+    if (!value || value === "0px") continue;
+
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed)) continue;
+    if (!/px$/i.test(value.trim())) continue;
+    if (parsed <= maxUsefulRadius * 2 && !/[eE][+-]?\d+/.test(value)) continue;
+
+    styles[key] = `${roundPx(maxUsefulRadius)}px`;
+  }
+}
+
+function normalizeInsetClipPathElement(
+  styles: Record<string, string>,
+  rect: ElementRect,
+): boolean {
+  const inset = parseInsetClipPath(styles.clipPath || "", rect.width, rect.height);
+  if (!inset) return false;
+
+  const visibleWidth = rect.width - inset.left - inset.right;
+  const visibleHeight = rect.height - inset.top - inset.bottom;
+  if (visibleWidth <= 0 || visibleHeight <= 0) return false;
+
+  const changed =
+    inset.top > 0.01 ||
+    inset.right > 0.01 ||
+    inset.bottom > 0.01 ||
+    inset.left > 0.01 ||
+    Boolean(inset.radius);
+  if (!changed) return false;
+
+  rect.x = roundPx(rect.x + inset.left);
+  rect.y = roundPx(rect.y + inset.top);
+  rect.width = roundPx(visibleWidth);
+  rect.height = roundPx(visibleHeight);
+  rect.cssWidth = Math.round(rect.width);
+  rect.cssHeight = Math.round(rect.height);
+
+  styles.width = `${roundPx(rect.width)}px`;
+  styles.height = `${roundPx(rect.height)}px`;
+  styles.overflow = "hidden";
+  styles.overflowX = "hidden";
+  styles.overflowY = "hidden";
+  delete styles.clipPath;
+
+  if (inset.radius) {
+    styles.borderTopLeftRadius = inset.radius;
+    styles.borderTopRightRadius = inset.radius;
+    styles.borderBottomRightRadius = inset.radius;
+    styles.borderBottomLeftRadius = inset.radius;
+  }
+
+  return true;
+}
+
+function parseInsetClipPath(
+  value: string,
+  width: number,
+  height: number,
+): { top: number; right: number; bottom: number; left: number; radius?: string } | null {
+  const match = value.trim().match(/^inset\((.*)\)$/i);
+  if (!match) return null;
+
+  const [insetPartRaw, radiusPartRaw] = match[1].split(/\s+round\s+/i);
+  if (!insetPartRaw || /calc\(/i.test(insetPartRaw)) return null;
+
+  const parts = insetPartRaw.trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 1 || parts.length > 4) return null;
+
+  const [topToken, rightToken = topToken, bottomToken = topToken, leftToken = rightToken] = parts;
+  const top = parseCssInsetLength(topToken, height);
+  const right = parseCssInsetLength(rightToken, width);
+  const bottom = parseCssInsetLength(bottomToken, height);
+  const left = parseCssInsetLength(leftToken, width);
+  if (![top, right, bottom, left].every((part) => Number.isFinite(part) && part >= 0)) return null;
+
+  const radius = parseInsetClipRadius(radiusPartRaw, Math.min(width - left - right, height - top - bottom));
+  return { top, right, bottom, left, radius };
+}
+
+function parseCssInsetLength(value: string, axisSize: number): number {
+  const trimmed = value.trim();
+  const parsed = parseFloat(trimmed);
+  if (!Number.isFinite(parsed)) return NaN;
+  if (trimmed.endsWith("%")) return axisSize * parsed / 100;
+  if (/^-?\d*\.?\d+(?:px)?$/i.test(trimmed)) return parsed;
+  return NaN;
+}
+
+function parseInsetClipRadius(value: string | undefined, boxSize: number): string | undefined {
+  if (!value) return undefined;
+  if (/calc\(/i.test(value)) return undefined;
+
+  const token = value.trim().split(/\s+|\/+/).find(Boolean);
+  if (!token) return undefined;
+
+  const parsed = parseFloat(token);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+
+  const radius = token.endsWith("%")
+    ? Math.max(0, boxSize) * parsed / 100
+    : parsed;
+  return radius > 0 ? `${roundPx(radius)}px` : undefined;
 }
 
 function stabilizeVerticalOverlayScrollViewport(
@@ -1434,6 +2007,93 @@ function stabilizePopupLayerStacking(element: Element, styles: Record<string, st
   if (!isPopupSurfaceCandidate(element, computed, framePopupInfo.layer)) return;
 
   elevateLayerZIndex(styles, computed, framePopupInfo.maskZIndex + 2);
+}
+
+function preserveFloatingMenuSurfaceStyles(element: Element, styles: Record<string, string>): void {
+  const computed = getComputedStyleFor(element);
+  if (!isFloatingMenuContentCandidate(element, computed)) return;
+
+  const surfaceAncestor = findFloatingMenuSurfaceAncestor(element);
+  if (surfaceAncestor) {
+    copyCompactToolbarActionSurfaceStyles(getComputedStyleFor(surfaceAncestor), styles);
+  }
+  copyCompactToolbarActionSurfaceStyles(computed, styles);
+}
+
+function findFloatingMenuSurfaceAncestor(element: Element): Element | null {
+  const elementRect = element.getBoundingClientRect();
+  let ancestor = element.parentElement;
+  let depth = 0;
+
+  while (ancestor && depth < 5) {
+    const tag = ancestor.tagName.toUpperCase();
+    if (tag === "HTML" || tag === "BODY") break;
+
+    const rect = ancestor.getBoundingClientRect();
+    if (isCloseSurfaceRect(rect, elementRect)) {
+      const computed = getComputedStyleFor(ancestor);
+      if (isFloatingMenuSurfaceCandidate(ancestor, computed)) {
+        return ancestor;
+      }
+    }
+
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+
+  return null;
+}
+
+function isFloatingMenuContentCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
+  const tag = element.tagName.toUpperCase();
+  if (tag === "HTML" || tag === "BODY") return false;
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 48 || rect.height < 32 || rect.width > 720 || rect.height > 820) return false;
+
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  const hasMenuRole = /^(menu|listbox|tree)$/i.test(role);
+  const menuItemCount = element.querySelectorAll(
+    '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="treeitem"]',
+  ).length;
+  if (!hasMenuRole && menuItemCount < 2) return false;
+
+  return hasDirectVisibleText(element) || hasVisibleTextDescendant(element);
+}
+
+function isFloatingMenuSurfaceCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 48 || rect.height < 32 || rect.width > 760 || rect.height > 860) return false;
+
+  const role = element.getAttribute("role")?.toLowerCase() || "";
+  const identity = getElementIdentity(element);
+  const looksFloating =
+    /^(menu|listbox|tree|dialog|alertdialog)$/i.test(role) ||
+    computed.position === "absolute" ||
+    computed.position === "fixed" ||
+    (computed.transform && computed.transform !== "none") ||
+    /(^|[-_\s])(popover|popper|popup|floating|dropdown|menu|dialog|portal|content|surface)([-_\s]|$)/i.test(identity);
+  if (!looksFloating) return false;
+
+  return (
+    isVisiblePaint(computed.backgroundColor) ||
+    hasVisibleBorderStyles(computed) ||
+    Boolean(computed.boxShadow && computed.boxShadow !== "none") ||
+    hasRoundedCorners(computed, 4)
+  );
+}
+
+function isCloseSurfaceRect(
+  outer: { left: number; top: number; right: number; bottom: number; width: number; height: number },
+  inner: { left: number; top: number; right: number; bottom: number; width: number; height: number },
+): boolean {
+  if (outer.width <= 0 || outer.height <= 0 || inner.width <= 0 || inner.height <= 0) return false;
+  if (inner.left < outer.left - 24 || inner.top < outer.top - 24) return false;
+  if (inner.right > outer.right + 24 || inner.bottom > outer.bottom + 24) return false;
+  return outer.width <= inner.width + 96 && outer.height <= inner.height + 96;
 }
 
 function isPopupLayerCandidate(element: Element, computed: CSSStyleDeclaration): boolean {
@@ -1765,7 +2425,16 @@ function hasTopChromeTextDescendant(element: Element): boolean {
 }
 
 function isVisiblePaint(color: string): boolean {
-  return Boolean(color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)");
+  const normalized = normalizeCssColorFunctions(color || "").trim().toLowerCase();
+  if (!normalized || normalized === "transparent" || normalized === "rgba(0, 0, 0, 0)") return false;
+
+  const rgbaMatch = normalized.match(/^rgba\([^,]+,[^,]+,[^,]+,\s*([^)]+)\)$/);
+  if (rgbaMatch) {
+    const alpha = parseFloat(rgbaMatch[1]);
+    return !Number.isFinite(alpha) || alpha > 0.01;
+  }
+
+  return true;
 }
 
 interface StatusDistributionSegment {
@@ -2196,6 +2865,13 @@ function appendStatusDistributionOverlays(rootSnapshot: ElementSnapshot, rootEle
 interface CompactToolbarAction {
   element: Element;
   text: string;
+  displayText: string;
+  hasIcon: boolean;
+  rect?: DOMRect;
+  textRect?: DOMRect;
+  styleElement?: Element;
+  surfaceElement?: Element | null;
+  preserveSource?: boolean;
 }
 
 interface StructuralTabGroup {
@@ -2206,30 +2882,77 @@ interface StructuralTabGroup {
 
 function appendCompactToolbarActionOverlays(rootSnapshot: ElementSnapshot, rootElement: Element): void {
   const rootRect = rootElement.getBoundingClientRect();
-  const captureRect = getVisibleCaptureRect(rootElement, rootRect);
+  const offsetX = rootSnapshot.rect.x - rootRect.x;
+  const offsetY = rootSnapshot.rect.y - rootRect.y;
+
+  appendCompactToolbarActionOverlaysForRoot(rootSnapshot, rootElement, offsetX, offsetY);
+  appendIframeCompactToolbarActionOverlays(rootSnapshot, rootElement, offsetX, offsetY);
+}
+
+function appendCompactToolbarActionOverlaysForRoot(
+  rootSnapshot: ElementSnapshot,
+  rootElement: Element,
+  offsetX: number,
+  offsetY: number,
+): void {
+  const captureRect = getVisibleCaptureRect(rootElement);
   const actions = collectCompactToolbarActions(rootElement, captureRect);
   if (actions.length === 0) return;
 
-  const offsetX = rootSnapshot.rect.x - rootRect.x;
-  const offsetY = rootSnapshot.rect.y - rootRect.y;
-  const actionIds = new Set(actions.map(({ element }) => generateNodeId(element)));
-  actionIds.delete(rootSnapshot.id);
-  pruneSnapshotsByIds(rootSnapshot, actionIds);
-
+  const overlays: Array<{ sourceId: string; overlay: ElementSnapshot }> = [];
   for (const action of actions) {
-    const overlay = createCompactToolbarActionOverlay(action.element, action.text);
+    const overlay = createCompactToolbarActionOverlayForAction(action);
     if (!overlay) continue;
 
     offsetSnapshotNode(overlay, offsetX, offsetY);
     anchorSnapshotToParent(overlay, rootSnapshot.rect);
+    overlays.push({ sourceId: action.preserveSource ? "" : generateNodeId(action.element), overlay });
+  }
+  if (overlays.length === 0) return;
+
+  const actionIds = new Set(overlays.map(({ sourceId }) => sourceId).filter(Boolean));
+  actionIds.delete(rootSnapshot.id);
+  pruneSnapshotsByIds(rootSnapshot, actionIds);
+
+  for (const { overlay } of overlays) {
     rootSnapshot.childNodes.push(overlay);
+  }
+}
+
+function appendIframeCompactToolbarActionOverlays(
+  rootSnapshot: ElementSnapshot,
+  rootElement: Element,
+  offsetX: number,
+  offsetY: number,
+): void {
+  const iframes = rootElement.tagName.toUpperCase() === "IFRAME"
+    ? [rootElement]
+    : Array.from(rootElement.querySelectorAll("iframe"));
+
+  for (const iframe of iframes) {
+    const iframeRect = iframe.getBoundingClientRect();
+    if (iframeRect.width <= 0 || iframeRect.height <= 0) continue;
+    if (!isRectNearCaptureRect(iframeRect, getVisibleCaptureRect(rootElement))) continue;
+
+    const frameDocument = getReadableIframeDocument(iframe);
+    if (!frameDocument?.documentElement) continue;
+
+    const frameElement = iframe as HTMLElement;
+    const frameOffsetX = offsetX + iframeRect.x + frameElement.clientLeft;
+    const frameOffsetY = offsetY + iframeRect.y + frameElement.clientTop;
+    appendCompactToolbarActionOverlaysForRoot(
+      rootSnapshot,
+      frameDocument.documentElement,
+      frameOffsetX,
+      frameOffsetY,
+    );
   }
 }
 
 function collectCompactToolbarActions(rootElement: Element, captureRect: DOMRect): CompactToolbarAction[] {
   const roots = [rootElement, ...Array.from(rootElement.querySelectorAll("*"))];
   const collected: CompactToolbarAction[] = [];
-  const seen = new Set<Element>();
+  const seen = new Set<string>();
 
   for (const root of roots) {
     if (!isElementVisibleInDocument(root)) continue;
@@ -2241,13 +2964,111 @@ function collectCompactToolbarActions(rootElement: Element, captureRect: DOMRect
     if (!isCompactToolbarRoot(root, rootRect, actions)) continue;
 
     for (const action of actions) {
-      if (seen.has(action.element)) continue;
-      seen.add(action.element);
+      const key = getCompactToolbarActionSeenKey(action);
+      if (seen.has(key)) continue;
+      seen.add(key);
       collected.push(action);
     }
   }
 
+  for (const action of collectCompactToolbarActionRows(rootElement, captureRect)) {
+    const key = getCompactToolbarActionSeenKey(action);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    collected.push(action);
+  }
+
+  for (const action of collectTextRangeCompactToolbarActionRows(rootElement, captureRect)) {
+    const key = getCompactToolbarActionSeenKey(action);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    collected.push(action);
+  }
+
   return collected;
+}
+
+function collectCompactToolbarActionRows(rootElement: Element, captureRect: DOMRect): CompactToolbarAction[] {
+  const candidates: CompactToolbarAction[] = [];
+
+  for (const element of Array.from(rootElement.querySelectorAll("*"))) {
+    const action = getStandaloneCompactToolbarAction(element, captureRect);
+    if (action) candidates.push(action);
+  }
+
+  const deduped = dedupeCompactToolbarActionCandidates(candidates);
+  const rows = groupCompactToolbarActionCandidatesByRow(deduped);
+  const actions: CompactToolbarAction[] = [];
+
+  for (const row of rows) {
+    if (!isCompactToolbarActionRow(row, captureRect)) continue;
+    actions.push(...row);
+  }
+
+  return actions;
+}
+
+function collectTextRangeCompactToolbarActionRows(rootElement: Element, captureRect: DOMRect): CompactToolbarAction[] {
+  const candidates = collectTextRangeCompactToolbarActionCandidates(rootElement, captureRect);
+  const deduped = dedupeCompactToolbarActionCandidates(candidates);
+  const rows = groupCompactToolbarActionCandidatesByRow(deduped);
+  const actions: CompactToolbarAction[] = [];
+
+  for (const row of rows) {
+    if (!isCompactToolbarActionRow(row, captureRect)) continue;
+    actions.push(...row);
+  }
+
+  return actions;
+}
+
+function collectTextRangeCompactToolbarActionCandidates(
+  rootElement: Element,
+  captureRect: DOMRect,
+): CompactToolbarAction[] {
+  const ownerDocument = getNodeDocument(rootElement);
+  const walker = ownerDocument.createTreeWalker(rootElement, NodeFilter.SHOW_TEXT);
+  const actions: CompactToolbarAction[] = [];
+  let current = walker.nextNode();
+
+  while (current) {
+    const textNode = current as Text;
+    const parent = textNode.parentElement;
+    if (!parent || !isElementLocallyVisible(parent)) {
+      current = walker.nextNode();
+      continue;
+    }
+
+    const rawText = textNode.textContent || "";
+    for (const segment of extractToolbarActionTextSegments(rawText)) {
+      const textRect = getTextNodeSubstringRect(textNode, segment.start, segment.end);
+      if (!textRect) continue;
+      if (!isRectNearCaptureRect(textRect, captureRect, 16)) continue;
+      if (textRect.width < 12 || textRect.height < 8 || textRect.height > 36) continue;
+
+      const surfaceElement = findCompactToolbarActionSurfaceElement(parent, textRect);
+      const surfaceRect = surfaceElement?.getBoundingClientRect() ?? null;
+      const rect = surfaceRect ?? getPaddedToolbarActionTextRect(textRect);
+      if (rect.width < 40 || rect.width > 240 || rect.height < 20 || rect.height > 44) continue;
+      if (!isRectNearCaptureRect(rect, captureRect, 16)) continue;
+
+      actions.push({
+        element: surfaceElement ?? parent,
+        text: segment.text,
+        displayText: segment.text,
+        hasIcon: Boolean(surfaceElement && findToolbarActionSvg(surfaceElement)),
+        rect,
+        textRect,
+        styleElement: parent,
+        surfaceElement,
+        preserveSource: !surfaceElement,
+      });
+    }
+
+    current = walker.nextNode();
+  }
+
+  return actions;
 }
 
 function getDirectCompactToolbarActions(root: Element, rootRect: DOMRect, captureRect: DOMRect): CompactToolbarAction[] {
@@ -2259,6 +3080,41 @@ function getDirectCompactToolbarActions(root: Element, rootRect: DOMRect, captur
   }
 
   return actions;
+}
+
+function getStandaloneCompactToolbarAction(element: Element, captureRect: DOMRect): CompactToolbarAction | null {
+  if (!isElementLocallyVisible(element)) return null;
+
+  const tag = element.tagName.toUpperCase();
+  if (["INPUT", "SELECT", "TEXTAREA", "OPTION"].includes(tag)) return null;
+  const role = element.getAttribute("role") || "";
+  if (/^(tab|tablist|option|listbox|combobox)$/i.test(role)) return null;
+
+  const sourceRect = element.getBoundingClientRect();
+  const surfaceElement =
+    findTopRightCompactToolbarActionSurfaceElement(element, sourceRect, captureRect) ??
+    findCompactToolbarActionSurfaceElement(element, sourceRect);
+  const actionElement = surfaceElement ?? element;
+  const rect = actionElement.getBoundingClientRect();
+  if (!isRectNearCaptureRect(rect, captureRect, 16)) return null;
+  if (rect.width < 40 || rect.width > 220 || rect.height < 20 || rect.height > 42) return null;
+  if (!isElementTopVisibleAtCenter(actionElement, rect)) return null;
+
+  const displayText = getElementVisibleText(actionElement);
+  const text = normalizeToolbarActionText(displayText);
+  if (!text || text.length > 32) return null;
+
+  const hasIcon = Boolean(findToolbarActionSvg(actionElement));
+  if (
+    !hasIcon &&
+    !isPlainCompactToolbarButton(actionElement) &&
+    !isTopRightCompactToolbarButton(actionElement, rect, captureRect) &&
+    !isLikelyCompactToolbarActionButton(actionElement, text)
+  ) {
+    return null;
+  }
+
+  return { element: actionElement, text, displayText, hasIcon };
 }
 
 function getCompactToolbarAction(element: Element, rootRect: DOMRect, captureRect: DOMRect): CompactToolbarAction | null {
@@ -2275,21 +3131,131 @@ function getCompactToolbarAction(element: Element, rootRect: DOMRect, captureRec
   if (rect.width < 16 || rect.width > 220 || rect.height < 12 || rect.height > 36) return null;
   if (Math.abs(getRectCenterY(rect) - getRectCenterY(rootRect)) > 12) return null;
 
-  const text = normalizeToolbarActionText(getElementVisibleText(element));
+  const displayText = getElementVisibleText(element);
+  const text = normalizeToolbarActionText(displayText);
   if (!text || text.length > 32) return null;
-  if (!findToolbarActionSvg(element)) return null;
+  const hasIcon = Boolean(findToolbarActionSvg(element));
+  if (!hasIcon && !isPlainCompactToolbarButton(element)) return null;
 
-  return { element, text };
+  return { element, text, displayText, hasIcon };
+}
+
+function dedupeCompactToolbarActionCandidates(actions: CompactToolbarAction[]): CompactToolbarAction[] {
+  const selected: CompactToolbarAction[] = [];
+  const ordered = [...actions].sort((a, b) => {
+    const aArea = getCompactToolbarActionRectArea(a);
+    const bArea = getCompactToolbarActionRectArea(b);
+    if (aArea !== bArea) return aArea - bArea;
+    return compareElementsByDocumentPosition(a.element, b.element);
+  });
+
+  for (const action of ordered) {
+    const duplicate = selected.some((existing) => isSameCompactToolbarActionCandidate(existing, action));
+    if (duplicate) continue;
+    selected.push(action);
+  }
+
+  return selected.sort((a, b) => {
+    const aRect = getCompactToolbarActionRect(a);
+    const bRect = getCompactToolbarActionRect(b);
+    if (Math.abs(aRect.top - bRect.top) > 1) return aRect.top - bRect.top;
+    return aRect.left - bRect.left;
+  });
+}
+
+function getCompactToolbarActionRectArea(action: CompactToolbarAction): number {
+  const rect = getCompactToolbarActionRect(action);
+  return Math.max(1, rect.width * rect.height);
+}
+
+function compareElementsByDocumentPosition(a: Element, b: Element): number {
+  if (a === b) return 0;
+  const position = a.compareDocumentPosition(b);
+  if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+  if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+  return 0;
+}
+
+function isSameCompactToolbarActionCandidate(a: CompactToolbarAction, b: CompactToolbarAction): boolean {
+  if (a.element === b.element) return true;
+  if (!a.element.contains(b.element) && !b.element.contains(a.element)) return false;
+
+  const aText = normalizeToolbarActionText(a.displayText);
+  const bText = normalizeToolbarActionText(b.displayText);
+  if (aText !== bText && !aText.includes(bText) && !bText.includes(aText)) return false;
+
+  const overlap = getRectOverlapRatio(
+    getCompactToolbarActionRect(a),
+    getCompactToolbarActionRect(b),
+  );
+  return overlap >= 0.72;
+}
+
+function getRectOverlapRatio(a: DOMRect, b: DOMRect): number {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.right, b.right);
+  const bottom = Math.min(a.bottom, b.bottom);
+  if (right <= left || bottom <= top) return 0;
+
+  const intersectionArea = (right - left) * (bottom - top);
+  const aArea = Math.max(1, a.width * a.height);
+  const bArea = Math.max(1, b.width * b.height);
+  return intersectionArea / Math.min(aArea, bArea);
+}
+
+function groupCompactToolbarActionCandidatesByRow(actions: CompactToolbarAction[]): CompactToolbarAction[][] {
+  const rows: Array<{ centerY: number; actions: CompactToolbarAction[] }> = [];
+
+  for (const action of actions) {
+    const rect = getCompactToolbarActionRect(action);
+    const centerY = getRectCenterY(rect);
+    const row = rows.find((candidate) => Math.abs(candidate.centerY - centerY) <= 6);
+    if (row) {
+      row.actions.push(action);
+      row.centerY = row.actions.reduce((sum, item) => sum + getRectCenterY(getCompactToolbarActionRect(item)), 0) / row.actions.length;
+    } else {
+      rows.push({ centerY, actions: [action] });
+    }
+  }
+
+  return rows.map((row) => row.actions.sort((a, b) => {
+    const aRect = getCompactToolbarActionRect(a);
+    const bRect = getCompactToolbarActionRect(b);
+    return aRect.left - bRect.left;
+  }));
+}
+
+function isCompactToolbarActionRow(actions: CompactToolbarAction[], captureRect: DOMRect): boolean {
+  if (actions.length < 3 || actions.length > 12) return false;
+
+  const rects = actions.map(getCompactToolbarActionRect);
+  const bounds = unionDOMRects(rects);
+  if (!bounds) return false;
+  if (!isRectNearCaptureRect(bounds, captureRect, 16)) return false;
+  if (bounds.width < 120 || bounds.width > 900 || bounds.height < 20 || bounds.height > 56) return false;
+
+  const centers = rects.map(getRectCenterY);
+  if (Math.max(...centers) - Math.min(...centers) > 8) return false;
+
+  let previousRight = Number.NEGATIVE_INFINITY;
+  for (const rect of rects) {
+    if (rect.left < previousRight - 2) return false;
+    previousRight = Math.max(previousRight, rect.right);
+  }
+
+  return true;
 }
 
 function isCompactToolbarRoot(root: Element, rootRect: DOMRect, actions: CompactToolbarAction[]): boolean {
   if (actions.length < 2 || actions.length > 12) return false;
+  if (!actions.some((action) => action.hasIcon) && actions.length < 3) return false;
   if (rootRect.width < 40 || rootRect.width > 900 || rootRect.height < 12 || rootRect.height > 48) return false;
 
-  const centers = actions.map(({ element }) => getRectCenterY(element.getBoundingClientRect()));
+  const centers = actions.map((action) => getRectCenterY(getCompactToolbarActionRect(action)));
   if (Math.max(...centers) - Math.min(...centers) > 8) return false;
 
-  const bounds = unionDOMRects(actions.map(({ element }) => element.getBoundingClientRect()));
+  const bounds = unionDOMRects(actions.map(getCompactToolbarActionRect));
   if (!bounds) return false;
   if (bounds.left < rootRect.left - 4 || bounds.right > rootRect.right + 4) return false;
   if (bounds.top < rootRect.top - 4 || bounds.bottom > rootRect.bottom + 4) return false;
@@ -2299,8 +3265,254 @@ function isCompactToolbarRoot(root: Element, rootRect: DOMRect, actions: Compact
   return rootText.includes(actionText);
 }
 
+function isLikelyCompactToolbarActionButton(element: Element, text: string): boolean {
+  if (!isToolbarActionText(text)) return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 40 || rect.width > 240 || rect.height < 20 || rect.height > 44) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+  const hasButtonSurface =
+    isVisiblePaint(computed.backgroundColor) ||
+    Boolean(computed.backgroundImage && computed.backgroundImage !== "none") ||
+    hasVisibleBorderStyles(computed) ||
+    Boolean(computed.boxShadow && computed.boxShadow !== "none");
+  if (!hasButtonSurface) return false;
+
+  return hasRoundedCorners(computed, 1) ||
+    hasVisibleBorderStyles(computed) ||
+    Boolean(computed.boxShadow && computed.boxShadow !== "none");
+}
+
+function isToolbarActionText(text: string): boolean {
+  if (!text || text.length > 32) return false;
+  return TOOLBAR_ACTION_TEXT_PATTERN.test(text);
+}
+
+function countToolbarActionTextHits(text: string): number {
+  const matches = text.match(TOOLBAR_ACTION_TEXT_HIT_PATTERN);
+  return matches ? new Set(matches).size : 0;
+}
+
+function getCompactToolbarActionRect(action: CompactToolbarAction): DOMRect {
+  return action.rect ?? action.element.getBoundingClientRect();
+}
+
+function getCompactToolbarActionSeenKey(action: CompactToolbarAction): string {
+  if (!action.rect) return generateNodeId(action.element);
+
+  const rect = action.rect;
+  return [
+    action.text,
+    Math.round(rect.left),
+    Math.round(rect.top),
+    Math.round(rect.width),
+    Math.round(rect.height),
+  ].join(":");
+}
+
+function isPlainCompactToolbarButton(element: Element): boolean {
+  const tag = element.tagName.toUpperCase();
+  const role = element.getAttribute("role") || "";
+  const identity = getElementIdentity(element);
+  if (tag !== "BUTTON" && !/^button$/i.test(role) && !/(^|[-_\s])(btn|button)([-_\s]|$)/i.test(identity)) {
+    return false;
+  }
+  if (/(^|[-_\s])(tab|tabs|tabpane|menuitem|option|select|dropdown-item)([-_\s]|$)/i.test(identity)) {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 40 || rect.width > 220 || rect.height < 20 || rect.height > 40) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+  const hasButtonSurface =
+    isVisiblePaint(computed.backgroundColor) ||
+    Boolean(computed.backgroundImage && computed.backgroundImage !== "none") ||
+    hasVisibleBorderStyles(computed) ||
+    Boolean(computed.boxShadow && computed.boxShadow !== "none");
+  return hasButtonSurface && (hasRoundedCorners(computed, 1) || hasVisibleBorderStyles(computed));
+}
+
+function isTopRightCompactToolbarButton(
+  element: Element,
+  rect: DOMRect,
+  captureRect: DOMRect,
+): boolean {
+  if (!isTopRightCompactToolbarRect(rect, captureRect)) return false;
+
+  const tag = element.tagName.toUpperCase();
+  const role = element.getAttribute("role") || "";
+  const identity = getElementIdentity(element);
+  if (["INPUT", "SELECT", "TEXTAREA", "OPTION"].includes(tag)) return false;
+  if (/^(tab|tablist|option|listbox|combobox)$/i.test(role)) return false;
+  if (/(^|[-_\s])(tab|tabs|tabpane|menuitem|option|select|dropdown-item)([-_\s]|$)/i.test(identity)) {
+    return false;
+  }
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+  const hasVisibleBackground =
+    isVisiblePaint(computed.backgroundColor) ||
+    Boolean(computed.backgroundImage && computed.backgroundImage !== "none");
+  const hasBorder = hasVisibleBorderStyles(computed);
+  const hasShadow = Boolean(computed.boxShadow && computed.boxShadow !== "none");
+  const hasRadius = hasRoundedCorners(computed, 1);
+  const hasActionIdentity =
+    tag === "BUTTON" ||
+    tag === "A" ||
+    /^(button|link)$/i.test(role) ||
+    /(^|[-_\s])(btn|button|action|operation|toolbar)([-_\s]|$)/i.test(identity) ||
+    computed.cursor === "pointer";
+  const hasButtonSurface = hasVisibleBackground || hasBorder || hasShadow;
+  if (!hasButtonSurface) return false;
+
+  // Some legacy systems render action controls as plain div/span nodes without
+  // role/button classes. For those, require a rounded/shadowed visual button
+  // surface so table headers or compact filter labels do not become actions.
+  return hasActionIdentity
+    ? (hasRadius || hasBorder || hasShadow)
+    : (hasRadius || hasShadow);
+}
+
+function findTopRightCompactToolbarActionSurfaceElement(
+  source: Element,
+  sourceRect: DOMRect,
+  captureRect: DOMRect,
+): Element | null {
+  let best: { element: Element; area: number } | null = null;
+  let candidate: Element | null = source;
+
+  for (let depth = 0; candidate && depth < 8; depth += 1) {
+    if (isElementLocallyVisible(candidate) && isCompactToolbarActionSurfaceElement(candidate, sourceRect)) {
+      const rect = candidate.getBoundingClientRect();
+      if (isTopRightCompactToolbarButton(candidate, rect, captureRect)) {
+        const area = rect.width * rect.height;
+        if (!best || area < best.area) {
+          best = { element: candidate, area };
+        }
+      }
+    }
+
+    candidate = candidate.parentElement;
+  }
+
+  return best?.element ?? null;
+}
+
+function isTopRightCompactToolbarRect(rect: DOMRect, captureRect: DOMRect): boolean {
+  if (rect.width < 40 || rect.width > 240 || rect.height < 20 || rect.height > 44) return false;
+  if (!isRectNearCaptureRect(rect, captureRect, 16)) return false;
+
+  const topBand = captureRect.top + Math.min(260, Math.max(120, captureRect.height * 0.32));
+  if (rect.top > topBand) return false;
+
+  const rightHalf = captureRect.left + captureRect.width * 0.5;
+  return rect.left >= rightHalf;
+}
+
+function isElementLocallyVisible(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden") return false;
+  const opacity = Number.parseFloat(computed.opacity || "1");
+  return !Number.isFinite(opacity) || opacity > 0.01;
+}
+
 function normalizeToolbarActionText(value: string): string {
-  return value.replace(/[\u200b-\u200f\ufeff]/g, "").replace(/\s+/g, "").trim();
+  return value.replace(/[\uE000-\uF8FF]/g, "").replace(/[\u200b-\u200f\ufeff]/g, "").replace(/\s+/g, "").trim();
+}
+
+interface ToolbarActionTextSegment {
+  text: string;
+  start: number;
+  end: number;
+}
+
+function extractToolbarActionTextSegments(rawText: string): ToolbarActionTextSegment[] {
+  const trimmedFull = getTrimmedTextSegment(rawText, 0, rawText.length);
+  if (!trimmedFull) return [];
+
+  const normalizedFull = normalizeToolbarActionText(trimmedFull.text);
+  if (isToolbarActionText(normalizedFull) && normalizedFull.length <= 12) {
+    return [{ ...trimmedFull, text: normalizedFull }];
+  }
+
+  const starts = Array.from(rawText.matchAll(TOOLBAR_ACTION_TEXT_START_PATTERN))
+    .map((match) => match.index ?? -1)
+    .filter((index) => index >= trimmedFull.start && index < trimmedFull.end);
+  if (starts.length < 2) return [];
+
+  const segments: ToolbarActionTextSegment[] = [];
+  for (let index = 0; index < starts.length; index += 1) {
+    const start = starts[index];
+    const end = starts[index + 1] ?? trimmedFull.end;
+    const segment = getTrimmedTextSegment(rawText, start, end);
+    if (!segment) continue;
+
+    const text = normalizeToolbarActionText(segment.text);
+    if (!isToolbarActionText(text)) continue;
+    if (text.length < 2 || text.length > 12) continue;
+    if (/[并和与及、，,。:：]$/.test(text)) continue;
+
+    segments.push({ ...segment, text });
+  }
+
+  return segments;
+}
+
+function getTrimmedTextSegment(rawText: string, start: number, end: number): ToolbarActionTextSegment | null {
+  let segmentStart = Math.max(0, start);
+  let segmentEnd = Math.min(rawText.length, end);
+
+  while (segmentStart < segmentEnd && /[\s\u200b-\u200f\ufeff]/.test(rawText[segmentStart] || "")) {
+    segmentStart += 1;
+  }
+  while (segmentEnd > segmentStart && /[\s\u200b-\u200f\ufeff]/.test(rawText[segmentEnd - 1] || "")) {
+    segmentEnd -= 1;
+  }
+  if (segmentEnd <= segmentStart) return null;
+
+  return {
+    text: rawText.slice(segmentStart, segmentEnd),
+    start: segmentStart,
+    end: segmentEnd,
+  };
+}
+
+function getTextNodeSubstringRect(textNode: Text, start: number, end: number): DOMRect | null {
+  if (start < 0 || end <= start || end > (textNode.textContent || "").length) return null;
+
+  const doc = textNode.ownerDocument;
+  const range = doc.createRange();
+  range.setStart(textNode, start);
+  range.setEnd(textNode, end);
+
+  try {
+    const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+    if (rects.length === 0) return null;
+    return unionDOMRects(rects);
+  } finally {
+    range.detach();
+  }
+}
+
+function getPaddedToolbarActionTextRect(textRect: DOMRect): DOMRect {
+  const horizontalPadding = Math.max(12, Math.min(24, textRect.height * 0.75));
+  const verticalPadding = Math.max(6, Math.min(10, textRect.height * 0.35));
+  return new DOMRect(
+    textRect.x - horizontalPadding,
+    textRect.y - verticalPadding,
+    textRect.width + horizontalPadding * 2,
+    textRect.height + verticalPadding * 2,
+  );
 }
 
 function getRectCenterY(rect: DOMRect): number {
@@ -2707,6 +3919,83 @@ function pruneSnapshotsByIds(rootSnapshot: ElementSnapshot, ids: Set<string>): v
     pruneSnapshotsByIds(child, ids);
     return true;
   });
+}
+
+function removeGeneratedToolbarActionOverlays(rootSnapshot: ElementSnapshot): void {
+  rootSnapshot.childNodes = rootSnapshot.childNodes.filter((child) => {
+    if (!isElementNodeSnapshot(child)) return true;
+    if (child.attributes["data-h2d-toolbar-action"]) return false;
+
+    removeGeneratedToolbarActionOverlays(child);
+    return true;
+  });
+}
+
+function createCompactToolbarActionOverlayForAction(action: CompactToolbarAction): ElementSnapshot | null {
+  if (!action.rect || !action.textRect) {
+    return createCompactToolbarActionOverlay(action.element, action.displayText);
+  }
+
+  return createCompactToolbarActionOverlayFromRects(action);
+}
+
+function createCompactToolbarActionOverlayFromRects(action: CompactToolbarAction): ElementSnapshot | null {
+  if (!action.rect || !action.textRect) return null;
+
+  const styleSource = action.styleElement ?? action.element;
+  const computed = getComputedStyleFor(styleSource);
+  const surfaceComputed = action.surfaceElement ? getComputedStyleFor(action.surfaceElement) : null;
+  const fontSize = parsePx(computed.fontSize, 12);
+  const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
+  const textRect = action.textRect;
+  const rect = action.rect;
+
+  const childNodes: SnapshotNode[] = [{
+    nodeType: NODE_TYPES.TEXT_NODE,
+    id: generateNodeId(null),
+    text: action.displayText,
+    rect: {
+      x: textRect.x,
+      y: textRect.y,
+      width: Math.max(textRect.width, estimateTextWidth(action.displayText, fontSize)),
+      height: textRect.height,
+    },
+    lineCount: 1,
+  }];
+
+  const styles: Record<string, string> = {
+    display: "block",
+    position: "absolute",
+    left: "0px",
+    top: "0px",
+    width: `${roundPx(rect.width)}px`,
+    height: `${roundPx(rect.height)}px`,
+    overflow: "visible",
+    color: computed.color,
+    fontFamily: computed.fontFamily,
+    fontSize: computed.fontSize || `${roundPx(fontSize)}px`,
+    fontWeight: computed.fontWeight,
+    lineHeight: Number.isFinite(lineHeight) ? `${roundPx(lineHeight)}px` : computed.lineHeight,
+    whiteSpace: "nowrap",
+    textAlign: computed.textAlign,
+    boxSizing: "border-box",
+    zIndex: "120",
+  };
+  if (surfaceComputed) {
+    copyCompactToolbarActionSurfaceStyles(surfaceComputed, styles);
+  }
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: generateNodeId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-toolbar-action": "true" },
+    styles,
+    rect: toElementRect(rect),
+    childNodes,
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
 }
 
 function createCompactToolbarActionOverlay(source: Element, text: string): ElementSnapshot | null {
@@ -3372,7 +4661,7 @@ function hasVisibleBorderStyles(computed: CSSStyleDeclaration): boolean {
 }
 
 function extractCssColor(value: string): string | undefined {
-  return value.match(/rgba?\([^)]+\)/)?.[0];
+  return normalizeCssColorFunctions(value).match(/rgba?\([^)]+\)/)?.[0];
 }
 
 function normalizeSmallSvgImageRect(
@@ -3864,6 +5153,117 @@ function getSnapshotText(node: SnapshotNode): string {
     .trim();
 }
 
+function stabilizeMeasuredInlineTextGroup(
+  element: Element,
+  styles: Record<string, string>,
+  rect: ElementRect,
+  childNodes: SnapshotNode[],
+): boolean {
+  if (rect.width < 24 || rect.width > 640 || rect.height < 8 || rect.height > 80) return false;
+  if (childNodes.length < 2 || childNodes.length > 4) return false;
+
+  const computed = getComputedStyleFor(element);
+  const display = styles.display || computed.display;
+  if (display !== "flex" && display !== "inline-flex") return false;
+
+  const flexDirection = styles.flexDirection || computed.flexDirection || "row";
+  if (!flexDirection.startsWith("row")) return false;
+
+  const flexWrap = styles.flexWrap || computed.flexWrap || "nowrap";
+  if (flexWrap === "nowrap") return false;
+
+  const textChildren = childNodes.filter(isCompactTextGroupSnapshot);
+  if (textChildren.length !== childNodes.length) return false;
+
+  const fontSizes = textChildren
+    .map((child) => getSnapshotMaxFontSize(child))
+    .filter((fontSize) => Number.isFinite(fontSize) && fontSize > 0);
+  if (fontSizes.length < 2) return false;
+
+  const minFontSize = Math.min(...fontSizes);
+  const maxFontSize = Math.max(...fontSizes);
+  const fontSizeDelta = maxFontSize - minFontSize;
+  if (fontSizeDelta < 6) return false;
+
+  const measuredColumnGap = getMeasuredInlineColumnGap(textChildren);
+  const largeTextWidthAllowance = Math.min(12, Math.max(6, fontSizeDelta * 0.45));
+  const safeColumnGap = Math.max(
+    measuredColumnGap,
+    parsePx(styles.columnGap || computed.columnGap || "", 0),
+    Math.min(14, Math.max(10, fontSizeDelta * 0.7)),
+  );
+  const followingTextShift = Math.max(0, safeColumnGap - measuredColumnGap) + largeTextWidthAllowance;
+
+  styles.width = `${roundPx(rect.width)}px`;
+  styles.height = `${roundPx(rect.height)}px`;
+  styles.flexShrink = "0";
+  styles.columnGap = `${roundPx(safeColumnGap)}px`;
+  styles.gap = `${roundPx(safeColumnGap)}px`;
+
+  let seenLargeText = false;
+  for (const child of textChildren) {
+    if (!isElementNodeSnapshot(child)) continue;
+    const fontSize = getSnapshotMaxFontSize(child);
+    const isLargeText = Number.isFinite(fontSize) && fontSize === maxFontSize;
+    const widthAllowance = isLargeText
+      ? largeTextWidthAllowance
+      : 0;
+    if (!isLargeText && seenLargeText && Number.isFinite(fontSize) && fontSize < maxFontSize && followingTextShift > 0) {
+      offsetSnapshotNode(child, followingTextShift, 0);
+    }
+    if (isLargeText) {
+      seenLargeText = true;
+    }
+    child.styles.width = `${roundPx(child.rect.width + widthAllowance)}px`;
+    child.styles.height = `${roundPx(child.rect.height)}px`;
+    child.styles.flexShrink = "0";
+    child.layoutSizingHorizontal = "FIXED";
+    child.layoutSizingVertical = "FIXED";
+  }
+
+  return true;
+}
+
+function getMeasuredInlineColumnGap(nodes: SnapshotNode[]): number {
+  let maxGap = 0;
+  for (let index = 1; index < nodes.length; index += 1) {
+    const previous = nodes[index - 1];
+    const current = nodes[index];
+    const previousRight = previous.rect.x + previous.rect.width;
+    const gap = current.rect.x - previousRight;
+    if (Number.isFinite(gap) && gap > maxGap) {
+      maxGap = gap;
+    }
+  }
+  return maxGap;
+}
+
+function isCompactTextGroupSnapshot(node: SnapshotNode): boolean {
+  if (node.nodeType === NODE_TYPES.TEXT_NODE) {
+    return Boolean(node.text.trim()) && node.rect.width > 0 && node.rect.height > 0;
+  }
+  if (!isElementNodeSnapshot(node)) return false;
+  if (node.rect.width <= 0 || node.rect.height <= 0) return false;
+  if (node.tag === "SVG" || node.tag === "IMG" || node.tag === "CANVAS" || node.tag === "VIDEO") return false;
+  return Boolean(getSnapshotText(node));
+}
+
+function getSnapshotMaxFontSize(node: SnapshotNode): number {
+  if (!isElementNodeSnapshot(node)) return NaN;
+
+  let maxFontSize = parsePx(node.styles.fontSize || "", NaN);
+  for (const child of node.childNodes) {
+    const childFontSize = getSnapshotMaxFontSize(child);
+    if (Number.isFinite(childFontSize)) {
+      maxFontSize = Number.isFinite(maxFontSize)
+        ? Math.max(maxFontSize, childFontSize)
+        : childFontSize;
+    }
+  }
+
+  return maxFontSize;
+}
+
 function isTableMeasurementSnapshot(
   element: Element,
   rect: ElementRect,
@@ -3897,10 +5297,120 @@ function hasSnapshotText(childNodes: SnapshotNode[]): boolean {
 // Pseudo-element materialization
 // ---------------------------------------------------------------------------
 
-function materializePseudoElements(element: Element, childNodes: SnapshotNode[]): Set<string> {
+function absorbFullCoverBackgroundPseudos(
+  element: Element,
+  styles: Record<string, string>,
+): Set<"::before" | "::after"> {
+  const absorbed = new Set<"::before" | "::after">();
+  if (hasHostBackgroundPaint(styles)) return absorbed;
+
+  for (const pseudo of ["::before", "::after"] as const) {
+    const computed = getComputedStyleFor(element, pseudo);
+    if (!isFullCoverBackgroundPseudo(element, pseudo, computed)) continue;
+
+    copyFullCoverPseudoBackgroundStyles(computed, styles);
+    absorbed.add(pseudo);
+  }
+
+  return absorbed;
+}
+
+function hasHostBackgroundPaint(styles: Record<string, string>): boolean {
+  return (
+    isVisiblePaint(styles.backgroundColor || "") ||
+    Boolean(styles.backgroundImage && styles.backgroundImage !== "none")
+  );
+}
+
+function isFullCoverBackgroundPseudo(
+  element: Element,
+  pseudo: "::before" | "::after",
+  computed: CSSStyleDeclaration,
+): boolean {
+  if (computed.display === "none" || computed.visibility === "hidden") return false;
+  if (parseFloat(computed.opacity || "1") <= 0.01) return false;
+  if (computed.position !== "absolute" && computed.position !== "fixed") return false;
+  if (computed.transform && computed.transform !== "none") return false;
+
+  const zIndex = parseFloat(computed.zIndex || "");
+  if (!Number.isFinite(zIndex) || zIndex >= 0) return false;
+
+  const text = parseCssTextContent(computed.content);
+  if (text && text.trim()) return false;
+  if (!hasPseudoBackgroundPaint(computed)) return false;
+
+  const hostRect = element.getBoundingClientRect();
+  if (hostRect.width <= 0 || hostRect.height <= 0) return false;
+
+  const width = parsePx(computed.width, NaN);
+  const height = parsePx(computed.height, NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
+
+  const pseudoRect = computePaintPseudoRect(pseudo, hostRect, computed, width, height);
+  return rectApproximatelyCovers(pseudoRect, hostRect, 1.5);
+}
+
+function hasPseudoBackgroundPaint(computed: CSSStyleDeclaration): boolean {
+  return (
+    isVisiblePaint(computed.backgroundColor) ||
+    Boolean(computed.backgroundImage && computed.backgroundImage !== "none") ||
+    hasVisibleBorderStyles(computed)
+  );
+}
+
+function rectApproximatelyCovers(inner: DOMRect, outer: DOMRect, tolerance: number): boolean {
+  return (
+    Math.abs(inner.x - outer.x) <= tolerance &&
+    Math.abs(inner.y - outer.y) <= tolerance &&
+    Math.abs(inner.width - outer.width) <= tolerance &&
+    Math.abs(inner.height - outer.height) <= tolerance
+  );
+}
+
+function copyFullCoverPseudoBackgroundStyles(
+  computed: CSSStyleDeclaration,
+  styles: Record<string, string>,
+): void {
+  if (isVisiblePaint(computed.backgroundColor)) {
+    styles.backgroundColor = normalizeCssColorFunctions(computed.backgroundColor);
+  }
+
+  if (computed.backgroundImage && computed.backgroundImage !== "none") {
+    styles.backgroundImage = normalizeCssColorFunctions(computed.backgroundImage);
+    copyComputedStyleIfPresent(computed, styles, "backgroundSize");
+    copyComputedStyleIfPresent(computed, styles, "backgroundPosition");
+    copyComputedStyleIfPresent(computed, styles, "backgroundPositionX");
+    copyComputedStyleIfPresent(computed, styles, "backgroundPositionY");
+    copyComputedStyleIfPresent(computed, styles, "backgroundRepeat");
+    copyComputedStyleIfPresent(computed, styles, "backgroundOrigin");
+    copyComputedStyleIfPresent(computed, styles, "backgroundClip");
+    copyComputedStyleIfPresent(computed, styles, "backgroundBlendMode");
+  }
+
+  copyPaintPseudoBorderStyles(computed, styles);
+  copyPaintPseudoRadiusStyles(computed, styles);
+}
+
+function copyComputedStyleIfPresent(
+  computed: CSSStyleDeclaration,
+  styles: Record<string, string>,
+  key: keyof CSSStyleDeclaration,
+): void {
+  const value = computed[key] as string;
+  if (value && value !== "normal" && value !== "initial") {
+    styles[key as string] = normalizeCssColorFunctions(value);
+  }
+}
+
+function materializePseudoElements(
+  element: Element,
+  childNodes: SnapshotNode[],
+  ignoredPseudos: Set<"::before" | "::after"> = new Set(),
+): Set<string> {
   const materialized = new Set<string>();
 
   for (const pseudo of ["::before", "::after"] as const) {
+    if (ignoredPseudos.has(pseudo)) continue;
     const pseudoNode =
       snapshotTextPseudoElement(element, pseudo) ??
       snapshotPaintPseudoElement(element, pseudo);
@@ -4964,10 +6474,10 @@ function getPaintPseudoStyles(computed: CSSStyleDeclaration, width: number, heig
   };
 
   if (isVisiblePaint(computed.backgroundColor)) {
-    styles.backgroundColor = computed.backgroundColor;
+    styles.backgroundColor = normalizeCssColorFunctions(computed.backgroundColor);
   }
   if (computed.backgroundImage && computed.backgroundImage !== "none") {
-    styles.backgroundImage = computed.backgroundImage;
+    styles.backgroundImage = normalizeCssColorFunctions(computed.backgroundImage);
   }
   if (computed.opacity && computed.opacity !== "1") {
     styles.opacity = computed.opacity;
@@ -4994,7 +6504,7 @@ function copyPaintPseudoBorderStyles(computed: CSSStyleDeclaration, styles: Reco
 
     styles[`border${side}Width`] = width;
     styles[`border${side}Style`] = style;
-    styles[`border${side}Color`] = color;
+    styles[`border${side}Color`] = normalizeCssColorFunctions(color);
   }
 }
 
@@ -5234,7 +6744,85 @@ function parsePx(value: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function toElementRect(rect: DOMRect): ElementRect {
+function applyNegativeVirtualScrollOffsetToElementRect(element: Element, rect: ElementRect): ElementRect {
+  const offset = getNegativeVirtualScrollOffset(element);
+  if (!offset) return rect;
+
+  rect.x = roundPx(rect.x + offset.x);
+  rect.y = roundPx(rect.y + offset.y);
+  if (rect.quad) {
+    rect.quad.p1.x = roundPx(rect.quad.p1.x + offset.x);
+    rect.quad.p1.y = roundPx(rect.quad.p1.y + offset.y);
+    rect.quad.p2.x = roundPx(rect.quad.p2.x + offset.x);
+    rect.quad.p2.y = roundPx(rect.quad.p2.y + offset.y);
+    rect.quad.p3.x = roundPx(rect.quad.p3.x + offset.x);
+    rect.quad.p3.y = roundPx(rect.quad.p3.y + offset.y);
+    rect.quad.p4.x = roundPx(rect.quad.p4.x + offset.x);
+    rect.quad.p4.y = roundPx(rect.quad.p4.y + offset.y);
+  }
+
+  return rect;
+}
+
+function applyNegativeVirtualScrollOffsetToRect(element: Element | null, rect: Rect): Rect {
+  const offset = element ? getNegativeVirtualScrollOffset(element) : null;
+  if (!offset) return rect;
+
+  return {
+    ...rect,
+    x: roundPx(rect.x + offset.x),
+    y: roundPx(rect.y + offset.y),
+  };
+}
+
+function getNegativeVirtualScrollOffset(element: Element): { x: number; y: number } | null {
+  let current: Element | null = element;
+  let depth = 0;
+
+  while (current && depth < 12) {
+    const offset = getOwnNegativeVirtualScrollOffset(current);
+    if (offset) return offset;
+
+    current = current.parentElement;
+    depth += 1;
+  }
+
+  return null;
+}
+
+function getOwnNegativeVirtualScrollOffset(element: Element): { x: number; y: number } | null {
+  if (!isInstanceOfOwner<HTMLElement>(element, element, "HTMLElement")) return null;
+
+  const tag = element.tagName.toUpperCase();
+  if (tag === "HTML" || tag === "BODY") return null;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+
+  const clientHeight = element.clientHeight;
+  const scrollHeight = element.scrollHeight;
+  if (clientHeight < 80) return null;
+  if (scrollHeight <= clientHeight + 200) return null;
+  if (Math.abs(rect.height - clientHeight) > 2) return null;
+
+  const hiddenAbove = scrollHeight - clientHeight;
+  if (hiddenAbove < 200 || rect.y >= -32) return null;
+
+  const ownerWindow = getNodeWindow(element);
+  if (rect.right <= -32 || rect.left >= ownerWindow.innerWidth + 32) return null;
+
+  const shiftedTop = rect.y + hiddenAbove;
+  const shiftedBottom = shiftedTop + rect.height;
+  if (shiftedTop > ownerWindow.innerHeight + 96 || shiftedBottom < -96) return null;
+
+  const computed = getComputedStyleFor(element);
+  if (computed.display === "none" || computed.visibility === "hidden") return null;
+  if (Number.parseFloat(computed.opacity || "1") <= 0.01) return null;
+
+  return { x: 0, y: hiddenAbove };
+}
+
+function toElementRect(rect: { x: number; y: number; width: number; height: number }): ElementRect {
   return {
     x: rect.x,
     y: rect.y,
@@ -6122,7 +7710,11 @@ function measureSingleLineText(element: Element, computed: CSSStyleDeclaration, 
  * Serialize a text node (or group of adjacent text nodes).
  */
 function snapshotTextNode(nodeOrNodes: Node | Node[]): TextSnapshot {
-  const { lineCount, ...rectWithoutLineCount } = getTextRect(nodeOrNodes);
+  const { lineCount, ...rawRectWithoutLineCount } = getTextRect(nodeOrNodes);
+  const rectWithoutLineCount = applyNegativeVirtualScrollOffsetToRect(
+    getTextNodeParentElement(nodeOrNodes),
+    rawRectWithoutLineCount,
+  );
 
   const text = Array.isArray(nodeOrNodes)
     ? nodeOrNodes.map((n) => n.textContent || "").join("")
