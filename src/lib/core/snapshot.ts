@@ -4,7 +4,7 @@
 
 import { getSourceAnnotations, getInspectorSelectedId } from '../react/fiber.js';
 import { TypefaceProbe, resolveFonts } from '../typography/probe.js';
-import { ResourceResolver, CaptureError, resolveResources, canvasToBlob } from '../media/resolver.js';
+import { ResourceResolver, CaptureError, resolveResources, canvasToBlob, resetResourceBridgeState } from '../media/resolver.js';
 import { bakeSvgStyles } from '../media/svg.js';
 import { resolveTransform, multiplyMatrices, getElementRect } from '../transform/matrix.js';
 import { extractComponentTree, findParentComponent } from '../react/tree.js';
@@ -135,6 +135,7 @@ export async function captureDOM(elementOrDocument: Element | Document, options?
   nodeIdCounter = 0;
   resetFormControlDebugState();
   resetScrollbarState();
+  resetResourceBridgeState();
 
   const assetCollector = new ResourceResolver(mergedOptions);
   const fontCollector = new TypefaceProbe();
@@ -196,6 +197,8 @@ async function captureDOMInner(
     appendContentHeaderTabOverlays(rootSnapshot, element);
     extendLeftSidebarBackgrounds(rootSnapshot, element, getCaptureScrollHeight(element, rootSnapshot));
     removeStackedSelectClones(rootSnapshot);
+    normalizeTextLineMetrics(rootSnapshot);
+    materializeFlexSpacing(rootSnapshot);
 
     const experimental = mergedOptions.includeReactFiberTree
       ? { reactFiberTree: extractComponentTree(element, getNodeId) }
@@ -285,6 +288,8 @@ async function captureDOMInner(
       normalizeGeneratedViewportRootOverlays(rootSnapshot);
       clampSlightViewportRootOverscroll(rootSnapshot);
     }
+    normalizeTextLineMetrics(rootSnapshot);
+    materializeFlexSpacing(rootSnapshot);
 
     return {
       documentTitle: doc.title || undefined,
@@ -674,7 +679,11 @@ function relaxViewportVisibleClipContainer(node: ElementSnapshot, viewportRect: 
   if (isNarrowNavigationClipSnapshot(node, viewportRect)) return;
   if (isCollapsedFixedViewportBarSnapshot(node, viewportRect)) return;
 
-  const visibleBounds = getSnapshotDescendantVisibleBounds(node.childNodes, viewportRect);
+  // Only positioned descendants can legitimately spill out of an overflow
+  // clip in the browser. In-flow content beyond the container box is always
+  // browser-clipped (e.g. a logo title wrapped below its container), so
+  // counting it here would un-hide content the user never sees.
+  const visibleBounds = getSnapshotEscapingDescendantBounds(node, viewportRect);
   if (!visibleBounds) return;
 
   const nodeBottom = node.rect.y + node.rect.height;
@@ -2210,13 +2219,25 @@ function appendCompactToolbarActionOverlays(rootSnapshot: ElementSnapshot, rootE
   const actions = collectCompactToolbarActions(rootElement, captureRect);
   if (actions.length === 0) return;
 
+  // The overlay is a rescue path for toolbar buttons that were lost or
+  // clipped away during serialization. Buttons that captured fine render
+  // better through the normal element path, so leave those untouched.
+  const missingActions = actions.filter(({ element }) => (
+    !isSnapshotVisibleWithinClips(rootSnapshot, getNodeId(element))
+  ));
+  if (missingActions.length === 0) return;
+
   const offsetX = rootSnapshot.rect.x - rootRect.x;
   const offsetY = rootSnapshot.rect.y - rootRect.y;
-  const actionIds = new Set(actions.map(({ element }) => generateNodeId(element)));
+  const actionIds = new Set(
+    missingActions
+      .map(({ element }) => getNodeId(element))
+      .filter((id): id is string => Boolean(id)),
+  );
   actionIds.delete(rootSnapshot.id);
   pruneSnapshotsByIds(rootSnapshot, actionIds);
 
-  for (const action of actions) {
+  for (const action of missingActions) {
     const overlay = createCompactToolbarActionOverlay(action.element, action.text);
     if (!overlay) continue;
 
@@ -2224,6 +2245,36 @@ function appendCompactToolbarActionOverlays(rootSnapshot: ElementSnapshot, rootE
     anchorSnapshotToParent(overlay, rootSnapshot.rect);
     rootSnapshot.childNodes.push(overlay);
   }
+}
+
+/**
+ * Check whether the snapshot for `id` exists in the tree and intersects every
+ * overflow-clipping ancestor, i.e. it will actually be visible in Figma.
+ */
+function isSnapshotVisibleWithinClips(root: ElementSnapshot, id: string | undefined): boolean {
+  if (!id) return false;
+
+  let visible = false;
+
+  const walk = (node: ElementSnapshot, clips: Rect[]): boolean => {
+    for (const child of node.childNodes) {
+      if (!isElementNodeSnapshot(child)) continue;
+
+      if (child.id === id) {
+        visible = child.rect.width > 0.5 && child.rect.height > 0.5 &&
+          clips.every((clip) => isSnapshotRectIntersectingRect(child.rect, clip));
+        return true;
+      }
+
+      const nextClips = isSnapshotOverflowClipContainer(child.styles) ? [...clips, child.rect] : clips;
+      if (walk(child, nextClips)) return true;
+    }
+
+    return false;
+  };
+
+  walk(root, isSnapshotOverflowClipContainer(root.styles) ? [root.rect] : []);
+  return visible;
 }
 
 function collectCompactToolbarActions(rootElement: Element, captureRect: DOMRect): CompactToolbarAction[] {
@@ -2721,7 +2772,6 @@ function createCompactToolbarActionOverlay(source: Element, text: string): Eleme
 
   const svgRect = svg?.getBoundingClientRect() ?? null;
   const fontSize = parsePx(computed.fontSize, 12);
-  const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
   const baseRect = surfaceRect ?? sourceRect;
   const left = Math.min(baseRect.left, sourceRect.left, textRect.x, svgRect?.left ?? sourceRect.left);
   const top = Math.min(baseRect.top, sourceRect.top, textRect.y, svgRect?.top ?? sourceRect.top);
@@ -2769,6 +2819,9 @@ function createCompactToolbarActionOverlay(source: Element, text: string): Eleme
     lineCount: 1,
   });
 
+  // Place the label deterministically: the Figma importer positions text
+  // from the element box plus text styles (padding/text-align/line-height),
+  // not from the text node rect, so encode the measured offsets directly.
   const styles: Record<string, string> = {
     display: "block",
     position: "absolute",
@@ -2781,9 +2834,10 @@ function createCompactToolbarActionOverlay(source: Element, text: string): Eleme
     fontFamily: computed.fontFamily,
     fontSize: computed.fontSize || `${roundPx(fontSize)}px`,
     fontWeight: computed.fontWeight,
-    lineHeight: Number.isFinite(lineHeight) ? `${roundPx(lineHeight)}px` : computed.lineHeight,
+    lineHeight: `${roundPx(Math.max(1, (textRect.y + textRect.height / 2 - rect.top) * 2))}px`,
     whiteSpace: "nowrap",
-    textAlign: computed.textAlign,
+    textAlign: "left",
+    paddingLeft: `${roundPx(Math.max(0, textRect.x - rect.left))}px`,
     boxSizing: "border-box",
     zIndex: "120",
   };
@@ -2918,7 +2972,6 @@ function createTabTextOverlay(
   const computed = getComputedStyleFor(source);
   const textRect = getElementTextRangeRect(source) ?? getFallbackTextRect(rect, computed, text);
   const fontSize = parsePx(computed.fontSize, 12);
-  const lineHeight = parseLineHeight(computed.lineHeight, fontSize);
 
   const textNode: TextSnapshot = {
     nodeType: NODE_TYPES.TEXT_NODE,
@@ -2933,6 +2986,8 @@ function createTabTextOverlay(
     lineCount: 1,
   };
 
+  // See createCompactToolbarActionOverlay: encode measured text offsets so the
+  // importer's box-plus-styles text placement reproduces the browser layout.
   const styles: Record<string, string> = {
     display: "block",
     position: "absolute",
@@ -2945,9 +3000,10 @@ function createTabTextOverlay(
     fontFamily: computed.fontFamily,
     fontSize: computed.fontSize || `${roundPx(fontSize)}px`,
     fontWeight: computed.fontWeight,
-    lineHeight: Number.isFinite(lineHeight) ? `${roundPx(lineHeight)}px` : computed.lineHeight,
+    lineHeight: `${roundPx(Math.max(1, (textRect.y + textRect.height / 2 - rect.top) * 2))}px`,
     whiteSpace: "nowrap",
-    textAlign: computed.textAlign,
+    textAlign: "left",
+    paddingLeft: `${roundPx(Math.max(0, textRect.x - rect.left))}px`,
     boxSizing: "border-box",
     zIndex: "120",
   };
@@ -3891,6 +3947,238 @@ function isTableMeasurementSnapshot(
 
 function hasSnapshotText(childNodes: SnapshotNode[]): boolean {
   return childNodes.some((child) => getSnapshotText(child).length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Text line metrics normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Align each element's line-height with the measured position of its
+ * single-line text. The Figma importer places text from the element box plus
+ * its text styles rather than from the text node rect, so flex-centered
+ * spans, stretched breadcrumb separators, and similar cases would otherwise
+ * render top-aligned even though the browser centers them.
+ */
+function normalizeTextLineMetrics(root: ElementSnapshot): void {
+  normalizeTextLineMetricsInner(root, 16, NaN);
+}
+
+function normalizeTextLineMetricsInner(
+  node: ElementSnapshot,
+  inheritedFontSize: number,
+  inheritedLineHeight: number,
+): void {
+  const fontSize = parsePx(node.styles.fontSize || "", inheritedFontSize);
+  const ownLineHeight = parsePx(node.styles.lineHeight || "", NaN);
+  const effectiveLineHeight = Number.isFinite(ownLineHeight)
+    ? ownLineHeight
+    : Number.isFinite(inheritedLineHeight)
+      ? inheritedLineHeight
+      : fontSize * 1.2;
+
+  applyMeasuredTextLineHeight(node, effectiveLineHeight);
+
+  const childInheritedLineHeight = Number.isFinite(ownLineHeight) ? ownLineHeight : inheritedLineHeight;
+  for (const child of node.childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    normalizeTextLineMetricsInner(child, fontSize, childInheritedLineHeight);
+  }
+}
+
+function applyMeasuredTextLineHeight(node: ElementSnapshot, effectiveLineHeight: number): void {
+  if ((node.styles.writingMode || "").startsWith("vertical")) return;
+
+  const texts: TextSnapshot[] = [];
+  for (const child of node.childNodes) {
+    if (child.nodeType !== NODE_TYPES.TEXT_NODE) continue;
+
+    const text = child as TextSnapshot;
+    if (!text.text.trim()) continue;
+    // Multi-line or unmeasurable text: line-height affects every line, so
+    // leave the element untouched.
+    if (text.lineCount !== 1 || text.rect.height <= 0) return;
+    texts.push(text);
+  }
+  if (texts.length === 0) return;
+
+  const centers = texts.map((text) => text.rect.y + text.rect.height / 2);
+  const minCenter = Math.min(...centers);
+  const maxCenter = Math.max(...centers);
+  if (maxCenter - minCenter > 2) return;
+
+  const contentTop = node.rect.y +
+    parsePx(node.styles.borderTopWidth || "", 0) +
+    parsePx(node.styles.paddingTop || "", 0);
+  const actualCenter = (minCenter + maxCenter) / 2;
+  const predictedCenter = contentTop + effectiveLineHeight / 2;
+  if (Math.abs(predictedCenter - actualCenter) <= 1.5) return;
+
+  const targetLineHeight = (actualCenter - contentTop) * 2;
+  if (!Number.isFinite(targetLineHeight) || targetLineHeight <= 0) return;
+
+  node.styles.lineHeight = `${roundPx(targetLineHeight)}px`;
+}
+
+// ---------------------------------------------------------------------------
+// Flex spacing materialization
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert measured spacing between flex children into explicit fixed-size
+ * spacer nodes. The Figma importer rebuilds flex containers as Auto Layout
+ * and drops CSS margins, so margin-driven gaps (pagination controls, button
+ * groups) collapse or shift. With spacers, the in-flow content fills the
+ * container exactly and every justify-content mode reproduces the captured
+ * geometry.
+ */
+function materializeFlexSpacing(node: ElementSnapshot): void {
+  for (const child of node.childNodes) {
+    if (isElementNodeSnapshot(child)) materializeFlexSpacing(child);
+  }
+
+  applyFlexSpacing(node);
+}
+
+function applyFlexSpacing(node: ElementSnapshot): void {
+  const display = node.styles.display;
+  if (display !== "flex" && display !== "inline-flex") return;
+
+  const direction = node.styles.flexDirection || "row";
+  if (direction !== "row" && direction !== "column") return;
+
+  const flexWrap = (node.styles.flexWrap || "").toLowerCase();
+  if (flexWrap === "wrap" || flexWrap === "wrap-reverse") return;
+
+  const isRow = direction === "row";
+  const contentBox = getSnapshotContentBox(node);
+  const contentStart = isRow ? contentBox.x : contentBox.y;
+  const contentEnd = isRow ? contentBox.x + contentBox.width : contentBox.y + contentBox.height;
+  if (contentEnd - contentStart <= 1) return;
+
+  const flow: Array<{ child: SnapshotNode; start: number; end: number }> = [];
+  for (const child of node.childNodes) {
+    if (isElementNodeSnapshot(child)) {
+      if (child.attributes["data-h2d-flex-spacer"] === "true") return;
+
+      const position = child.styles.position || "";
+      if (position === "absolute" || position === "fixed") continue;
+    }
+    if (child.rect.width <= 0.5 || child.rect.height <= 0.5) continue;
+
+    const start = isRow ? child.rect.x : child.rect.y;
+    flow.push({ child, start, end: start + (isRow ? child.rect.width : child.rect.height) });
+  }
+  if (flow.length === 0) return;
+
+  // Only handle a single visually ordered line: bail on overlaps, reversed
+  // or wrapped content, and children that spill outside the content box
+  // (horizontally scrolled rows must keep their clipping untouched).
+  for (let index = 1; index < flow.length; index += 1) {
+    if (flow[index].start < flow[index - 1].end - 0.5) return;
+  }
+  if (flow[0].start < contentStart - 0.5) return;
+  if (flow[flow.length - 1].end > contentEnd + 0.5) return;
+
+  const gapBefore = new Map<SnapshotNode, number>();
+  let cursor = contentStart;
+  for (const entry of flow) {
+    gapBefore.set(entry.child, entry.start - cursor);
+    cursor = entry.end;
+  }
+  const trailingGap = contentEnd - cursor;
+  const hasGap = trailingGap > 0.75 || [...gapBefore.values()].some((gap) => gap > 0.75);
+  if (!hasGap) return;
+
+  const crossStart = isRow ? contentBox.y : contentBox.x;
+  const crossSize = Math.max(1, isRow ? contentBox.height : contentBox.width);
+  const nextChildren: SnapshotNode[] = [];
+  cursor = contentStart;
+  for (const child of node.childNodes) {
+    const gap = gapBefore.get(child);
+    if (gap != null) {
+      if (gap > 0.75) {
+        nextChildren.push(createFlexSpacerSnapshot(cursor, crossStart, gap, crossSize, isRow));
+      }
+      cursor = isRow ? child.rect.x + child.rect.width : child.rect.y + child.rect.height;
+      clearFlexMainAxisMargins(child, isRow);
+    }
+    nextChildren.push(child);
+  }
+  if (trailingGap > 0.75) {
+    nextChildren.push(createFlexSpacerSnapshot(cursor, crossStart, trailingGap, crossSize, isRow));
+  }
+
+  node.childNodes = nextChildren;
+  clearFlexGapStyles(node, isRow);
+}
+
+function getSnapshotContentBox(node: ElementSnapshot): Rect {
+  const borderLeft = parsePx(node.styles.borderLeftWidth || "", 0);
+  const borderRight = parsePx(node.styles.borderRightWidth || "", 0);
+  const borderTop = parsePx(node.styles.borderTopWidth || "", 0);
+  const borderBottom = parsePx(node.styles.borderBottomWidth || "", 0);
+  const paddingLeft = parsePx(node.styles.paddingLeft || "", 0);
+  const paddingRight = parsePx(node.styles.paddingRight || "", 0);
+  const paddingTop = parsePx(node.styles.paddingTop || "", 0);
+  const paddingBottom = parsePx(node.styles.paddingBottom || "", 0);
+
+  return {
+    x: node.rect.x + borderLeft + paddingLeft,
+    y: node.rect.y + borderTop + paddingTop,
+    width: Math.max(0, node.rect.width - borderLeft - borderRight - paddingLeft - paddingRight),
+    height: Math.max(0, node.rect.height - borderTop - borderBottom - paddingTop - paddingBottom),
+  };
+}
+
+function createFlexSpacerSnapshot(
+  mainStart: number,
+  crossStart: number,
+  mainSize: number,
+  crossSize: number,
+  isRow: boolean,
+): ElementSnapshot {
+  const rect = isRow
+    ? new DOMRect(mainStart, crossStart, mainSize, crossSize)
+    : new DOMRect(crossStart, mainStart, crossSize, mainSize);
+
+  return {
+    nodeType: NODE_TYPES.ELEMENT_NODE,
+    id: generateNodeId(null),
+    tag: "DIV",
+    attributes: { "data-h2d-flex-spacer": "true" },
+    styles: {
+      display: "block",
+      width: `${roundPx(rect.width)}px`,
+      height: `${roundPx(rect.height)}px`,
+      flexGrow: "0",
+      flexShrink: "0",
+      boxSizing: "border-box",
+    },
+    rect: toElementRect(rect),
+    childNodes: [],
+    layoutSizingHorizontal: "FIXED",
+    layoutSizingVertical: "FIXED",
+  };
+}
+
+function clearFlexMainAxisMargins(child: SnapshotNode, isRow: boolean): void {
+  if (!isElementNodeSnapshot(child)) return;
+
+  if (isRow) {
+    delete child.styles.marginLeft;
+    delete child.styles.marginRight;
+  } else {
+    delete child.styles.marginTop;
+    delete child.styles.marginBottom;
+  }
+  delete child.styles.margin;
+}
+
+function clearFlexGapStyles(node: ElementSnapshot, isRow: boolean): void {
+  const axisGapKey = isRow ? "columnGap" : "rowGap";
+  if (parsePx(node.styles[axisGapKey] || "", 0) > 0) node.styles[axisGapKey] = "normal";
+  if (parsePx(node.styles.gap || "", 0) > 0) node.styles.gap = "normal";
 }
 
 // ---------------------------------------------------------------------------
@@ -5361,6 +5649,53 @@ function getSnapshotDescendantVisibleBounds(
   const rects: Rect[] = [];
   collectSnapshotVisibleDescendantRects(childNodes, clipRect, rects);
   return unionSnapshotRects(rects);
+}
+
+/**
+ * Union the viewport-visible rects of descendants that can escape this
+ * container's overflow clip: fixed-position nodes, and absolute nodes with
+ * no positioned element between them and the (unpositioned) container.
+ */
+function getSnapshotEscapingDescendantBounds(
+  node: ElementSnapshot,
+  clipRect: { x: number; y: number; width: number; height: number },
+): Rect | null {
+  const rects: Rect[] = [];
+  collectSnapshotEscapingDescendantRects(node.childNodes, isSnapshotPositioned(node.styles), clipRect, rects);
+  return unionSnapshotRects(rects);
+}
+
+function collectSnapshotEscapingDescendantRects(
+  childNodes: SnapshotNode[],
+  chainPositioned: boolean,
+  clipRect: { x: number; y: number; width: number; height: number },
+  rects: Rect[],
+): void {
+  for (const child of childNodes) {
+    if (!isElementNodeSnapshot(child)) continue;
+    if (isSnapshotVisuallyHidden(child)) continue;
+
+    const position = child.styles.position || "";
+    const escapes = position === "fixed" || (position === "absolute" && !chainPositioned);
+    if (escapes) {
+      const visibleRect = intersectSnapshotRect(child.rect, clipRect);
+      if (visibleRect) rects.push(visibleRect);
+      collectSnapshotVisibleDescendantRects(child.childNodes, clipRect, rects);
+      continue;
+    }
+
+    collectSnapshotEscapingDescendantRects(
+      child.childNodes,
+      chainPositioned || isSnapshotPositioned(child.styles),
+      clipRect,
+      rects,
+    );
+  }
+}
+
+function isSnapshotPositioned(styles: Record<string, string>): boolean {
+  const position = styles.position || "";
+  return position !== "" && position !== "static";
 }
 
 function collectSnapshotVisibleDescendantRects(

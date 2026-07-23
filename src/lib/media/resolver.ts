@@ -16,6 +16,17 @@ const H2D_TOOLBAR_HOST_ID = "__figma_capture_ext_toolbar__";
 /** Cache: once the extension bridge times out, skip it for all subsequent images. */
 let bridgeUnavailable = false;
 let toolbarHideDepth = 0;
+
+/**
+ * Reset per-capture bridge state.
+ *
+ * The bridge-unavailable latch must not leak across captures: a single slow
+ * service-worker wakeup would otherwise disable cross-origin image fetching
+ * for every later capture on the same page.
+ */
+export function resetResourceBridgeState(): void {
+  bridgeUnavailable = false;
+}
 let toolbarPreviousVisibility: string | null = null;
 let toolbarPreviousPointerEvents: string | null = null;
 
@@ -323,7 +334,7 @@ async function fetchImageAsBlob(url: string, sourceElement?: HTMLImageElement): 
   // === Cross-origin path (no fetch, no console errors) ===
 
   // Strategy 1: extension CORS bridge — the only reliable way for cross-origin.
-  // Skip if bridge was already detected as unavailable (avoid 3s timeout per image).
+  // Skip if bridge was already detected as unavailable (avoid a timeout per image).
   if (!bridgeUnavailable) {
     try {
       const blob = await fetchViaExtensionBridge(url);
@@ -333,7 +344,9 @@ async function fetchImageAsBlob(url: string, sourceElement?: HTMLImageElement): 
       // null result means timeout — bridge not installed
       bridgeUnavailable = true;
     } catch {
-      bridgeUnavailable = true;
+      // The bridge answered but the fetch failed for this specific image
+      // (HTTP error, network hiccup). The bridge itself works — keep it
+      // enabled for the remaining images and fall through to local strategies.
     }
   }
 
@@ -373,10 +386,13 @@ async function fetchImageAsBlob(url: string, sourceElement?: HTMLImageElement): 
 function fetchViaExtensionBridge(url: string): Promise<Blob | null> {
   return new Promise<Blob | null>((resolve, reject) => {
     const callbackId = `figma-fetch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    // Generous timeout: a cold service-worker start plus a slow CDN response
+    // can easily exceed 1.5s, and fetches run concurrently so the cost of a
+    // real timeout is paid once per capture, not once per image.
     const timeout = setTimeout(() => {
       cleanup();
       resolve(null); // Timeout = bridge not available, don't reject
-    }, 1_500);
+    }, 4_000);
 
     function onResult(event: Event): void {
       const detail = (event as CustomEvent).detail;
@@ -422,7 +438,7 @@ function captureVisibleTabViaExtensionBridge(): Promise<Blob | null> {
     const timeout = setTimeout(() => {
       cleanup();
       resolve(null);
-    }, 2_000);
+    }, 4_000);
 
     function onResult(event: Event): void {
       const detail = (event as CustomEvent).detail;

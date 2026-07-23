@@ -219,7 +219,10 @@ export function shouldPruneNode(
     rect.width > 0 &&
     rect.height > 0
   ) {
-    const clippingRects = getFullyClippingScrollAncestorRects(element, rect);
+    const clippingRects = [
+      ...getFullyClippingScrollAncestorRects(element, rect),
+      ...getFullyClippingOverflowHiddenAncestorRects(element, rect),
+    ];
     if (clippingRects.length > 0 && !hasVisibleSnapshotDescendantInAllClips(childNodes, clippingRects)) {
       return true;
     }
@@ -289,6 +292,76 @@ function getFullyClippingScrollAncestorRects(
   }
 
   return clippingRects;
+}
+
+/**
+ * Collect overflow hidden/clip ancestors that clip `element` fully out of view.
+ *
+ * Walks the CSS containing-block chain (not the plain parent chain) so that
+ * absolutely positioned elements are only tested against ancestors whose
+ * overflow actually applies to them. Content lying entirely outside such an
+ * ancestor is never painted by the browser (e.g. a sidebar logo title that
+ * wraps below its overflow-hidden container), so it must not survive capture.
+ */
+function getFullyClippingOverflowHiddenAncestorRects(
+  element: Element,
+  rect: { x: number; y: number; width: number; height: number },
+): DOMRect[] {
+  if (rect.width <= 0 || rect.height <= 0) return [];
+
+  const clippingRects: DOMRect[] = [];
+  let current: Element | null = element;
+  let depth = 0;
+
+  while (current && depth < 64) {
+    const container = getContainingBlockAncestor(current);
+    if (!container) break;
+
+    const computed = getComputedStyleFor(container);
+    const clipsX = /^(hidden|clip)$/i.test(computed.overflowX);
+    const clipsY = /^(hidden|clip)$/i.test(computed.overflowY);
+    if (clipsX || clipsY) {
+      const clip = container.getBoundingClientRect();
+      const outsideX = clipsX && clip.width > 0 && (rect.x + rect.width <= clip.left || rect.x >= clip.right);
+      const outsideY = clipsY && clip.height > 0 && (rect.y + rect.height <= clip.top || rect.y >= clip.bottom);
+      if (outsideX || outsideY) clippingRects.push(clip);
+    }
+
+    current = container;
+    depth += 1;
+  }
+
+  return clippingRects;
+}
+
+/**
+ * Find the element acting as the CSS containing block for `element`.
+ *
+ * In-flow and relatively positioned elements use their parent; absolutely
+ * positioned elements skip to the nearest positioned (or transform-bearing)
+ * ancestor; fixed elements skip to the nearest transform-bearing ancestor.
+ */
+function getContainingBlockAncestor(element: Element): Element | null {
+  const position = getComputedStyleFor(element).position;
+  let ancestor = element.parentElement;
+  if (position !== "fixed" && position !== "absolute") return ancestor;
+
+  while (ancestor) {
+    const computed = getComputedStyleFor(ancestor);
+    if (position === "absolute" && computed.position !== "static") return ancestor;
+    if (createsContainingBlockForPositioned(computed)) return ancestor;
+    ancestor = ancestor.parentElement;
+  }
+
+  return null;
+}
+
+function createsContainingBlockForPositioned(computed: CSSStyleDeclaration): boolean {
+  if (computed.transform && computed.transform !== "none") return true;
+  if (computed.perspective && computed.perspective !== "none") return true;
+  if (computed.filter && computed.filter !== "none") return true;
+  if (/(transform|perspective|filter)/i.test(computed.willChange || "")) return true;
+  return /(layout|paint|strict|content)/i.test(computed.contain || "");
 }
 
 function hasVisibleSnapshotDescendantInAllClips(childNodes: SnapshotNode[], clippingRects: DOMRect[]): boolean {
