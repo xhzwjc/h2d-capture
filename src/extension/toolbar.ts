@@ -1184,8 +1184,8 @@
   function onSelectionMove(e: MouseEvent): void {
     const el = document.elementFromPoint(e.clientX, e.clientY);
     if (!el || el === host) return;
-    selectedEl = el;
-    const rect = el.getBoundingClientRect();
+    selectedEl = resolveSelectionCaptureTarget(el);
+    const rect = selectedEl.getBoundingClientRect();
     highlight.style.display = "block";
     highlight.style.top = rect.top + "px";
     highlight.style.left = rect.left + "px";
@@ -1212,6 +1212,210 @@
         else el.removeAttribute("id");
       });
     }
+  }
+
+  function resolveSelectionCaptureTarget(element: Element): Element {
+    const floatingSurface = findFloatingSelectionSurface(element);
+    if (floatingSurface) return floatingSurface;
+
+    const structuralSurface = findStructuralSelectionSurface(element);
+    return structuralSurface ?? element;
+  }
+
+  function findStructuralSelectionSurface(element: Element): Element | null {
+    const headerSurface = findPageHeaderSelectionSurface(element);
+    if (!headerSurface) return null;
+
+    const headerRect = headerSurface.getBoundingClientRect();
+    const headerText = normalizeText(getVisibleText(headerSurface));
+    let current = headerSurface.parentElement;
+    let depth = 0;
+
+    while (current && depth < 12) {
+      if (current === host || current.tagName === "HTML" || current.tagName === "BODY") break;
+      if (isStructuralSelectionContainerCandidate(current, headerSurface, headerRect, headerText)) {
+        return current;
+      }
+
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return null;
+  }
+
+  function findPageHeaderSelectionSurface(element: Element): Element | null {
+    let current: Element | null = element;
+
+    for (let depth = 0; current && depth < 8; depth += 1) {
+      if (current === host || current.tagName === "HTML" || current.tagName === "BODY") break;
+      if (isPageHeaderSelectionSurfaceCandidate(current)) return current;
+      current = current.parentElement;
+    }
+
+    return null;
+  }
+
+  function isPageHeaderSelectionSurfaceCandidate(element: Element): boolean {
+    const rect = element.getBoundingClientRect();
+    const view = getElementWindow(element);
+    if (rect.height < 24 || rect.height > 96) return false;
+    if (rect.width < Math.min(320, view.innerWidth * 0.3)) return false;
+    if (rect.top > Math.max(180, view.innerHeight * 0.25)) return false;
+
+    const text = normalizeText(getVisibleText(element));
+    if (!text || text.length > 80) return false;
+
+    const computed = getComputedStyle(element);
+    if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+    const identity = `${element.tagName} ${stringifyClassName(element)} ${element.id || ""}`.toLowerCase();
+    const role = element.getAttribute("role")?.toLowerCase() || "";
+    return /(^|[-_\s])(page|view|header|title|heading|list|toolbar)([-_\s]|$)/i.test(identity) ||
+      /^heading$/i.test(role) ||
+      rect.width >= view.innerWidth * 0.5;
+  }
+
+  function isStructuralSelectionContainerCandidate(
+    element: Element,
+    headerSurface: Element,
+    headerRect: DOMRect,
+    headerText: string,
+  ): boolean {
+    const rect = element.getBoundingClientRect();
+    const view = getElementWindow(element);
+    if (rect.width < Math.min(640, view.innerWidth * 0.45)) return false;
+    if (rect.height < Math.min(360, view.innerHeight * 0.42)) return false;
+    if (rect.top > headerRect.top + 80) return false;
+    if (rect.bottom < headerRect.bottom + 180) return false;
+    if (headerRect.left < rect.left - 8 || headerRect.right > rect.right + Math.max(8, view.innerWidth * 0.2)) {
+      return false;
+    }
+
+    const text = normalizeText(getVisibleText(element));
+    if (text.length < headerText.length + 80) return false;
+    if (!hasStructuralPageContent(element, headerSurface)) return false;
+
+    const computed = getComputedStyle(element);
+    return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
+  }
+
+  function hasStructuralPageContent(container: Element, headerSurface: Element): boolean {
+    for (const candidate of Array.from(container.querySelectorAll("*"))) {
+      if (candidate === headerSurface || headerSurface.contains(candidate)) continue;
+      if (!isVisibleForSelectionCandidate(candidate)) continue;
+
+      const identity = `${candidate.tagName} ${stringifyClassName(candidate)} ${candidate.id || ""}`.toLowerCase();
+      const role = candidate.getAttribute("role")?.toLowerCase() || "";
+      if (
+        candidate.tagName === "TABLE" ||
+        /^(table|grid|rowgroup)$/i.test(role) ||
+        /(^|[-_\s])(table|datatable|grid|list|listview|content|main|region)([-_\s]|$)/i.test(identity)
+      ) {
+        const rect = candidate.getBoundingClientRect();
+        if (rect.width >= 240 && rect.height >= 80) return true;
+      }
+    }
+
+    return countVisibleCompactActionButtons(container, headerSurface) >= 3;
+  }
+
+  function countVisibleCompactActionButtons(container: Element, ignoredRoot: Element): number {
+    const positions = new Set<string>();
+
+    for (const candidate of Array.from(container.querySelectorAll("button,a,[role='button'],[role='link']"))) {
+      if (candidate === ignoredRoot || ignoredRoot.contains(candidate)) continue;
+      if (!isVisibleForSelectionCandidate(candidate)) continue;
+
+      const rect = candidate.getBoundingClientRect();
+      if (rect.width < 40 || rect.width > 240 || rect.height < 20 || rect.height > 48) continue;
+      if (!normalizeText(getVisibleText(candidate))) continue;
+
+      positions.add(`${Math.round(rect.top / 4) * 4}:${Math.round(rect.left / 4) * 4}`);
+    }
+
+    return positions.size;
+  }
+
+  function isVisibleForSelectionCandidate(element: Element): boolean {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const computed = getComputedStyle(element);
+    return computed.display !== "none" && computed.visibility !== "hidden" && computed.opacity !== "0";
+  }
+
+  function findFloatingSelectionSurface(element: Element): Element | null {
+    let current: Element | null = element;
+    let best: Element | null = null;
+    let depth = 0;
+
+    while (current && depth < 8) {
+      if (current === host || current.tagName === "HTML" || current.tagName === "BODY") break;
+      if (isFloatingSelectionSurfaceCandidate(current)) {
+        best = current;
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return best;
+  }
+
+  function isFloatingSelectionSurfaceCandidate(element: Element): boolean {
+    const rect = element.getBoundingClientRect();
+    if (rect.width < 48 || rect.height < 32 || rect.width > 720 || rect.height > 820) return false;
+
+    const computed = getComputedStyle(element);
+    if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return false;
+
+    const role = element.getAttribute("role")?.toLowerCase() || "";
+    const identity = `${String((element as HTMLElement | SVGElement).className || "")} ${element.id || ""}`.toLowerCase();
+    const menuRows = element.querySelectorAll(
+      '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"]',
+    ).length;
+    const hasPopupRole = /^(menu|listbox|tree|dialog|alertdialog)$/i.test(role);
+    const hasPopupContent = menuRows >= 2;
+    if (!hasPopupRole && !hasPopupContent) return false;
+
+    const looksFloating =
+      computed.position === "absolute" ||
+      computed.position === "fixed" ||
+      (computed.transform && computed.transform !== "none") ||
+      /(^|[-_\s])(popover|popper|popup|floating|dropdown|menu|dialog|portal|content|surface)([-_\s]|$)/i.test(identity);
+    const hasSurfacePaint =
+      isVisibleCssColor(computed.backgroundColor) ||
+      (computed.boxShadow && computed.boxShadow !== "none") ||
+      hasVisibleCssBorder(computed) ||
+      hasRoundedCssCorner(computed);
+
+    return looksFloating || hasSurfacePaint;
+  }
+
+  function isVisibleCssColor(color: string): boolean {
+    return Boolean(color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)");
+  }
+
+  function hasVisibleCssBorder(computed: CSSStyleDeclaration): boolean {
+    return [
+      [computed.borderTopWidth, computed.borderTopStyle],
+      [computed.borderRightWidth, computed.borderRightStyle],
+      [computed.borderBottomWidth, computed.borderBottomStyle],
+      [computed.borderLeftWidth, computed.borderLeftStyle],
+    ].some(([width, style]) => parseCssPx(width) > 0 && style !== "none" && style !== "hidden");
+  }
+
+  function hasRoundedCssCorner(computed: CSSStyleDeclaration): boolean {
+    return [
+      computed.borderTopLeftRadius,
+      computed.borderTopRightRadius,
+      computed.borderBottomRightRadius,
+      computed.borderBottomLeftRadius,
+    ].some((value) => parseCssPx(value) >= 4);
+  }
+
+  function parseCssPx(value: string): number {
+    const parsed = Number.parseFloat(value || "");
+    return Number.isFinite(parsed) ? parsed : 0;
   }
 
   function onSelectionKey(e: KeyboardEvent): void {

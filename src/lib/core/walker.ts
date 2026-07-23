@@ -85,6 +85,8 @@ export function isNodeVisible(element: Element): boolean {
   // display:none — element and all descendants are invisible
   if (computed.display === "none") return false;
 
+  if (isVisuallyHiddenAccessibilityElement(element, computed)) return false;
+
   // visibility:hidden — element is invisible (children may override, but
   // Figma can't represent that, so skip the subtree)
   if (computed.visibility === "hidden") return false;
@@ -93,6 +95,37 @@ export function isNodeVisible(element: Element): boolean {
   if (Number.isFinite(opacity) && opacity <= 0.01) return false;
 
   return true;
+}
+
+function isVisuallyHiddenAccessibilityElement(element: Element, computed: CSSStyleDeclaration): boolean {
+  if (element.matches(":focus, :focus-within")) return false;
+
+  const identity = `${String((element as HTMLElement | SVGElement).className || "")} ${element.id || ""}`;
+  const hasAccessibilityHiddenClass =
+    /(^|[-_\s])(sr-only|visually-hidden|screen-reader|screenreader|a11y-hidden|assistive-text)([-_\s]|$)/i.test(identity);
+  const usesClippedHiding =
+    /rect\(\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*,\s*0(?:px)?\s*\)/i.test(computed.clip || "") ||
+    /inset\(\s*50%\s*\)/i.test(computed.clipPath || "");
+
+  if (!hasAccessibilityHiddenClass && !usesClippedHiding) return false;
+
+  const rect = element.getBoundingClientRect();
+  const isTinyBox =
+    rect.width <= 2 ||
+    rect.height <= 2 ||
+    parseCssPx(computed.width, 0) <= 2 ||
+    parseCssPx(computed.height, 0) <= 2;
+  const isOutOfFlow = computed.position === "absolute" || computed.position === "fixed";
+  const clipsContent = /^(hidden|clip)$/i.test(computed.overflow) ||
+    /^(hidden|clip)$/i.test(computed.overflowX) ||
+    /^(hidden|clip)$/i.test(computed.overflowY);
+
+  return hasAccessibilityHiddenClass || (usesClippedHiding && (isTinyBox || isOutOfFlow || clipsContent));
+}
+
+function parseCssPx(value: string, fallback: number): number {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function isHiddenPopupLayer(element: Element): boolean {

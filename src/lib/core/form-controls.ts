@@ -34,7 +34,7 @@ interface RadioControl {
 }
 
 const SELECT_ROOT_CLASS_PATTERN =
-  /(^|[-_\s])(select|picker|cascader|combobox)([-_\s]|$)/i;
+  /(^|[-_\s])(select(?![-_](?:none|text|all|auto)(?:[-_\s]|$))|picker|cascader|combobox)([-_\s]|$)/i;
 const DROPDOWN_CLASS_PATTERN = /(^|[-_\s])dropdown([-_\s]|$)/i;
 const SELECT_VISUAL_CLASS_PATTERN =
   /(^|[-_\s])(selector|selection|control|wrapper|trigger|field)([-_\s]|$)/i;
@@ -79,12 +79,14 @@ export function detectSelectControl(element: Element): SelectControl | null {
   const visualBox = findSelectVisualBox(root);
   const visualRect = visualBox.getBoundingClientRect();
   if (!isReasonableControlRect(visualRect)) return null;
+  if (isOffscreenSyntheticControlCandidate(root, visualRect)) return null;
 
   if (hasCanonicalSelectAncestor(root, visualBox)) return null;
 
   const displayText = extractSelectDisplayText(root);
   const input = findSelectInput(root);
   if (!displayText.text && !input) return null;
+  if (isCompactInlineFilterSelectTrigger(root, visualBox, displayText)) return null;
   if (hasExpandedCompositeSelectContent(root, visualBox)) return null;
   if (isMultilineDisclosureSelectTrigger(root, visualBox, displayText, input)) return null;
 
@@ -825,6 +827,90 @@ function isSplitActionPicker(
   return horizontallySeparated && actionIsCompact;
 }
 
+function isCompactInlineFilterSelectTrigger(
+  root: Element,
+  visualBox: Element,
+  displayText: SelectDisplayText,
+): boolean {
+  if (displayText.source !== "visible text" || displayText.isPlaceholder) return false;
+
+  const rootRect = root.getBoundingClientRect();
+  const visualRect = visualBox.getBoundingClientRect();
+  const triggerRect = rootRect.width >= visualRect.width && rootRect.height >= visualRect.height
+    ? rootRect
+    : visualRect;
+  if (triggerRect.width < 40 || triggerRect.width > 180) return false;
+  if (triggerRect.height < 18 || triggerRect.height > 34) return false;
+
+  const compactText = displayText.text.replace(/\s+/g, "");
+  if (!compactText || compactText.length > 16) return false;
+  if (/^(请选择|请输入|选择|搜索|全部)$/.test(compactText)) return false;
+
+  return hasCompactInlineFilterRowContext(root, triggerRect);
+}
+
+function hasCompactInlineFilterRowContext(root: Element, triggerRect: DOMRect): boolean {
+  let ancestor = root.parentElement;
+  let depth = 0;
+
+  while (ancestor && depth < 24) {
+    const ancestorRect = ancestor.getBoundingClientRect();
+    if (isCompactInlineFilterRowRect(ancestorRect, triggerRect)) {
+      const rowEntries = getVisibleTextNodeEntries(ancestor).filter((entry) => (
+        entry.rect.height > 0 &&
+        entry.rect.height <= 24 &&
+        Math.abs(getRectCenterY(entry.rect) - getRectCenterY(triggerRect)) <= 8
+      ));
+      const labels = new Set(rowEntries.map((entry) => entry.text.replace(/\s+/g, "")).filter(Boolean));
+      if (labels.size >= 4) return true;
+
+      if (countCompactInlineRowTriggers(ancestor, triggerRect) >= 3) return true;
+    }
+
+    ancestor = ancestor.parentElement;
+    depth += 1;
+  }
+
+  return false;
+}
+
+function isCompactInlineFilterRowRect(rowRect: DOMRect, triggerRect: DOMRect): boolean {
+  if (rowRect.width < 240 || rowRect.width < triggerRect.width * 3) return false;
+  if (rowRect.height < triggerRect.height || rowRect.height > 72) return false;
+  if (triggerRect.top < rowRect.top - 2 || triggerRect.bottom > rowRect.bottom + 2) return false;
+  return true;
+}
+
+function countCompactInlineRowTriggers(container: Element, triggerRect: DOMRect): number {
+  const positions = new Set<number>();
+
+  for (const candidate of Array.from(container.querySelectorAll("*"))) {
+    if (!isNodeVisible(candidate)) continue;
+
+    const rect = candidate.getBoundingClientRect();
+    if (!isCompactInlineTriggerRect(rect, triggerRect)) continue;
+
+    const text = getVisibleText(candidate).replace(/\s+/g, "");
+    if (!text || text.length > 20) continue;
+    if (/^(请选择|请输入|选择|搜索|全部)$/.test(text)) continue;
+
+    positions.add(Math.round(rect.left / 4) * 4);
+  }
+
+  return positions.size;
+}
+
+function isCompactInlineTriggerRect(rect: DOMRect, triggerRect: DOMRect): boolean {
+  if (rect.width < 32 || rect.width > 220) return false;
+  if (rect.height < 16 || rect.height > 36) return false;
+  if (Math.abs(getRectCenterY(rect) - getRectCenterY(triggerRect)) > 8) return false;
+  return rect.right > triggerRect.left - 320 && rect.left < triggerRect.right + 720;
+}
+
+function getRectCenterY(rect: DOMRect): number {
+  return rect.top + rect.height / 2;
+}
+
 function hasExpandedCompositeSelectContent(root: Element, visualBox: Element): boolean {
   const visualRect = visualBox.getBoundingClientRect();
   const textRects = getVisibleTextNodeRects(root)
@@ -905,23 +991,31 @@ function isRectInCurrentViewport(rect: DOMRect, root: Element): boolean {
 }
 
 function getVisibleTextNodeRects(root: Element): DOMRect[] {
-  const rects: DOMRect[] = [];
+  return getVisibleTextNodeEntries(root).map((entry) => entry.rect);
+}
+
+function getVisibleTextNodeEntries(root: Element): Array<{ text: string; rect: DOMRect }> {
+  const entries: Array<{ text: string; rect: DOMRect }> = [];
   const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   let node = walker.nextNode();
 
   while (node) {
     const text = node.textContent || "";
+    const normalizedText = text.replace(/\s+/g, " ").trim();
     const parent = node.parentElement;
-    if (text.trim() && parent && isNodeVisible(parent) && !isSelectDecorationElement(parent)) {
+    if (normalizedText && parent && isNodeVisible(parent) && !isSelectDecorationElement(parent)) {
       const rect = getTextRect(node);
       if (rect.width > 0 && rect.height > 0) {
-        rects.push(new DOMRect(rect.x, rect.y, rect.width, rect.height));
+        entries.push({
+          text: normalizedText,
+          rect: new DOMRect(rect.x, rect.y, rect.width, rect.height),
+        });
       }
     }
     node = walker.nextNode();
   }
 
-  return rects;
+  return entries;
 }
 
 function isSelectDecorationElement(element: Element): boolean {
@@ -1428,6 +1522,26 @@ function getClassName(element: Element): string {
 
 function isReasonableControlRect(rect: DOMRect): boolean {
   return rect.width >= 40 && rect.height >= 16 && rect.height <= 120;
+}
+
+function isOffscreenSyntheticControlCandidate(root: Element, rect: DOMRect): boolean {
+  if (rect.left >= -1 && rect.top >= -1) return false;
+  if (rect.width > 220 || rect.height > 32) return false;
+
+  const view = root.ownerDocument.defaultView;
+  if (!view) return false;
+
+  const visibleLeft = Math.max(rect.left, 0);
+  const visibleTop = Math.max(rect.top, 0);
+  const visibleRight = Math.min(rect.right, view.innerWidth);
+  const visibleBottom = Math.min(rect.bottom, view.innerHeight);
+  const visibleWidth = Math.max(0, visibleRight - visibleLeft);
+  const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+  const visibleArea = visibleWidth * visibleHeight;
+  const totalArea = rect.width * rect.height;
+  if (totalArea <= 0) return true;
+
+  return visibleArea / totalArea < 0.75;
 }
 
 function hasVisibleBorder(computed: CSSStyleDeclaration): boolean {

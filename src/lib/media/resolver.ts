@@ -369,6 +369,17 @@ async function fetchImageAsBlob(url: string, sourceElement?: HTMLImageElement): 
     } catch { /* tainted — expected */ }
   }
 
+  // Strategy 4: if the page is already visibly rendering a small image
+  // (for example an avatar or icon), crop that exact region from the tab.
+  // This is independent of the image host and preserves what the user sees
+  // when network/CORS serialization cannot produce a blob.
+  const viewportCropSource = getViewportImageCropSource(sourceElement) ?? getViewportImageCropSource(existingImg);
+  if (viewportCropSource) {
+    try {
+      return { url, blob: await captureViewportCrop(viewportCropSource.rect) };
+    } catch { /* visible-tab bridge unavailable — fall through */ }
+  }
+
   // Final fallback: preserve URL, no blob. Do NOT create new <img> or fetch()
   // for cross-origin URLs — it would only produce console CORS errors.
   return { url, blob: null, error: `Cross-origin image, bridge unavailable: ${url}` };
@@ -396,6 +407,20 @@ function fetchViaExtensionBridge(url: string): Promise<Blob | null> {
 
     function onResult(event: Event): void {
       const detail = (event as CustomEvent).detail;
+      handleBridgeFetchResult(detail);
+    }
+
+    function onMessage(event: MessageEvent): void {
+      if (event.source !== window) return;
+      const data = event.data as { type?: string; callbackId?: string; result?: unknown } | null;
+      if (data?.type !== "figma-capture-fetch-result") return;
+      handleBridgeFetchResult({
+        callbackId: data.callbackId,
+        result: parseBridgeFetchResult(data.result),
+      });
+    }
+
+    function handleBridgeFetchResult(detail: { callbackId?: string; result?: { error?: string; dataUrl?: string } } | null | undefined): void {
       if (detail?.callbackId !== callbackId) return;
 
       cleanup();
@@ -419,17 +444,37 @@ function fetchViaExtensionBridge(url: string): Promise<Blob | null> {
     function cleanup(): void {
       clearTimeout(timeout);
       window.removeEventListener("figma-capture-fetch-result", onResult);
+      window.removeEventListener("message", onMessage);
     }
 
     window.addEventListener("figma-capture-fetch-result", onResult);
+    window.addEventListener("message", onMessage);
 
     // Dispatch request to ISOLATED world bridge
+    window.postMessage(
+      {
+        type: "figma-capture-fetch",
+        url,
+        callbackId,
+      },
+      window.location.origin,
+    );
     window.dispatchEvent(
       new CustomEvent("figma-capture-fetch", {
         detail: { url, callbackId },
       }),
     );
   });
+}
+
+function parseBridgeFetchResult(result: unknown): { error?: string; dataUrl?: string } | undefined {
+  if (!result || typeof result !== "object") return undefined;
+
+  const record = result as Record<string, unknown>;
+  return {
+    error: typeof record.error === "string" ? record.error : undefined,
+    dataUrl: typeof record.dataUrl === "string" ? record.dataUrl : undefined,
+  };
 }
 
 function captureVisibleTabViaExtensionBridge(): Promise<Blob | null> {
@@ -442,6 +487,20 @@ function captureVisibleTabViaExtensionBridge(): Promise<Blob | null> {
 
     function onResult(event: Event): void {
       const detail = (event as CustomEvent).detail;
+      handleVisibleTabResult(detail);
+    }
+
+    function onMessage(event: MessageEvent): void {
+      if (event.source !== window) return;
+      const data = event.data as { type?: string; callbackId?: string; result?: unknown } | null;
+      if (data?.type !== "figma-capture-visible-tab-result") return;
+      handleVisibleTabResult({
+        callbackId: data.callbackId,
+        result: parseBridgeFetchResult(data.result),
+      });
+    }
+
+    function handleVisibleTabResult(detail: { callbackId?: string; result?: { error?: string; dataUrl?: string } } | null | undefined): void {
       if (detail?.callbackId !== callbackId) return;
 
       cleanup();
@@ -464,10 +523,19 @@ function captureVisibleTabViaExtensionBridge(): Promise<Blob | null> {
     function cleanup(): void {
       clearTimeout(timeout);
       window.removeEventListener("figma-capture-visible-tab-result", onResult);
+      window.removeEventListener("message", onMessage);
     }
 
     window.addEventListener("figma-capture-visible-tab-result", onResult);
+    window.addEventListener("message", onMessage);
 
+    window.postMessage(
+      {
+        type: "figma-capture-visible-tab",
+        callbackId,
+      },
+      window.location.origin,
+    );
     window.dispatchEvent(
       new CustomEvent("figma-capture-visible-tab", {
         detail: { callbackId },
@@ -606,6 +674,37 @@ function findLoadedImageOnPage(url: string, doc: Document = document): HTMLImage
     }
   }
   return null;
+}
+
+function getViewportImageCropSource(img: HTMLImageElement | null | undefined): { rect: Rect } | null {
+  if (!img || !img.complete || img.naturalWidth <= 0 || img.naturalHeight <= 0) return null;
+
+  const doc = img.ownerDocument;
+  const view = doc.defaultView;
+  if (!view || view.top !== view) return null;
+
+  const rect = img.getBoundingClientRect();
+  if (rect.width < 4 || rect.height < 4 || rect.width > 128 || rect.height > 128) return null;
+  if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= view.innerWidth || rect.top >= view.innerHeight) return null;
+
+  const computed = view.getComputedStyle(img);
+  if (computed.display === "none" || computed.visibility === "hidden") return null;
+  if (Number.parseFloat(computed.opacity || "1") <= 0.01) return null;
+
+  const visibleLeft = Math.max(0, rect.left);
+  const visibleTop = Math.max(0, rect.top);
+  const visibleRight = Math.min(view.innerWidth, rect.right);
+  const visibleBottom = Math.min(view.innerHeight, rect.bottom);
+  if (visibleRight <= visibleLeft || visibleBottom <= visibleTop) return null;
+
+  return {
+    rect: {
+      x: visibleLeft,
+      y: visibleTop,
+      width: Math.max(1, visibleRight - visibleLeft),
+      height: Math.max(1, visibleBottom - visibleTop),
+    },
+  };
 }
 
 /**

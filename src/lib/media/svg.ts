@@ -94,11 +94,27 @@ const kebabNames = camelToKebabMap(Object.keys(SVG_STYLE_DEFAULTS));
  * are also propagated to the `width` / `height` attributes of the clone
  * so that the serialized SVG renders at the correct intrinsic size.
  */
-export function bakeSvgStyles(svgElement: SVGElement): string {
+export type SvgSpriteCache = Map<string, Document>;
+
+export async function preloadExternalSvgSprites(root: ParentNode): Promise<SvgSpriteCache> {
+  const urls = getExternalSvgSpriteUrls(root);
+  const cache: SvgSpriteCache = new Map();
+
+  await Promise.all(
+    urls.map(async (url) => {
+      const doc = await fetchSvgSpriteDocument(url);
+      if (doc) cache.set(url, doc);
+    }),
+  );
+
+  return cache;
+}
+
+export function bakeSvgStyles(svgElement: SVGElement, spriteCache?: SvgSpriteCache): string {
   const clone = svgElement.cloneNode(true) as SVGElement;
 
   copySvgComputedStyles(svgElement, clone);
-  inlineSvgUseReferences(svgElement, clone);
+  inlineSvgUseReferences(svgElement, clone, spriteCache);
   replaceCurrentColorReferences(clone);
 
   const { width, height } = getComputedStyleFor(svgElement);
@@ -117,6 +133,43 @@ export function bakeSvgStyles(svgElement: SVGElement): string {
 const SVG_NS = "http://www.w3.org/2000/svg";
 const HREF_ATTRS = new Set(["href", "xlink:href"]);
 const CURRENT_COLOR_ATTRS = ["fill", "stroke", "stop-color", "flood-color", "lighting-color"];
+const SPRITE_FETCH_TIMEOUT_MS = 1_500;
+
+function getExternalSvgSpriteUrls(root: ParentNode): string[] {
+  if (!("querySelectorAll" in root)) return [];
+
+  const urls = new Set<string>();
+  for (const use of Array.from(root.querySelectorAll("svg use, use"))) {
+    const href = getRawUseHref(use);
+    const reference = href ? parseExternalUseReference(href, use.ownerDocument) : null;
+    if (reference) urls.add(reference.url);
+  }
+
+  return Array.from(urls).slice(0, 24);
+}
+
+async function fetchSvgSpriteDocument(url: string): Promise<Document | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SPRITE_FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+
+    const text = await response.text();
+    const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+    const root = doc.documentElement;
+    if (!root || root.tagName.toLowerCase() !== "svg") return null;
+    return doc;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 function replaceCurrentColorReferences(element: Element, inheritedColor?: string): void {
   const color = getInlineSvgColor(element) || inheritedColor;
@@ -151,7 +204,7 @@ function getInlineSvgColor(element: Element): string | undefined {
   return undefined;
 }
 
-function inlineSvgUseReferences(sourceSvg: SVGElement, cloneSvg: SVGElement): void {
+function inlineSvgUseReferences(sourceSvg: SVGElement, cloneSvg: SVGElement, spriteCache?: SvgSpriteCache): void {
   const sourceUses = Array.from(sourceSvg.querySelectorAll("use"));
   const cloneUses = Array.from(cloneSvg.querySelectorAll("use"));
 
@@ -160,15 +213,20 @@ function inlineSvgUseReferences(sourceSvg: SVGElement, cloneSvg: SVGElement): vo
     const cloneUse = cloneUses[index];
     if (!sourceUse || !cloneUse) continue;
 
-    inlineSingleUseReference(sourceUse, cloneUse, cloneSvg);
+    inlineSingleUseReference(sourceUse, cloneUse, cloneSvg, spriteCache);
   }
 }
 
-function inlineSingleUseReference(sourceUse: SVGUseElement, cloneUse: SVGUseElement, cloneSvg: SVGElement): void {
+function inlineSingleUseReference(
+  sourceUse: SVGUseElement,
+  cloneUse: SVGUseElement,
+  cloneSvg: SVGElement,
+  spriteCache?: SvgSpriteCache,
+): void {
   const href = getUseHref(sourceUse);
-  if (!href?.startsWith("#")) return;
+  if (!href) return;
 
-  const referenced = sourceUse.ownerDocument.getElementById(href.slice(1));
+  const referenced = resolveUseReference(sourceUse, href, spriteCache);
   if (!referenced || !isElementNode(referenced)) return;
 
   const group = cloneUse.ownerDocument.createElementNS(SVG_NS, "g");
@@ -184,11 +242,52 @@ function inlineSingleUseReference(sourceUse: SVGUseElement, cloneUse: SVGUseElem
   cloneUse.replaceWith(group);
 }
 
+function resolveUseReference(
+  sourceUse: SVGUseElement,
+  href: string,
+  spriteCache?: SvgSpriteCache,
+): Element | null {
+  if (href.startsWith("#")) {
+    return sourceUse.ownerDocument.getElementById(href.slice(1));
+  }
+
+  const reference = parseExternalUseReference(href, sourceUse.ownerDocument);
+  if (!reference) return null;
+
+  return spriteCache?.get(reference.url)?.getElementById(reference.id) ?? null;
+}
+
+function parseExternalUseReference(href: string, doc: Document): { url: string; id: string } | null {
+  const hashIndex = href.indexOf("#");
+  if (hashIndex <= 0 || hashIndex === href.length - 1) return null;
+
+  const urlPart = href.slice(0, hashIndex);
+  const id = href.slice(hashIndex + 1);
+  if (!urlPart || !id) return null;
+
+  try {
+    return {
+      url: new URL(urlPart, doc.baseURI || doc.location?.href || window.location.href).href,
+      id: decodeURIComponent(id),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function getUseHref(use: SVGUseElement): string | null {
   return (
     use.getAttribute("href") ||
     use.getAttribute("xlink:href") ||
     use.href?.baseVal ||
+    null
+  );
+}
+
+function getRawUseHref(use: Element): string | null {
+  return (
+    use.getAttribute("href") ||
+    use.getAttribute("xlink:href") ||
     null
   );
 }
